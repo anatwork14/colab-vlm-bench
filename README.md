@@ -11,6 +11,7 @@ The seven frozen arms are **Base**, **H2O+Base**, **Declarative Attention+Base**
 - [Scientific seven-arm protocol](docs/SEVEN_ARM_PROTOCOL.md)
 - [Hallucination evaluation protocol](docs/HALLUCINATION_EVALUATION.md)
 - [Upstream compatibility and porting checklist](docs/THIRD_PARTY_METHODS.md)
+- [Pinned upstream source fetch and SHA verification](docs/UPSTREAM_BOOTSTRAP.md)
 - [Agent work order](docs/SEVEN_ARM_AGENT_TASKS.md)
 - [Expanded runbook — NOT_RUN](runbooks/SEVEN_ARM_QWEN.md)
 

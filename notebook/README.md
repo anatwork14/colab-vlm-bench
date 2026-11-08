@@ -27,3 +27,5 @@ Download one of the two **.ipynb** files and upload to **Google Colab â†’ File â
 **Important:** Each notebook makes its own reproducible campaign ID, preserving paired Base/MTP comparisons within the same model. The priority pilot combined across two notebooks has **48 planned serving cells**. More than 6 cells/job requires repeat `run-job` invocations until complete.
 
 Quality can fail on A100 when native 32K context plus images exceeds 40GB. Do not truncate and label the result official. The official MemLens LLM judge and MMLongBench scoring are separate upstream workflows. No test run is bundled or claimed; these notebooks have been syntax/contract-validated in CPU CI only.
+
+Source repositories may be fetched and verified outside the Git working tree using `python scripts/checkout_method_sources.py --method all --dest /content/vlmbench/upstream_sources`. This only fetches source code and verifies SHAs/licenses; it is NOT a runtime port.

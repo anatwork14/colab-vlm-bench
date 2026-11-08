@@ -21,7 +21,8 @@
     "enable_prefix_caching": false,
     "temperature": 0,
     "thinking": false,
-    "max_images_per_prompt": 256
+    "max_images_per_prompt": 256,
+    "top_p": 1
   },
   "models": [
     {
