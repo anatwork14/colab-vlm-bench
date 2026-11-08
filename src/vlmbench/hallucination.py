@@ -95,9 +95,11 @@ def score_evidence_annotations(
             raise AnnotationError(f"Incomplete judge coverage: {len(seen)}/{len(expected)}")
     evaluable_claims = sum(claims[v] for v in ("SUPPORTED", "UNSUPPORTED", "CONTRADICTED"))
     return {
-        "status": "EVIDENCE_JUDGE_SCORED" if (
-            expected_ids is None or set(map(str, expected_ids)) == seen
-        ) else "PARTIAL_JUDGE_COVERAGE",
+        "status": (
+            "JUDGE_SCORED_POPULATION_UNVERIFIED" if expected_ids is None
+            else "EVIDENCE_JUDGE_SCORED" if set(map(str, expected_ids)) == seen
+            else "PARTIAL_JUDGE_COVERAGE"
+        ),
         "annotated_answers": total_answers,
         "expected_answers": len(expected_ids) if expected_ids is not None else None,
         "judge_coverage": total_answers / len(expected_ids) if expected_ids is not None else None,

@@ -91,6 +91,7 @@ def request_payload(sample: dict, *, model_id: str, max_tokens: int,
         "model": model_id,
         "messages": resolve_messages(sample["messages"]),
         "temperature": 0,
+        "top_p": 1.0,
         "max_tokens": max_tokens,
         "stream": streaming,
     }

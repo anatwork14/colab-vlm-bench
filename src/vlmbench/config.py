@@ -63,6 +63,10 @@ def validate(c: dict, *, execution: bool = False) -> None:
         raise ConfigError("Main hardware is exact A100 40GB")
     if h["dtype"] != "bfloat16" or h["tensor_parallel_size"] != 1:
         raise ConfigError("Main benchmark requires BF16 TP1")
+    if s.get("temperature") != 0:
+        raise ConfigError("Accuracy requires greedy temperature=0 for all arms")
+    if s.get("top_p", 1.0) != 1.0:
+        raise ConfigError("Accuracy requires top_p=1.0 for all arms")
     if s["backend"] != "vllm" or s["enable_prefix_caching"] is not False:
         raise ConfigError("vLLM with prefix caching disabled is required")
     if int(s["max_num_seqs"]) < 32 or s["max_model_len"] < 16640:

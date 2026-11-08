@@ -2,11 +2,13 @@
 
 ## IMMEDIATE OWNER PRIORITY (2026-11-08)
 
-**Do Qwen3.5-0.8B and Qwen3.5-4B only, Base vs native MTP, until this pair has reproducible real A100 results.** Stop spending effort/GPU budget on Qwen3.5-2B/9B and Gemma 4 E4B for now. Those models remain registered for later.
+**Do Qwen3.5-0.8B and Qwen3.5-4B only; extend 7 methods (Base, H2O+Base, DA+Base, ECRD+Base, MTP, H2O+MTP, DA+MTP).** Stop spending effort/GPU budget on Qwen3.5-2B/9B and Gemma 4 E4B for now. Those models remain registered for later.
 
-**Read first:** docs/PRIORITY_EXECUTION.md; use configs/a100_qwen_priority_pilot.json (engineering) and configs/a100_qwen_priority_full.json (confirmatory). Never use configs/a100_campaign.json for immediate GPU execution. Stage only the two selected models and leave unpinned deferred model placeholders untouched. Do not claim full 5-model readiness or official quality from pilot/truncated questions.
+**First read:** docs/SEVEN_ARM_PROTOCOL.md, docs/SEVEN_ARM_AGENT_TASKS.md, docs/HALLUCINATION_EVALUATION.md, docs/THIRD_PARTY_METHODS.md. Always keep `temperature=0` and `top_p=1.0`, and do not call wrong answers hallucinations without independent evidence. Source compatibility matters: H2O is not native Qwen3.5 vLLM, DA preserves original KV and its published profiles target SM100, and ECRD reweights decoding logits (not a KV safety mask). Unported arms return BACKEND_UNQUALIFIED, not fabricated Base measurements.
 
-Goal order: 0.8B Base smoke → 0.8B MTP smoke → 0.8B paired MemLens+MMLong pilot → 4B Base/MTP qualification and pilot → native quality subset → first runbook → full 1,008-cell priority campaign and official-quality scoring where feasible. **Publish the first truthful partial benchmark results before expanding the roster.**
+**Legacy first-results sequence (still valid as a subset):** docs/PRIORITY_EXECUTION.md; use configs/a100_qwen_priority_pilot.json (engineering) and configs/a100_qwen_priority_full.json (confirmatory). Never use configs/a100_campaign.json for immediate GPU execution. Stage only the two selected models and leave unpinned deferred model placeholders untouched. Do not claim full 5-model readiness or official quality from pilot/truncated questions.
+
+Goal order: freeze seven-arm/greedy/evidence contracts → 0.8B Base smoke → 0.8B MTP smoke → 0.8B paired MemLens+MMLong pilot → 4B Base/MTP qualification and pilot → native quality subset → first runbook → full 1,008-cell priority campaign and official-quality scoring where feasible. **Publish the first truthful partial benchmark results before expanding the roster.**
 
 
 **Current task**: independent A100 inference benchmarking, NOT STARLIGHT. Read README.md, docs/PROTOCOL.md, docs/COLAB.md, docs/ARCHITECTURE.md before editing.

@@ -1,5 +1,8 @@
 # Active campaign: Qwen3.5-0.8B and Qwen3.5-4B first
 
+**2026-11-08 extension:** Seven methods now in scope: Base, H2O+Base, DA+Base, ECRD+Base, MTP, H2O+MTP, DA+MTP. This document's two-arm steps are the first **working subset** only. See [seven-arm protocol](SEVEN_ARM_PROTOCOL.md), [agent tasks](SEVEN_ARM_AGENT_TASKS.md) and [independent hallucination metrics](HALLUCINATION_EVALUATION.md). The additional five arms require real backend ports; do not pretend their metrics exist. Greedy `temperature=0` is mandatory throughout.
+
+
 **Owner decision (2026-11-08):** Stop expansion to other model families; generate real reproducible results for the two priority Qwen3.5 VLMs before beginning Qwen3.5-2B, Qwen3.5-9B or Gemma 4 E4B. These deferred checkpoints stay in the registry, not in GPU execution scope.
 
 ## Execution sequence (A100 40GB, BF16, TP=1)

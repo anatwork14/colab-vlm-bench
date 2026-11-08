@@ -85,3 +85,19 @@ def test_deterministic_pilot_native_quality_subset():
     assert len({x["id"] for x in a}) == 48
     assert deterministic_subset(rows, 0, 42) == rows
     assert [x["id"] for x in deterministic_subset(rows, 48, 43)] != [x["id"] for x in a]
+
+
+def test_greedy_accuracy_payload_is_frozen():
+    from vlmbench.config import ConfigError, validate
+    from vlmbench.bench import request_payload
+    from pathlib import Path
+    c = load_config(CONFIG)
+    assert c["serving"]["temperature"] == 0
+    row = {"id": "a", "messages": [{"role": "user", "content": "Q"}]}
+    request = request_payload(row, model_id="qwen35_08b", max_tokens=20,
+                              streaming=False, fixed_output=False)
+    assert request["temperature"] == 0 and request["top_p"] == 1.0
+    assert request["chat_template_kwargs"]["enable_thinking"] is False
+    c["serving"]["temperature"] = 0.7
+    with pytest.raises(ConfigError, match="temperature=0"):
+        validate(c)
