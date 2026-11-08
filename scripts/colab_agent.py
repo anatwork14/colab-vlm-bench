@@ -62,12 +62,13 @@ def make_bundle(dst: Path) -> str:
 
 
 def remote_job(args: argparse.Namespace) -> None:
-    sha = check_git_clean()
     session = verify_session(args.session)
     drive = verify_drive(args.drive_root)
+    # Reject paid actions BEFORE touching git, uploading data, or contacting Colab.
     if args.action in REQUIRE_PAID and not args.approve_paid:
         raise PermissionError(
             "GPU inference requires explicit --approve-paid in each invocation")
+    sha = check_git_clean()
     if args.action == "prepare" and args.qa_limit and args.phase == "full":
         raise ValueError("Full confirmatory source cannot have QA subset limit")
     if args.action == "annotate" and not (1 <= args.max_requests <= 128):
