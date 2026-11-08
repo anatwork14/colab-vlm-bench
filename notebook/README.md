@@ -29,3 +29,11 @@ Download one of the two **.ipynb** files and upload to **Google Colab â†’ File â
 Quality can fail on A100 when native 32K context plus images exceeds 40GB. Do not truncate and label the result official. The official MemLens LLM judge and MMLongBench scoring are separate upstream workflows. No test run is bundled or claimed; these notebooks have been syntax/contract-validated in CPU CI only.
 
 Source repositories may be fetched and verified outside the Git working tree using `python scripts/checkout_method_sources.py --method all --dest /content/vlmbench/upstream_sources`. This only fetches source code and verifies SHAs/licenses; it is NOT a runtime port.
+
+## RAM-safe MemLens normalization (Qwen3.5-0.8B fix)
+
+After Colab saved commit `1b8542d`, the notebook included a recursive whole-dataset role rewriting step. That step read all 789 examples twice and created `/content/patched_dataset_32k.json`. The replacement implementation streams **one** MemLens question at a time with `ijson`, handles 'USER'/'AI Assistant' role labels inline, and writes normalized JSONL atomically, with no giant temporary JSON or in-memory list. It also reads source-derived prompts using a sorted index of JSONL byte offsets (not `load_jsonl` for the entire native dataset). These are RAM bounds, not measured peak-memory numbers.
+
+For MMLongBench-Doc, the adapter now supports publisher QA `.parquet` via PyArrow small batches as well as JSON, while PDF images remain on disk. Normalizing full documents may consume substantial SSD/Drive space and can exceed the A100 inference context window even if preprocessing succeeds. Dataset-specific publisher prompt/scorer parity remains unverified.
+
+If rerunning an existing Colab session, execute the setup cell to fast-forward the cloned repo to current `main` before retrying normalization. Upload the latest `.ipynb` from GitHub (old Colab tabs do not auto-update). Never commit executed notebook outputs, raw dataset answers, tokens or private runtime diagnostics into GitHub.

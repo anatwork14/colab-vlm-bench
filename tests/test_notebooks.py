@@ -60,3 +60,23 @@ def test_seven_method_notebook_cells_and_hallucination_gate(name):
     assert "RUN_HALLUCINATION_SCORING" in combined
     assert "score_evidence_annotations" in combined
     assert "RUN_METHOD_MATRIX = False" in combined
+
+
+def test_memlens_colab_ram_regression_and_clean_outputs():
+    obj = json.loads((NBS / "Qwen3.5-0.8B.ipynb").read_text(encoding="utf8"))
+    combined = "\n".join(
+        "".join(c["source"]) if isinstance(c["source"], list) else c["source"]
+        for c in obj["cells"] if c["cell_type"] == "code"
+    )
+    assert "patched_normalize_memlens" not in combined
+    assert "robust_lowercase_roles" not in combined
+    assert "json.load(f)" not in combined
+    assert "normalize_memlens(" in combined
+    assert "ijson>=3.3" in combined
+    assert "pyarrow>=15" in combined
+    assert 'merge", "--ff-only"' in combined
+    assert "drive.mount" in combined
+    for c in obj["cells"]:
+        if c["cell_type"] == "code":
+            assert not c.get("outputs")
+            assert c.get("execution_count") is None

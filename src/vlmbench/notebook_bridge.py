@@ -44,13 +44,38 @@ def build_serving_candidates(
     tokenizer = AutoTokenizer.from_pretrained(
         str(model_directory), local_files_only=True, trust_remote_code=False
     )
-    native = load_jsonl(native_path, dataset=dataset, track="native_quality")
-    native.sort(key=lambda row: _digest_id(row["id"]))
+    # Index only byte offsets/IDs, never 789 full 32K native prompts in RAM.
+    ordered_offsets: list[tuple[str, int]] = []
+    seen_ids: set[str] = set()
+    with Path(native_path).open("rb") as fp:
+        while True:
+            offset = fp.tell()
+            line = fp.readline()
+            if not line:
+                break
+            if not line.strip():
+                continue
+            sample = json.loads(line)
+            if sample.get("dataset") != dataset or sample.get("track") != "native_quality":
+                raise ValueError("Unexpected dataset or track in normalized JSONL")
+            sid = str(sample["id"])
+            if sid in seen_ids:
+                raise ValueError(f"Duplicate normalized question ID: {sid}")
+            seen_ids.add(sid)
+            ordered_offsets.append((_digest_id(sid), offset))
+    ordered_offsets.sort()
+
+    def ordered_native_records():
+        with Path(native_path).open("rb") as fp:
+            for _, offset in ordered_offsets:
+                fp.seek(offset)
+                yield json.loads(fp.readline())
+
     inputs = []
     counts = Counter()
     reasons = Counter()
     pdf_cache = {}
-    for example in native:
+    for example in ordered_native_records():
         if all(counts[n] >= max_per_bin for n in input_lengths):
             break
         if not isinstance(example["messages"][0]["content"], list):
@@ -77,7 +102,10 @@ def build_serving_candidates(
             if doc_id not in pdf_cache:
                 import fitz
                 with fitz.open(pdf) as document:
-                    pdf_cache[doc_id] = "\n".join(p.get_text() for p in document)
+                    text = "\n".join(p.get_text() for p in document)
+                if len(pdf_cache) >= 2:
+                    pdf_cache.pop(next(iter(pdf_cache)))
+                pdf_cache[doc_id] = text
             history = pdf_cache[doc_id]
         image = next(
             (part for part in content[:-1] if part.get("type") == "image_path"), None
