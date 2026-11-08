@@ -1,0 +1,2 @@
+# Contributing
+Develop on a branch. Keep the benchmark matrix scientific contract unchanged unless a new schema version and protocol amendment is introduced. Run `python -m pytest -q`, `ruff check src tests` (when available) and `python -m vlmbench.cli plan --config configs/a100_campaign.json`. Do not commit raw model or dataset content. PRs should include negative results, assumptions and references to upstream method licenses. Keep implementation mode and evidence status separate.

@@ -1,0 +1,25 @@
+{
+  "notes": "Document-only example for agent. Implement via manifest derived from approved main config, NOT a silent runtime override.",
+  "models": [
+    "qwen35_08b"
+  ],
+  "modes": [
+    "base",
+    "mtp"
+  ],
+  "datasets": [
+    "memlens"
+  ],
+  "input_lengths": [
+    2048,
+    16384
+  ],
+  "concurrencies": [
+    1,
+    8,
+    32
+  ],
+  "repetitions": 1,
+  "output_tokens": 256,
+  "max_cells_per_session": 6
+}

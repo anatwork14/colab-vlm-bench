@@ -1,0 +1,5 @@
+# Candidate installation profile; qualify wheel + CUDA first, on exact A100 session.
+# Using vLLM + Torch wheels from compatible source is environment-specific.
+httpx>=0.27,<1
+vllm==0.29.0
+PyMuPDF>=1.24,<2
