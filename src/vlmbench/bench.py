@@ -94,6 +94,9 @@ def request_payload(sample: dict, *, model_id: str, max_tokens: int,
         "max_tokens": max_tokens,
         "stream": streaming,
     }
+    # Qwen3.5: disable thinking identically for Base and speculative arms.
+    if model_id.startswith("qwen35_"):
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
     if fixed_output:
         payload.update({"ignore_eos": True, "min_tokens": max_tokens})
     if streaming:

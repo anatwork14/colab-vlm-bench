@@ -4,7 +4,7 @@ import pytest
 
 from vlmbench.config import load_config
 from vlmbench.workloads import load_jsonl
-from notebook.bridge import write_local_campaign
+from vlmbench.notebook_bridge import write_local_campaign
 
 BASE = Path(__file__).resolve().parents[1]
 NBS = BASE / "notebook"
