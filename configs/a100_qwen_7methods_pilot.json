@@ -1,0 +1,62 @@
+{
+  "schema_version": "1.0",
+  "campaign_id": "a100-qwen07-methods-pilot-v1",
+  "status": "PLANNED_NOT_RUN",
+  "track": "pilot",
+  "dry_run": true,
+  "models": [
+    "qwen35_08b",
+    "qwen35_4b"
+  ],
+  "methods": [
+    "base",
+    "h2o_base",
+    "da_base",
+    "ecrd_base",
+    "mtp",
+    "h2o_mtp",
+    "da_mtp"
+  ],
+  "datasets": [
+    "memlens",
+    "mmlongbench_doc"
+  ],
+  "gpu": {
+    "type": "NVIDIA A100 40GB",
+    "dtype": "bfloat16",
+    "tensor_parallel_size": 1
+  },
+  "temperature": 0,
+  "top_p": 1,
+  "enable_thinking": false,
+  "prefix_caching": false,
+  "input_lengths": [
+    2048,
+    16384
+  ],
+  "ccu": [
+    1,
+    8,
+    32
+  ],
+  "repetitions": 1,
+  "output_tokens": 256,
+  "seed": 42,
+  "quality": {
+    "track": "native_full_context",
+    "temperature": 0,
+    "top_p": 1,
+    "natural_eos": true,
+    "scorers": [
+      "upstream_official",
+      "independent_evidence_judge"
+    ]
+  },
+  "source_pins": {
+    "h2o": "ac75c2a8a9e76832b2a4139b9363373b56336bfb",
+    "da": "24110b7b441ad9423f55952a2c02d23eac80ec52",
+    "ecrd": "0bc209f599bfef0d28d19e9a34024464406a9295"
+  },
+  "backend_qualification_policy": "fail_closed_no_method_fallback",
+  "note": "Method plan only. Base/MTP need GPU smoke. Other five arms require real Qwen3.5 vLLM A100 port, not available by default."
+}
