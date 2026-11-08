@@ -1,5 +1,10 @@
 # Agents — Colab VLM Bench
 
+## PRIMARY EXECUTION PATH — Colab CLI agents (2026-11-09)
+
+**The two uploadable notebooks are now legacy, not active.** Read [docs/AGENT_COLAB_CLI.md](docs/AGENT_COLAB_CLI.md) and use `python scripts/colab_agent.py` on an authenticated Linux/macOS host. Agents operate named Colab CLI sessions, acquire source-pinned Qwen3.5-0.8B/4B and real MemLens/MMLongBench-Doc directly from Hugging Face during a CPU session, preserve them on mounted Drive, and submit tightly bounded Base/MTP GPU jobs only after explicit owner-paid-compute approval. Do not provision/stop Colab session silently. Never mark H2O/DA/ECRD qualified without verified backend ports.
+
+
 ## IMMEDIATE OWNER PRIORITY (2026-11-08)
 
 **Do Qwen3.5-0.8B and Qwen3.5-4B only; extend 7 methods (Base, H2O+Base, DA+Base, ECRD+Base, MTP, H2O+MTP, DA+MTP).** Stop spending effort/GPU budget on Qwen3.5-2B/9B and Gemma 4 E4B for now. Those models remain registered for later.

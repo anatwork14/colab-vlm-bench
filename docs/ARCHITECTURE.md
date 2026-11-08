@@ -39,3 +39,8 @@ Scientific baseline vs upstream: no copied or modified STARLIGHT code. This repo
 
 ## Extensibility
 New GPU providers, workload datasets, vLLM backend versions, MTP depths, custom judge or metrics can be added behind explicit registries, versioned contracts, new run IDs and independent validation. No silent substitutions.
+
+
+## Active 2026-11-09 agent CLI architecture
+
+Host AI agent (authenticated macOS/Linux + google-colab-cli) → named Colab CPU session → Hugging Face pinned sources (model + dataset, revision/SHA) → mounted Drive (durable source, native JSONL, tokenizer-derived serving prompts, frozen manifest) → owner-approved Colab A100 (single model staged on local SSD, real vLLM Base/MTP) → incremental Drive GPU receipts → host `colab download` summary bundle → GitHub review. Source transferred via SHA256-checked git archive. Every remote action runs in a fresh subprocess; notebook execution no longer part of active workflow. Refer to docs/AGENT_COLAB_CLI.md.
