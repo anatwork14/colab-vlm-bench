@@ -1,5 +1,17 @@
 # Colab VLM Bench
 
+## ACTIVE PRIORITY — Qwen3.5-0.8B and 4B first
+
+Run **Qwen3.5-0.8B + Qwen3.5-4B**, each **Base and native MTP**, on **MemLens + MMLongBench-Doc** using a single approved **Colab A100 40GB**. Complete a 48-cell engineering pilot before attempting their 1,008-cell confirmatory serving grid; 2B/9B/Gemma E4B remain **deferred**, not removed.
+
+- [Pilot configuration](configs/a100_qwen_priority_pilot.json) — 2K/16K text bins × CCU 1/8/32 × 1 repetition, 48 total cells
+- [Confirmatory configuration](configs/a100_qwen_priority_full.json) — all 7 bins × all 6 CCU × 3 repetitions, 1,008 cells
+- [Exact agent execution order and evidence gates](docs/PRIORITY_EXECUTION.md)
+- [Priority runbook](runbooks/QWEN_PRIORITY.md) — no GPU results recorded yet
+
+The five-model [full-study config](configs/a100_campaign.json) is preserved for later. These are **separate campaign IDs**; pilot observations must never be mixed with confirmatory results.
+
+
 **Reproducible multimodal inference benchmarking on Google Colab A100 40GB.** An independent research/serving project. **No STARLIGHT treatment arms.**
 
 > Status: **ENGINEERING PREPARED / GPU NOT QUALIFIED / NO RESULTS**. This repository does not imply that every model, MTP implementation, 16K × 32 CCU cell, or 32K MemLens context fits on a 40GB A100.

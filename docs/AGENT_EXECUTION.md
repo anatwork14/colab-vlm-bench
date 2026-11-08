@@ -1,5 +1,8 @@
 # Agent GPU execution deliverables
 
+> Active execution scope: Qwen3.5-0.8B and Qwen3.5-4B only; follow [PRIORITY_EXECUTION.md](PRIORITY_EXECUTION.md). The original five-model work below is a **later** phase and must not block the two-model priority.
+
+
 **P0 — CPU qualification.** Model/processor SHA pinned and staged in owner Drive; dataset source hashes pinned; code CI/test gate; 5×2×2×42×3 fixed grid; no gold in requests, legal dataset usage.
 
 **P1 — A100 GPU pilot.** Exactly 1× A100 40GB, BF16, TP1. Confirm native vLLM 0.29.0 compatible wheels, all five VLM model forward passes, Gemma E4B *matching assistant* native MTP and Qwen native MTP. Verify real visual tokens and input-count calibration.

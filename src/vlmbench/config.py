@@ -39,6 +39,20 @@ def load_config(path: str | Path, *, execution: bool = False) -> dict:
     return obj
 
 
+def selected_scope(c: dict) -> dict:
+    """Resolve an auditable sub-campaign without removing future model registrations."""
+    p = c["performance"]
+    scope = c.get("execution_scope") or {}
+    all_ids = [m["id"] for m in c["models"]]
+    return {
+        "kind": scope.get("kind", "full_study"),
+        "model_ids": scope.get("model_ids", all_ids),
+        "input_lengths": scope.get("input_lengths", p["input_lengths"]),
+        "concurrencies": scope.get("concurrencies", p["concurrencies"]),
+        "repetitions": scope.get("repetitions", list(range(p["repetitions"]))),
+    }
+
+
 def validate(c: dict, *, execution: bool = False) -> None:
     if c.get("schema_version") != "1.0":
         raise ConfigError("Unsupported campaign schema")
@@ -78,6 +92,38 @@ def validate(c: dict, *, execution: bool = False) -> None:
         raise ConfigError("Three independent fixed seeds required")
     if not p["require_real_token_counts"] or not (0.0 < p["max_bin_relative_error"] <= 0.05):
         raise ConfigError("Model-specific effective tokens must be verified")
+    scope = selected_scope(c)
+    if scope["kind"] not in {"full_study", "engineering_pilot", "priority_confirmatory"}:
+        raise ConfigError("Unknown execution scope kind")
+    allowed = {"kind", "model_ids", "input_lengths", "concurrencies", "repetitions"}
+    if set(c.get("execution_scope", {})) - allowed:
+        raise ConfigError("Unknown execution scope fields")
+    for key, population in (
+        ("model_ids", [m["id"] for m in c["models"]]),
+        ("input_lengths", p["input_lengths"]),
+        ("concurrencies", p["concurrencies"]),
+        ("repetitions", list(range(p["repetitions"]))),
+    ):
+        selected = scope[key]
+        if not isinstance(selected, list) or not selected or len(selected) != len(set(selected)):
+            raise ConfigError(f"Nonempty unique execution scope {key} required")
+        if any(x not in population for x in selected):
+            raise ConfigError(f"Out-of-registry execution scope {key}")
+        if selected != [x for x in population if x in selected]:
+            raise ConfigError(f"Execution scope {key} must preserve canonical order")
+    if scope["kind"] in {"full_study", "priority_confirmatory"}:
+        if (scope["input_lengths"] != p["input_lengths"]
+                or scope["concurrencies"] != p["concurrencies"]
+                or scope["repetitions"] != list(range(p["repetitions"]))):
+            raise ConfigError("Confirmatory scope must retain the full 42-cell x 3-rep grid")
+    if scope["kind"] == "full_study" and set(scope["model_ids"]) != set(EXPECTED_MODELS):
+        raise ConfigError("Full study must include all registered models")
+    if q.get("max_samples", 0) is not None and (
+        not isinstance(q.get("max_samples", 0), int) or q.get("max_samples", 0) < 0
+    ):
+        raise ConfigError("quality.max_samples must be zero (all) or a positive integer")
+    if q.get("max_samples", 0) and scope["kind"] != "engineering_pilot":
+        raise ConfigError("Native quality subset is restricted to engineering pilot")
     if q.get("max_model_len", 0) < 32768 or q.get("max_num_seqs") != 1:
         raise ConfigError("Quality needs independent long-context runtime profile, CCU=1")
     if q["require_full_native_context"] is not True or q["official_scorer_required"] is not True:
@@ -88,6 +134,8 @@ def validate(c: dict, *, execution: bool = False) -> None:
         if not c["storage"]["drive_results_dir"].startswith("/content/drive/"):
             raise ConfigError("Results must be saved to mounted Drive")
         for m in c["models"]:
+            if m["id"] not in scope["model_ids"]:
+                continue
             if m["revision"] in ("UNPINNED", "", None) or not m["source_drive_path"].startswith("/content/drive/"):
                 raise ConfigError(f"Pin checkpoint source/revision for {m['id']}")
             if m["id"] == "gemma4_e4b" and not m["assistant_drive_path"].startswith("/content/drive/"):
@@ -112,12 +160,15 @@ def cell_seed(dataset: str, input_length: int, ccu: int, repetition: int, base_s
 
 def planned_cells(c: dict) -> Iterator[dict]:
     p = c["performance"]
+    scope = selected_scope(c)
     for ds in c["datasets"]:
         for model in c["models"]:
+            if model["id"] not in scope["model_ids"]:
+                continue
             for mode in c["modes"]:
-                for rep in range(p["repetitions"]):
-                    for n in p["input_lengths"]:
-                        for ccu in p["concurrencies"]:
+                for rep in scope["repetitions"]:
+                    for n in scope["input_lengths"]:
+                        for ccu in scope["concurrencies"]:
                             yield {
                                 "dataset": ds["id"], "model": model["id"], "mode": mode,
                                 "repetition": rep, "input_length": n, "concurrency": ccu,
@@ -140,11 +191,13 @@ def plan_summary(c: dict) -> dict:
         "campaign_id": c["campaign_id"],
         "status": c["status"],
         "dry_run": c["dry_run"],
-        "model_count": len(c["models"]),
+        "model_count": len(selected_scope(c)["model_ids"]),
+        "registered_model_count": len(c["models"]),
+        "execution_scope": selected_scope(c),
         "mode_count": len(c["modes"]),
         "dataset_count": len(c["datasets"]),
         "cell_count": len(cells),
-        "quality_jobs": len(c["models"]) * len(c["modes"]) * len(c["datasets"]),
+        "quality_jobs": len(selected_scope(c)["model_ids"]) * len(c["modes"]) * len(c["datasets"]),
         "measured_requests": sum(x["requests"] for x in cells),
         "warmup_requests": sum(x["warmup"] for x in cells),
         "nominal_output_tokens": sum(x["requests"] * x["output_tokens"] for x in cells),
