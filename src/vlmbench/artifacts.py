@@ -31,12 +31,16 @@ def atomic_jsonl(path: str | Path, records: list[dict]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(p.name + ".pending")
-    with tmp.open("w", encoding="utf8") as fp:
-        for record in records:
-            fp.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
-        fp.flush()
-        os.fsync(fp.fileno())
-    tmp.replace(p)
+    try:
+        with tmp.open("w", encoding="utf8") as fp:
+            for record in records:
+                fp.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            fp.flush()
+            os.fsync(fp.fileno())
+        tmp.replace(p)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def staged_copy(source: str | Path, dest: str | Path) -> dict:

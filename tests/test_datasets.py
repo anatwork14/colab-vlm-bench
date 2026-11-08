@@ -84,3 +84,93 @@ def test_derived_missing_origin_refused(tmp_path):
                             "messages": [{"role": "user", "content": "prompt"}]}) + "\n")
     with pytest.raises(WorkloadError, match="[Dd]erived"):
         load_jsonl(p, dataset="memlens", track="derived_serving")
+
+
+def test_memlens_streams_question_by_question_and_normalizes_ai_assistant(tmp_path, monkeypatch):
+    images = tmp_path / "publisher" / "release_images"
+    images.mkdir(parents=True)
+    (images / "one.jpg").write_bytes(b"fixture")
+    entries = [
+        {
+            "question_id": f"q_{i:04d}",
+            "question_type": "information_extraction",
+            "question": "What month?", "answer": "June",
+            "haystack_dates": ["2026-06-01"], "haystack_session_ids": ["s1"],
+            "haystack_sessions": [[
+                {"role": "USER", "content": "June", "images": [{"file": "one.jpg"}]},
+                {"role": "AI Assistant", "content": "Understood", "images": []},
+            ]],
+        }
+        for i in range(150)
+    ]
+    source = tmp_path / "dataset_32k.json"
+    source.write_text(json.dumps(entries), encoding="utf8")
+    output = tmp_path / "native.jsonl"
+    original_read_text = Path.read_text
+
+    def block_full_source_reads(path, *args, **kwargs):
+        if path == source:
+            raise AssertionError("Never call read_text/json.load on the entire MemLens source")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", block_full_source_reads)
+    result = normalize_memlens(source, tmp_path / "publisher", output)
+    assert result["count"] == 150
+    assert result["memory_strategy"] == "ijson_stream_one_question_and_atomic_jsonl"
+    assert not output.with_name(output.name + ".pending").exists()
+    rows = load_jsonl(output, dataset="memlens", track="native_quality")
+    assert len(rows) == 150
+    assert "[assistant] Understood" in str(rows[0]["messages"])
+    assert rows[0]["meta"]["image_count"] == 1
+    assert rows[-1]["id"] == "q_0149"
+
+
+def test_memlens_duplicate_failure_does_not_publish_partial_output(tmp_path):
+    row = {
+        "question_id": "q", "question_type": "answer_refusal",
+        "question": "unknown?", "answer": "unknown",
+        "haystack_session_ids": ["s"], "haystack_dates": ["today"],
+        "haystack_sessions": [[{"role": "User", "content": "Hello", "images": []}]],
+    }
+    source = tmp_path / "dataset.json"
+    source.write_text(json.dumps([row, row]), encoding="utf8")
+    output = tmp_path / "native.jsonl"
+    with pytest.raises(ValueError, match="Duplicate MemLens"):
+        normalize_memlens(source, tmp_path, output)
+    assert not output.exists()
+    assert not output.with_name(output.name + ".pending").exists()
+
+
+def test_derived_candidates_index_only_native_offsets(tmp_path, monkeypatch):
+    from types import ModuleType, SimpleNamespace
+    import sys
+    from vlmbench.notebook_bridge import build_serving_candidates
+
+    class FakeTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            return [ord(x) for x in text]
+        def decode(self, ids, skip_special_tokens=False):
+            return "".join(chr(x) for x in ids)
+
+    module = ModuleType("transformers")
+    module.AutoTokenizer = SimpleNamespace(from_pretrained=lambda *a, **kw: FakeTokenizer())
+    monkeypatch.setitem(sys.modules, "transformers", module)
+    row = {
+        "id": "q1", "dataset": "memlens", "track": "native_quality",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "x" * 500},
+            {"type": "image_path", "path": "/dummy/img.jpg", "asset_root": "/dummy"},
+            {"type": "text", "text": "Question: Which?"}
+        ]}],
+    }
+    source = tmp_path / "native.jsonl"
+    source.write_text(json.dumps(row) + "\n", encoding="utf8")
+    output = tmp_path / "derived.jsonl"
+    report = build_serving_candidates(
+        source, output, dataset="memlens", model_directory=tmp_path,
+        input_lengths=[128], max_per_bin=160)
+    assert report["total_rows"] == 1
+    assert report["eligible_per_bin"]["128"] == 1
+    derived = load_jsonl(output, dataset="memlens", track="derived_serving")
+    assert derived[0]["meta"]["official_quality_allowed"] is False
+    assert derived[0]["image_count"] == 1
