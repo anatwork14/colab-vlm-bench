@@ -182,3 +182,15 @@ def test_pipeline_prepare_resumes_same_manifest_without_extra_hf_download(tmp_pa
     second = agent_pipeline.prepare(job)
     assert second["status"] == "PREPARED_REUSED_NO_NEW_DOWNLOAD"
     assert len(hf_hits) == 2
+
+
+
+def test_prepare_refuses_accelerator_before_any_hf_download(monkeypatch):
+    import vlmbench.agent_pipeline as ap
+    import shutil
+    import subprocess
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **kw: SimpleNamespace(returncode=0, stdout="A100-SXM4-40GB\n"))
+    with pytest.raises(RuntimeError, match="GPU_SESSION_REFUSED_FOR_PREPARE"):
+        ap.require_cpu_for_hf_intake()

@@ -60,7 +60,23 @@ def require_prepared(job: dict, paths: dict) -> dict:
     return manifest
 
 
+def require_cpu_for_hf_intake() -> None:
+    """Block expensive downloads/rendering if an accelerator is attached."""
+    import shutil
+    import subprocess
+    if shutil.which("nvidia-smi"):
+        probe = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if probe.returncode == 0 and probe.stdout.strip():
+            raise RuntimeError(
+                "GPU_SESSION_REFUSED_FOR_PREPARE: download and render on CPU Colab"
+            )
+
+
 def prepare(job: dict) -> dict:
+    require_cpu_for_hf_intake()
     p = paths_for(job)
     if p["manifest"].is_file():
         return {**require_prepared(job, p),

@@ -5,7 +5,7 @@
 ## Goals and constraints
 
 - Priority only Qwen3.5-0.8B and Qwen3.5-4B, **Base then native MTP**, on MemLens and MMLongBench-Doc. All five external H2O/DA/ECRD arms remain **BACKEND_UNQUALIFIED**, never simulated.
-- Acquire the model checkpoints and both datasets **directly from Hugging Face** on a **CPU Colab runtime**. Save immutable HF commit SHAs, metadata, and originals on the user's mounted Google Drive. Download only MemLens 32K JSON + images archive, and MMLongBench QA + source PDFs, not unrelated 64/128/256K images/content.
+- Acquire the model checkpoints and both datasets **directly from Hugging Face** on a **CPU Colab runtime**. The remote `prepare` command verifies no GPU is attached and blocks download/render if an accelerator is present. Save immutable HF commit SHAs, metadata, and originals on the user's mounted Google Drive. Download only MemLens 32K JSON + images archive, and MMLongBench QA + source PDFs, not unrelated 64/128/256K images/content.
 - Stage selected model from Drive to local SSD for inference on the separate A100 runtime, verify staging SHA256 and actual A100 40GB/BF16. No mixing T4/L4/80GB results. Local SSD, host RAM and GPU VRAM are separately gated.
 - Never allocate A100 or run inference without explicit --approve-paid on that **specific** command. Never silently stop a session; only explicit --confirm-stop. Colab authentication and first Drive mount are interactive user actions.
 - Temperature 0, top_p 1; fixed 256 output tokens for serving, natural EOS on native quality. Two-source benchmark quality needs independent publisher scorers; source-derived serving accuracy is forbidden.
