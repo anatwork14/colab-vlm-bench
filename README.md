@@ -1,1 +1,82 @@
-# colab-vlm-bench
+# Colab VLM Bench
+
+**Reproducible multimodal inference benchmarking on Google Colab A100 40GB.** An independent research/serving project. **No STARLIGHT treatment arms.**
+
+> Status: **ENGINEERING PREPARED / GPU NOT QUALIFIED / NO RESULTS**. This repository does not imply that every model, MTP implementation, 16K × 32 CCU cell, or 32K MemLens context fits on a 40GB A100.
+
+## Scope
+
+| Family | Model | Modes | MTP route |
+| --- | --- | --- | --- |
+| Qwen3.5 | Qwen/Qwen3.5-0.8B | base / mtp | native vLLM MTP, n=1 |
+| Qwen3.5 | Qwen/Qwen3.5-2B | base / mtp | native vLLM MTP, n=1 |
+| Qwen3.5 | Qwen/Qwen3.5-4B | base / mtp | native vLLM MTP, n=1 |
+| Qwen3.5 | Qwen/Qwen3.5-9B | base / mtp | native vLLM MTP, n=1 |
+| Gemma4 | google/gemma-4-E4B-it | base / mtp | matching **assistant** checkpoint, native vLLM MTP, n=1 pilot |
+
+**Important:** Gemma 4 MTP uses `method=mtp` with matching assistant, not generic `draft_model`. Exact assistant Hugging Face repository/revision must be verified and placed in Drive by owner. Model and processor SHA/revision are required before GPU runs.
+
+## Two primary datasets
+
+- [MemLens](https://github.com/xrenaf/MEMLENS): 789 questions in 32K/64K/128K/256K contexts, conversation memory and images. Primary **native** quality evaluation at 32K only when entire context fits, otherwise record capacity-limited. Official quality uses upstream LLM judge, potentially requiring external resources. Token F1 here is **proxy only**.
+- [MMLongBench-Doc](https://github.com/mayubo2333/MMLongBench-Doc): current upstream 135 documents and 1,091 QA according to repository (pin and record release). Full-document image-page replay is the quality track; its official scoring workflow must be run separately, not replaced by proxy F1.
+
+**Do not claim official accuracy from truncated inputs.** Serving track uses real-source-derived workload bins with explicit `derived_serving` status and optional human-approved context construction; native quality uses complete evidence-bearing context.
+
+## Fixed grid / benchmark protocol
+
+- Input text-context bins: `128 512 1024 2048 4096 8192 16384` (target; verified model-token accounting required).
+- Offered concurrent users: `1 2 4 8 16 32`. A GPU may serve fewer active sequences and queue the remainder.
+- Output: target **256 actually generated tokens**, via `ignore_eos/min_tokens` if supported; otherwise declare the cell non-comparable. Independent quality runs use natural EOS.
+- Count per cell: `max(16, 4*CCU)` measured requests plus `CCU` warmup; same request IDs / schedule / seeds across paired base-MTP arms.
+- Repetitions: 3; warmup not included in metrics, prefix caching disabled, streaming, thinking disabled when verified.
+- 5 checkpoints × 2 modes × 2 datasets × 42 cells × 3 reps = **2,520 serving cells** (subject to explicit capacity/support results), plus native accuracy tasks.
+- Main GPU: only 1× A100 40GB, BF16, TP1; report unsupported/OOM cells rather than changing GPU, quantization or CCU silently.
+- Native quality runs use a **separate** 65,536-token CCU1 server profile, still subject to A100 capacity. Use the controller `--quality` flag for quality-only.
+
+[Scientific protocol](docs/PROTOCOL.md) · [Operations/Colab](docs/COLAB.md) · [Agent task contract](AGENTS.md) · [Repo architecture](docs/ARCHITECTURE.md) · [Runbooks](runbooks/README.md)
+
+## Quick start — CPU, no spend
+
+```bash
+python -m pip install -e '.[dev]'
+python -m pytest -q
+python -m vlmbench.cli plan --config configs/a100_campaign.json
+python -m vlmbench.cli validate --config configs/a100_campaign.json
+```
+
+Prepare datasets from owner-owned local/Drive files:
+
+```bash
+python -m vlmbench.cli prepare-memlens --input /PATH/dataset_32k.json --images-root /PATH/MEMLENS --output /PATH/memlens_native.jsonl
+python -m vlmbench.cli prepare-mmlong --input /PATH/qa.json --pdf-root /PATH/documents --images-out /PATH/rendered_pages --output /PATH/mmlong_native.jsonl
+```
+
+Then create real **derived serving** datasets with a documented transformation and verified prompt-token bins. Native `*_native.jsonl` is for official quality and must not be silently truncated.
+
+Use [Colab controller](scripts/colab_controller.sh) only after inspecting actual CLI help, Drive mount and approved GPU allocation. The controller requires a **pre-existing** A100 session; it does not create a billed runtime.
+
+
+
+### Preparing paired serving workloads (not official quality)
+
+Build seven **source-derived** candidate bins from a native full-context JSONL. The transformation deliberately drops some context/evidence and can select up to one real image, so it cannot be scored as official accuracy.
+
+~~~bash
+python -m vlmbench.cli derive-serving --native /DRIVE/memlens_native.jsonl --dataset memlens --output /DRIVE/memlens_derived_candidates.jsonl --max-images 1
+python -m vlmbench.cli derive-serving --native /DRIVE/mmlong_native.jsonl --dataset mmlongbench_doc --output /DRIVE/mmlong_derived_candidates.jsonl --max-images 1
+~~~
+
+Before a serving cell is eligible, each candidate needs **model-specific token annotation** from the matching vLLM Base server. The annotation command makes real one-token GPU calls and therefore requires an approved A100 runtime and quota:
+
+~~~bash
+python -m vlmbench.cli annotate-serving --input /DRIVE/memlens_derived_candidates.jsonl --output /DRIVE/memlens_annotated_qwen08b.jsonl --dataset memlens --model-id qwen35_08b --checkpoint /content/STAGED_MODEL --base-url http://127.0.0.1:8000
+~~~
+
+Repeat for each model, carrying existing annotations forward into a frozen combined JSONL **before Base/MTP comparisons**. Calibrate text token counts against the actual vLLM chat template and record full multimodal prompt-token usage. Candidate bins are approximate until the server measurement is attached; insufficient matches yield `INSUFFICIENT_WORKLOAD`, never fake numbers. Input bin=128 text tokens + separately measured visual overhead, not 128 all-modality tokens.
+
+## Publishing
+
+Every attempt emits immutable config/environment/hash records, individual JSONL predictions/receipts, failures, GPU logs and summary. Large artifacts go to owner Drive; GitHub runbooks link to validated receipts and include **NOT_MEASURED** where instrumentation is missing. No API secrets, model weights, raw images, or datasets in Git.
+
+License: see [LICENSE](LICENSE). Third-party models/datasets have their own terms (MMLongBench-Doc noncommercial research use).
