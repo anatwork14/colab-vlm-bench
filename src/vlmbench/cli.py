@@ -128,7 +128,7 @@ def run_job(args) -> int:
             "mtp_method_qualification": "NEEDS_BACKEND_TRACE_REVIEW" if args.mode == "mtp" else "NA",
         })
         proc = start_server(command, root / "logs" / (job_key + ".server.log"))
-        wait_ready(proc, cfg["serving"]["port"])
+        wait_ready(proc, cfg["serving"]["port"], expected_model=args.model)
         atomic_json(root / "launch" / (job_key + ".json"), {
             "argv": command, "startup_status": "READY",
             "expected_method": args.mode,

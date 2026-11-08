@@ -85,15 +85,35 @@ def annotate_with_backend(
         raise RuntimeError("Install transformers to annotate model text tokens") from exc
 
     rows = load_jsonl(source, dataset=dataset, track="derived_serving")
+    if limit < 0:
+        raise ValueError("Annotation budget must be >= 0")
+    source_sha = sha256(source)
+    state = output.with_name(output.name + ".state.json")
+    if output.exists():
+        if not state.is_file():
+            raise ValueError("Existing annotated file lacks source-digest state; audit/rename before restart")
+        previous_state = json.loads(state.read_text(encoding="utf8"))
+        if previous_state.get("source_sha256") != source_sha or previous_state.get("model") != model_id:
+            raise ValueError("Annotation source/model changed; use distinct output path")
+        previous = load_jsonl(output, dataset=dataset, track="derived_serving")
+        if [x["id"] for x in rows] != [x["id"] for x in previous]:
+            raise ValueError("Annotation resume IDs differ from original candidates")
+        rows = previous
+    else:
+        atomic_json(state, {"source_sha256": source_sha, "model": model_id,
+                            "checkpoint": checkpoint_path, "status": "PARTIAL_ANNOTATION"})
     tokenizer = AutoTokenizer.from_pretrained(
         checkpoint_path, local_files_only=True, trust_remote_code=False
     )
     produced = []
     successes = 0
+    attempted = 0
+    carried = sum(x.get("model_token_counts", {}).get(model_id, {}).get("verified_by")
+                  == "vllm_effective_token_accounting" for x in rows)
     url = base_url.rstrip("/") + "/v1/chat/completions"
     with httpx.Client(timeout=httpx.Timeout(360.0, connect=30.0)) as client:
         for row in rows:
-            if limit and successes >= limit:
+            if limit and attempted >= limit:
                 produced.append(row)
                 continue
             previous = row.get("model_token_counts", {}).get(model_id)
@@ -114,6 +134,7 @@ def annotate_with_backend(
                 " ".join(text_parts), add_special_tokens=False
             ))
             try:
+                attempted += 1
                 request = request_payload(
                     row, model_id=model_id, max_tokens=1, streaming=False, fixed_output=False)
                 response = client.post(url, json=request)
@@ -141,9 +162,19 @@ def annotate_with_backend(
             if len(produced) % 10 == 0:
                 atomic_jsonl(output, produced + rows[len(produced):])
     atomic_jsonl(output, produced)
+    verified_total = sum(x.get("model_token_counts", {}).get(model_id, {}).get("verified_by")
+                         == "vllm_effective_token_accounting" for x in produced)
+    state_body = {"source_sha256": source_sha, "model": model_id,
+                  "checkpoint": checkpoint_path,
+                  "status": "ANNOTATED" if verified_total == len(rows) else "PARTIAL_ANNOTATED",
+                  "verified_total": verified_total, "total_rows": len(rows)}
+    atomic_json(state, state_body)
     return {
-        "status": "PARTIAL_ANNOTATED" if successes < len(rows) else "ANNOTATED",
-        "source_sha256": sha256(source), "output_sha256": sha256(output),
+        "status": state_body["status"],
+        "source_sha256": source_sha, "output_sha256": sha256(output),
         "model": model_id, "verified_new": successes,
+        "verified_before": carried, "verified_total": verified_total,
+        "http_requests_this_invocation": attempted,
+        "remaining_unverified": len(rows) - verified_total,
         "total_rows": len(rows), "output": str(output),
     }

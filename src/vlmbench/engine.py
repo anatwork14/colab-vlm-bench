@@ -68,7 +68,8 @@ def start_server(argv: list[str], log: Path) -> subprocess.Popen:
     return p
 
 
-def wait_ready(proc: subprocess.Popen, port: int, timeout_s: int = 360) -> None:
+def wait_ready(proc: subprocess.Popen, port: int, timeout_s: int = 360,
+               expected_model: str | None = None) -> None:
     end = time.monotonic() + timeout_s
     url = f"http://127.0.0.1:{port}/v1/models"
     while time.monotonic() < end:
@@ -77,6 +78,12 @@ def wait_ready(proc: subprocess.Popen, port: int, timeout_s: int = 360) -> None:
         try:
             with urllib.request.urlopen(url, timeout=2) as response:
                 if response.status == 200:
+                    if expected_model is not None:
+                        payload = json.load(response)
+                        names = [x.get("id") for x in payload.get("data", [])]
+                        if expected_model not in names:
+                            raise RuntimeError(
+                                f"Port {port} has the wrong model {names}, expected {expected_model}")
                     return
         except (OSError, TimeoutError):
             pass

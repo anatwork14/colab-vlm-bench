@@ -53,7 +53,7 @@ def test_single_model_campaign_no_deferred_revision_requirements(tmp_path):
 @pytest.mark.parametrize("name", ["Qwen3.5-0.8B.ipynb", "Qwen3.5-4B.ipynb"])
 def test_seven_method_notebook_cells_and_hallucination_gate(name):
     notebook = json.loads((NBS / name).read_text(encoding="utf8"))
-    assert len(notebook["cells"]) == 36
+    assert len(notebook["cells"]) == 38
     combined = "\n".join(str(c.get("source", "")) for c in notebook["cells"])
     for method in ("h2o_base", "da_base", "ecrd_base", "h2o_mtp", "da_mtp"):
         assert method in combined or "METHOD_SELECTION" in combined
@@ -80,3 +80,24 @@ def test_memlens_colab_ram_regression_and_clean_outputs():
         if c["cell_type"] == "code":
             assert not c.get("outputs")
             assert c.get("execution_count") is None
+
+
+@pytest.mark.parametrize("name", ["Qwen3.5-0.8B.ipynb", "Qwen3.5-4B.ipynb"])
+def test_full_colab_resource_and_cost_guard_before_gpu_steps(name):
+    notebook = json.loads((NBS / name).read_text(encoding="utf8"))
+    cells = ["".join(c["source"]) if isinstance(c["source"], list) else c["source"]
+             for c in notebook["cells"]]
+    preflight = next(i for i,x in enumerate(cells) if "checkpoint_info = checkpoint_inventory" in x)
+    staging = next(i for i,x in enumerate(cells) if "staged_copy(MODEL_DRIVE_DIR" in x)
+    annotation = next(i for i,x in enumerate(cells) if "annotate_with_backend(" in x)
+    serving = next(i for i,x in enumerate(cells) if '"run-job", "--config"' in x)
+    assert preflight < staging < annotation < serving
+    combined = "\n".join(cells)
+    assert "CPU_PREFLIGHT_ONLY" in combined
+    assert "ANNOTATION_CALL_BUDGET = 8" in combined
+    assert "serving_readiness(" in combined
+    assert "ACTIVE_DATASETS" in combined
+    assert "RUN_GPU_ANNOTATION = False" in combined
+    assert "RUN_BASE = False" in combined
+    assert "RUN_MTP = False" in combined
+    assert "RUN_NATIVE_QUALITY = False" in combined

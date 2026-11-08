@@ -149,8 +149,11 @@ async def run_performance_cell(
                                               max_tokens=cell["output_tokens"],
                                               streaming=True, fixed_output=True)
                     return await stream_completion(client, url, payload, str(sample["id"]))
-            for warmup in warmups:
-                warm = await one(warmup)
+            # Warmup at the requested offered CCU. Sequential 32-request
+            # warmups at 16K would waste significant paid A100 wall time and
+            # fail to warm the concurrency-specific scheduler/caches.
+            warm_observations = await asyncio.gather(*(one(warmup) for warmup in warmups))
+            for warm in warm_observations:
                 if warm["status"] != "HTTP_OK" or warm["output_tokens"] != cell["output_tokens"]:
                     raise WorkloadError(f"WARMUP_INVALID: {warm['error']} / {warm['output_tokens']}")
             start_cell = perf_counter()
@@ -258,8 +261,9 @@ async def run_quality_predictions(cfg: dict, model_id: str, mode: str,
                                 "error": f"{type(exc).__name__}: {exc}", "prediction": None})
             # Avoid losing all quality predictions if Colab disconnects.
             atomic_jsonl(output, results)
-            if len(results) % 10 == 0:
-                sync_files(root, drive_root)
+            # Native 32K VLM quality requests can be costly. Commit each
+            # prediction to durable Drive without re-uploading all raw logs.
+            sync_files(root / "quality", drive_root / "quality")
     receipt = {
         "dataset": dataset, "model": model_id, "mode": mode,
         "status": "QUALITY_PREDICTIONS_UNSCORED",
