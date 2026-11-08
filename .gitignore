@@ -24,3 +24,7 @@ outputs/
 .credentials/
 **/credentials.json
 **/token.json
+
+# Agent-operated Colab CLI: never commit local receipts / source snapshots
+agent_artifacts/
+*.pending

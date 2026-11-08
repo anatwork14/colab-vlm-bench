@@ -1,3 +1,9 @@
+# DEPRECATED NOTEBOOK TESTS: superseded by official agent-operated Colab CLI.
+# These tests refer to manual upload .ipynb files which may include Colab output
+# cells; they are retained for provenance but are not part of the active runtime.
+import pytest
+pytestmark = pytest.mark.skip(reason="Legacy uploadable notebooks retired; agent CLI is active")
+
 from pathlib import Path
 import json
 import pytest
