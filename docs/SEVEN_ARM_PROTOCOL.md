@@ -31,7 +31,7 @@ Sources (inspect / pin, never indiscriminately vendor):
 - In quality experiments choose native samples and judge thresholds *before* comparing methods; judge versions, annotation rubric, exact image evidence and sample manifests frozen.
 
 ## Endpoints / metrics
-Quality: official accuracy and F1; refusal/abstention accuracy; answer hallucination rate and unsupported claim rate; contradiction rate; false assertion rate on unanswerable; visual evidence citation precision/recall when labels available. Always report judge coverage and \`UNVERIFIABLE\` separately; never equate any incorrect answer with hallucination.
+Quality: official accuracy and F1; refusal/abstention accuracy and false refusal rate on answerable questions (avoid over-abstention); answer coverage; answer hallucination rate and unsupported claim rate; contradiction rate; false assertion rate on unanswerable; visual evidence citation precision/recall when labels available. Always report judge coverage and \`UNVERIFIABLE\` separately; never equate any incorrect answer with hallucination.
 
 Serving: TTFT p50/p95/p99, TPOT p50/p95, E2E p50/p95/p99, requests/s, committed output tok/s, goodput under declared SLO, offered CCU and actual active GPU sequences if instrumented, GPU peak MiB, physical KV/cache bytes if instrumented, decode/eviction/protected KV stats for qualifying arms, MTP acceptance/rollback if instrumented. No invented measurements: \`NOT_MEASURED\` for missing.
 

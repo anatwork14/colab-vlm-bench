@@ -10,6 +10,7 @@ Metrics are divided into quality, evidence-grounded hallucination, end-to-end se
 | Answer hallucination rate | responses with >=1 unsupported/contradicted claim / evidence-evaluable answered responses | independent claim/evidence labels | native |
 | Contradiction rate | CONTRADICTED / evidence-evaluable claims | cited evidence IDs | native |
 | False assertion rate / correct abstention | assert or abstain on independently labeled unanswerable items | publisher answerability + independent abstention labels | native |
+| False refusal rate / answer coverage | abstention on answerable items; fraction of requests actually answered | independent answerability + abstention labels | native |
 | Judge coverage, unverifiable count | annotated / expected; unknowns kept separate | frozen manifest and judge revision | native |
 | Proxy EM / token F1 | normalized exact match and overlap, failures count zero | references held evaluator-only | auxiliary only |
 | TTFT | HTTP arrival to first nonempty streamed content chunk | streaming server + client clock | serving |

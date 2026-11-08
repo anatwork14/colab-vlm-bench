@@ -36,6 +36,9 @@ def score_evidence_annotations(
     unanswerable_total = 0
     false_assertions = 0
     correct_abstentions = 0
+    answerable_total = 0
+    false_refusals = 0
+    abstention_total = 0
     all_details = []
     for entry in annotations:
         identifier = str(entry.get("id") or "")
@@ -73,6 +76,10 @@ def score_evidence_annotations(
             local_verdicts[verdict] += 1
             claims[verdict] += 1
         total_answers += 1
+        abstention_total += int(abstained)
+        if ans == "ANSWERABLE":
+            answerable_total += 1
+            false_refusals += int(abstained)
         count_evaluable = sum(local_verdicts[v] for v in ("SUPPORTED", "UNSUPPORTED", "CONTRADICTED"))
         has_hallucination = bool(local_verdicts["UNSUPPORTED"] or local_verdicts["CONTRADICTED"])
         if not abstained and count_evaluable:
@@ -121,11 +128,17 @@ def score_evidence_annotations(
             false_assertions / unanswerable_total if unanswerable_total else None),
         "correct_abstention_rate": (
             correct_abstentions / unanswerable_total if unanswerable_total else None),
+        "answerable_questions": answerable_total,
+        "false_refusal_rate": (
+            false_refusals / answerable_total if answerable_total else None),
+        "answer_coverage_rate": (total_answers - abstention_total) / total_answers,
         "denominator_policy": {
             "unsupported_claim_rate": "UNSUPPORTED / (SUPPORTED + UNSUPPORTED + CONTRADICTED)",
             "hallucinated_claim_rate": "(UNSUPPORTED + CONTRADICTED) / evaluable factual claims",
             "answer_hallucination_rate": "non-abstained answers containing >=1 evaluable claim and >=1 hallucinated claim / non-abstained answers containing >=1 evaluable claim",
             "false_assertion_rate": "non-abstained on independently labeled UNANSWERABLE questions / all UNANSWERABLE",
+            "false_refusal_rate": "abstained on independently labeled ANSWERABLE questions / all ANSWERABLE",
+            "answer_coverage_rate": "non-abstained responses / all annotated responses",
             "unknown": "UNVERIFIABLE excluded, always reported separately",
         },
         "per_answer": all_details,

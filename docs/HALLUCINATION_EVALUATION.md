@@ -18,6 +18,8 @@ A factual assertion unsupported by the evidence provided in **the evaluated mult
 - **Answer hallucination rate**: non-abstained responses containing ≥1 unsupported/contradicted claim / non-abstained responses with ≥1 evaluable factual claim.
 - **False assertion rate (FAR)**: non-abstentions on verified UNANSWERABLE items / all verified UNANSWERABLE items.
 - **Correct abstention rate**: abstentions on UNANSWERABLE / all verified UNANSWERABLE.
+- **False refusal rate**: abstentions on ANSWERABLE / all verified ANSWERABLE. This is crucial: always-abstaining is not a valid hallucination reduction.
+- **Answer coverage**: non-abstained / all annotated responses, paired with selective hallucination rate. Report failure/OOM separately.
 - **Coverage / UNVERIFIABLE**: judge-annotated responses / frozen expected responses; unverifiable claims separate, not zero.
 - **Quality**: publisher official MemLens accuracy, MMLongBench-Doc overall Accuracy/F1, grouped by refusal/unanswerable + evidence type/page. Proxy EM/F1 remains auxiliary.
 

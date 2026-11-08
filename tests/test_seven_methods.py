@@ -97,6 +97,8 @@ def test_hallucination_metrics_do_not_equate_wrong_answer_to_hallucination():
     assert scored["answer_hallucination_rate"] == pytest.approx(1)
     assert scored["false_assertion_rate"] == pytest.approx(1 / 2)
     assert scored["correct_abstention_rate"] == pytest.approx(1 / 2)
+    assert scored["false_refusal_rate"] == pytest.approx(0.0)
+    assert scored["answer_coverage_rate"] == pytest.approx(3 / 4)
 
 
 def test_hallucination_fail_closed_missing_judge_and_coverage():
@@ -118,3 +120,15 @@ def test_hallucination_template_is_not_measured():
     rows = read_annotations(BASE / "configs/hallucination_annotation.example.jsonl")
     assert len(rows) == 1
     assert rows[0]["judge_provenance"]["judge_id"].startswith("REPLACE_")
+
+
+def test_always_refusing_cannot_game_hallucination():
+    xs = [
+        evidence("1", [], answerability="ANSWERABLE", abstained=True),
+        evidence("2", [], answerability="UNANSWERABLE", abstained=True),
+    ]
+    s = score_evidence_annotations(xs, expected_ids=["1", "2"])
+    assert s["answer_hallucination_rate"] is None
+    assert s["hallucinated_claim_rate"] is None
+    assert s["false_refusal_rate"] == 1.0
+    assert s["answer_coverage_rate"] == 0.0
