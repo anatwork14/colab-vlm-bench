@@ -53,7 +53,7 @@ def test_single_model_campaign_no_deferred_revision_requirements(tmp_path):
 @pytest.mark.parametrize("name", ["Qwen3.5-0.8B.ipynb", "Qwen3.5-4B.ipynb"])
 def test_seven_method_notebook_cells_and_hallucination_gate(name):
     notebook = json.loads((NBS / name).read_text(encoding="utf8"))
-    assert len(notebook["cells"]) == (39 if name == "Qwen3.5-0.8B.ipynb" else 38)
+    assert len(notebook["cells"]) == 38
     combined = "\n".join(str(c.get("source", "")) for c in notebook["cells"])
     for method in ("h2o_base", "da_base", "ecrd_base", "h2o_mtp", "da_mtp"):
         assert method in combined or "METHOD_SELECTION" in combined
