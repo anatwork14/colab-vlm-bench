@@ -19,6 +19,7 @@ from .quality import import_official, score_proxy
 from .report import write_report
 from .workloads import load_jsonl
 from .bench import run_performance_cell, run_quality_predictions
+from .derivation import generate_candidates, annotate_with_backend
 
 
 def _installed(name: str) -> str:
@@ -126,6 +127,7 @@ def run_job(args) -> int:
         cells = [x for x in planned_cells(cfg)
                  if x["model"] == args.model and x["dataset"] == args.dataset and x["mode"] == args.mode]
         done = 0
+        limit = args.max_cells if args.max_cells > 0 else int(cfg["performance"]["max_cells_per_session"])
         for cell in cells:
             # Resume independently at cell level; a full successful cell does not consume job cap.
             existing = root / "cells" / f"{cell_id(cell)}.json"
@@ -138,7 +140,7 @@ def run_job(args) -> int:
                     continue
                 # Prevent accidental overwrite of failures in the same campaign.
                 continue
-            if done >= (args.max_cells or cfg["performance"]["max_cells_per_session"]):
+            if limit and done >= limit:
                 break
             result = asyncio.run(run_performance_cell(
                 cfg, cell, rows, root, drive_root, args.model, derived_hash))
@@ -189,6 +191,21 @@ def main(argv=None):
     ml.add_argument("--limit", type=int)
     ml.add_argument("--dpi", type=int, default=96)
 
+    derived = sub.add_parser("derive-serving")
+    derived.add_argument("--native", required=True, type=Path)
+    derived.add_argument("--dataset", required=True, choices=["memlens", "mmlongbench_doc"])
+    derived.add_argument("--output", required=True, type=Path)
+    derived.add_argument("--max-images", type=int, default=1)
+
+    annotation = sub.add_parser("annotate-serving")
+    annotation.add_argument("--input", required=True, type=Path)
+    annotation.add_argument("--output", required=True, type=Path)
+    annotation.add_argument("--dataset", required=True, choices=["memlens", "mmlongbench_doc"])
+    annotation.add_argument("--model-id", required=True)
+    annotation.add_argument("--checkpoint", required=True)
+    annotation.add_argument("--base-url", default="http://127.0.0.1:8000")
+    annotation.add_argument("--limit", type=int, default=0)
+
     job = sub.add_parser("run-job")
     job.add_argument("--config", required=True, type=Path)
     job.add_argument("--model", required=True)
@@ -224,6 +241,16 @@ def main(argv=None):
     if args.command == "prepare-mmlong":
         print(json.dumps(normalize_mmlong(args.input, args.pdf_root, args.images_out,
                                          args.output, args.limit, args.dpi), indent=2))
+        return 0
+    if args.command == "derive-serving":
+        print(json.dumps(generate_candidates(args.native, args.output,
+                                             args.dataset, args.max_images), indent=2))
+        return 0
+    if args.command == "annotate-serving":
+        print(json.dumps(annotate_with_backend(args.input, args.output,
+                                             args.dataset, args.model_id,
+                                             args.checkpoint, args.base_url,
+                                             args.limit), indent=2))
         return 0
     if args.command == "run-job":
         return run_job(args)

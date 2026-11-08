@@ -34,6 +34,12 @@ colab install -s vlmbench-a100 -r requirements-colab.txt
 
 Use [scripts/colab_controller.sh](../scripts/colab_controller.sh) after validating config. The controller uploads a source ZIP and runs a Python entrypoint via `colab exec`, pulls a small summary, and leaves GPU session ownership to user. Large evidence is periodically synchronized to mounted Drive.
 
+## 2b. Workload annotation and quality
+
+Native full-data JSONL is created with prepare-memlens or prepare-mmlong. Derived serving candidates are generated using derive-serving and annotated per target model with annotate-serving **after** staging the matching processor/checkpoint. These extra 1-token requests consume A100 time. The annotation produces measured backend effective prompt tokens and tokenizer-derived text tokens; image overhead is separately recorded. Do not confuse derived serving inputs with official native quality questions.
+
+For official native quality, use the upstream MemLens/MMLongBench scoring tools and import-official-score; proxy token F1 is not official.
+
 ## 3. Jobs and resume
 - Assign immutable `campaign_id` and per-cell receipt path; do not reuse ID for different config hashes.
 - Keep job duration shorter than available session allowance; save after each cell.

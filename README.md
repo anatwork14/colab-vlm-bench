@@ -55,6 +55,25 @@ Then create real **derived serving** datasets with a documented transformation a
 
 Use [Colab controller](scripts/colab_controller.sh) only after inspecting actual CLI help, Drive mount and approved GPU allocation. The controller requires a **pre-existing** A100 session; it does not create a billed runtime.
 
+
+
+### Preparing paired serving workloads (not official quality)
+
+Build seven **source-derived** candidate bins from a native full-context JSONL. The transformation deliberately drops some context/evidence and can select up to one real image, so it cannot be scored as official accuracy.
+
+~~~bash
+python -m vlmbench.cli derive-serving --native /DRIVE/memlens_native.jsonl --dataset memlens --output /DRIVE/memlens_derived_candidates.jsonl --max-images 1
+python -m vlmbench.cli derive-serving --native /DRIVE/mmlong_native.jsonl --dataset mmlongbench_doc --output /DRIVE/mmlong_derived_candidates.jsonl --max-images 1
+~~~
+
+Before a serving cell is eligible, each candidate needs **model-specific token annotation** from the matching vLLM Base server. The annotation command makes real one-token GPU calls and therefore requires an approved A100 runtime and quota:
+
+~~~bash
+python -m vlmbench.cli annotate-serving --input /DRIVE/memlens_derived_candidates.jsonl --output /DRIVE/memlens_annotated_qwen08b.jsonl --dataset memlens --model-id qwen35_08b --checkpoint /content/STAGED_MODEL --base-url http://127.0.0.1:8000
+~~~
+
+Repeat for each model, carrying existing annotations forward into a frozen combined JSONL **before Base/MTP comparisons**. Calibrate text token counts against the actual vLLM chat template and record full multimodal prompt-token usage. Candidate bins are approximate until the server measurement is attached; insufficient matches yield `INSUFFICIENT_WORKLOAD`, never fake numbers. Input bin=128 text tokens + separately measured visual overhead, not 128 all-modality tokens.
+
 ## Publishing
 
 Every attempt emits immutable config/environment/hash records, individual JSONL predictions/receipts, failures, GPU logs and summary. Large artifacts go to owner Drive; GitHub runbooks link to validated receipts and include **NOT_MEASURED** where instrumentation is missing. No API secrets, model weights, raw images, or datasets in Git.

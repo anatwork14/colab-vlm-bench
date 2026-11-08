@@ -52,10 +52,10 @@ def test_bin_requires_real_model_token_counts():
     rows = [{
         "id": "q1", "model_token_counts": {"qwen35_08b": {
             "verified_by": "vllm_effective_token_accounting",
-            "effective_total_tokens": 1022,
+            "text_tokens": 1022, "effective_total_tokens": 1450,
         }}
     }, {"id": "q2", "model_token_counts": {"qwen35_08b": {
-        "verified_by": "approximate_word_count", "effective_total_tokens": 1024,
+        "verified_by": "approximate_word_count", "text_tokens": 1024, "effective_total_tokens": 1450,
     }}}]
     assert [r["id"] for r in exact_bin_pool(rows, "qwen35_08b", 1024, 0.05)] == ["q1"]
     assert exact_bin_pool(rows, "qwen35_2b", 1024, 0.05) == []

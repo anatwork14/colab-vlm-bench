@@ -18,3 +18,7 @@
 - Official MemLens judge and MMLongBench scoring require independent upstream pipelines; existing proxy scorer is not a replacement.
 - Server-side token-level ITL, queue wait, MTP acceptance rate and actual physical KV bytes are not captured by client-only runtime; remain NOT_MEASURED.
 - Multi-request long-running sequence replay is a future derived workload, not equivalent to treating independent requests at CCU 32 as a persistent conversation.
+
+
+## Concrete workload instructions
+Run prepare-memlens / prepare-mmlong (full evidence), derive-serving for each dataset, and annotate-serving against every pinned Base checkpoint. Only after annotations have been frozen and sufficient unique prompts satisfy each text-token bin may the 42-cell Base/MTP paired benchmark begin. Never run a random-token workload under a real-dataset label.

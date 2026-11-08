@@ -70,6 +70,8 @@ def validate(c: dict, *, execution: bool = False) -> None:
         raise ConfigError("Two expected datasets required")
     if tuple(p["input_lengths"]) != LENGTHS or tuple(p["concurrencies"]) != CONCURRENCIES:
         raise ConfigError("Fixed 7x6 grid was changed")
+    if p.get("input_length_unit") != "text_tokens":
+        raise ConfigError("VLM bins must represent model-tokenized text; multimodal tokens reported separately")
     if p["output_tokens"] != 256 or p["repetitions"] != 3:
         raise ConfigError("Output and repetitions are frozen")
     if len(set(p["seeds"])) != 3 or len(p["seeds"]) != 3:

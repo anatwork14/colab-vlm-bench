@@ -116,7 +116,8 @@ async def run_performance_cell(
         return {"status": "RESUMED_PASS_MEASURED", "cell": cell}
 
     # Native tasks and synthetic reference snippets must not be assigned invented token counts.
-    pool = exact_bin_pool(rows, model_id, cell["input_length"], p["max_bin_relative_error"])
+    pool = exact_bin_pool(rows, model_id, cell["input_length"], p["max_bin_relative_error"],
+                          max_effective_total=s["max_model_len"] - cell["output_tokens"])
     total = cell["requests"] + cell["warmup"]
     try:
         chosen = sample_unique(pool, total, cell["seed"])
@@ -178,6 +179,12 @@ async def run_performance_cell(
         "e2e_p50_ms": quantile([x["e2e_ms"] for x in valid], 0.50),
         "e2e_p95_ms": quantile([x["e2e_ms"] for x in valid], 0.95),
         "e2e_p99_ms": quantile([x["e2e_ms"] for x in valid], 0.99),
+        "actual_effective_prompt_tokens_p50": quantile(
+            [x["input_tokens_reported"] for x in valid
+             if isinstance(x["input_tokens_reported"], int)], 0.50),
+        "actual_effective_prompt_tokens_p95": quantile(
+            [x["input_tokens_reported"] for x in valid
+             if isinstance(x["input_tokens_reported"], int)], 0.95),
         "output_tokens_per_s": sum(x["output_tokens"] for x in valid) / total_time,
         "requests_per_s": len(valid) / total_time,
         "cell_elapsed_s": total_time,
@@ -191,6 +198,7 @@ async def run_performance_cell(
     receipt = {
         **expected, "status": status, "method": cell["mode"], "offered_ccu": cell["concurrency"],
         "warmup": cell["warmup"], "expected_requests": cell["requests"],
+        "text_token_bin_requested": cell["input_length"],
         "successful_requests": len(valid), "failed_requests": len(failures),
         "sample_id_sha256": sample_digest(measured),
         "all_sample_ids": [str(x["id"]) for x in measured],

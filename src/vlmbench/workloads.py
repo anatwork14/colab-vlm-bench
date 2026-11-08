@@ -41,7 +41,8 @@ def load_jsonl(path: str | Path, *, dataset: str, track: str) -> list[dict]:
     return results
 
 
-def exact_bin_pool(rows: list[dict], model_id: str, target_length: int, tolerance: float) -> list[dict]:
+def exact_bin_pool(rows: list[dict], model_id: str, target_length: int, tolerance: float,
+                   max_effective_total: int | None = None) -> list[dict]:
     good = []
     for row in rows:
         counts = row.get("model_token_counts", {}).get(model_id)
@@ -50,9 +51,14 @@ def exact_bin_pool(rows: list[dict], model_id: str, target_length: int, toleranc
         ):
             continue
         total = counts.get("effective_total_tokens")
+        text_length = counts.get("text_tokens")
         if not isinstance(total, int) or total <= 0:
             continue
-        if abs(total - target_length) / target_length <= tolerance:
+        if not isinstance(text_length, int) or text_length <= 0:
+            continue
+        if max_effective_total is not None and total >= max_effective_total:
+            continue
+        if abs(text_length - target_length) / target_length <= tolerance:
             good.append(row)
     return good
 

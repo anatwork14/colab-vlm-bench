@@ -112,7 +112,8 @@
     "require_real_token_counts": true,
     "max_bin_relative_error": 0.05,
     "request_timeout_s": 600,
-    "cell_timeout_s": 1800
+    "cell_timeout_s": 1800,
+    "input_length_unit": "text_tokens"
   },
   "quality": {
     "enabled": true,

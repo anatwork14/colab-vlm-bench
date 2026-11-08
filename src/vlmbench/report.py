@@ -1,92 +1,125 @@
-"""No imputation: summarize observed per-cell receipts and record unsupported cells."""
+"""Receipt-only reporting, native quality status and paired Base/MTP speedups."""
 from __future__ import annotations
-
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
-
+from .analysis import paired_speedups
 from .artifacts import atomic_json
 from .config import cell_id, planned_cells
+
+METRICS = ("ttft_p95_ms", "tpot_p95_ms", "e2e_p95_ms",
+           "output_tokens_per_s", "peak_total_gpu_used_mib")
 
 
 def aggregate(root: Path, config: dict) -> dict:
     root = Path(root)
-    groups = defaultdict(list)
+    grouped = defaultdict(list)
     statuses = Counter()
-    rows = []
+    rows, receipts = [], []
     for cell in planned_cells(config):
         path = root / "cells" / (cell_id(cell) + ".json")
-        if path.exists():
-            item = json.loads(path.read_text(encoding="utf8"))
-            if item.get("cell") != cell:
-                raise ValueError(f"Receipt does not match frozen cell: {path}")
-            status = item.get("status", "UNKNOWN")
-            measured = item.get("metrics") or {}
-        else:
-            status = "NOT_RUN"
-            measured = {}
+        raw = json.loads(path.read_text(encoding="utf8")) if path.is_file() else {}
+        if raw and raw.get("cell") != cell:
+            raise ValueError(f"Invalid receipt cell identity: {path}")
+        status = raw.get("status", "NOT_RUN")
+        observed = raw.get("metrics") or {}
         statuses[status] += 1
-        row = {**cell, "status": status,
-               "ttft_p95_ms": measured.get("ttft_p95_ms"),
-               "e2e_p95_ms": measured.get("e2e_p95_ms"),
-               "tpot_p95_ms": measured.get("tpot_p95_ms"),
-               "output_tokens_per_s": measured.get("output_tokens_per_s"),
-               "peak_total_gpu_used_mib": measured.get("peak_total_gpu_used_mib")}
+        receipts.append({"cell": cell, "status": status,
+                         "sample_id_sha256": raw.get("sample_id_sha256"),
+                         "metrics": observed})
+        row = {**cell, "status": status}
+        row.update({metric: observed.get(metric) for metric in METRICS})
         rows.append(row)
-        groups[(cell["dataset"], cell["model"], cell["mode"])].append(row)
+        grouped[(cell["dataset"], cell["model"], cell["mode"])].append(row)
+    quality = []
+    for path in sorted((root / "quality").glob("*.receipt.json")):
+        raw = json.loads(path.read_text(encoding="utf8"))
+        quality.append({"filename": path.name, "status": raw.get("status"),
+                        "count": raw.get("count"), "failures": raw.get("failures"),
+                        "official_accuracy": raw.get("official_accuracy", "NOT_MEASURED")})
     return {
         "campaign_id": config["campaign_id"], "status_counts": dict(statuses),
         "total_planned_cells": len(rows),
         "groups": [
             {"dataset": ds, "model": model, "mode": mode, "total_cells": len(group),
              "passed": sum(x["status"] == "PASS_MEASURED" for x in group)}
-            for (ds, model, mode), group in sorted(groups.items())
+            for (ds, model, mode), group in sorted(grouped.items())
         ],
-        "rows": rows,
-        "warning": "Only PASS_MEASURED with matching frozen manifests supports system performance claims",
+        "paired_comparisons": paired_speedups(receipts),
+        "quality_receipts": quality, "rows": rows,
+        "warning": "Only matching PASS_MEASURED data support performance claims",
     }
 
 
 def render_markdown(summary: dict) -> str:
     lines = [
         f"# Benchmark runbook — {summary['campaign_id']}", "",
-        "> Results are derived solely from per-cell receipts. Missing data is NOT_MEASURED.", "",
+        "> Only observed receipts support claims; missing data = NOT_MEASURED.", "",
         f"Planned cells: **{summary['total_planned_cells']}**",
-        f"Status counts: \`{json.dumps(summary['status_counts'], sort_keys=True)}\`", "",
-        "| Dataset | Model | Mode | PASS / Planned |",
-        "|---|---|---|---:|",
+        "Status counts: " + json.dumps(summary["status_counts"], sort_keys=True), "",
+        "| Dataset | Model | Mode | PASS / Planned |", "|---|---|---|---:|",
     ]
     for x in summary["groups"]:
-        lines.append(f"| {x['dataset']} | {x['model']} | {x['mode']} | {x['passed']} / {x['total_cells']} |")
+        lines.append(f"| {x['dataset']} | {x['model']} | {x['mode']} | "
+                     f"{x['passed']} / {x['total_cells']} |")
     lines += [
-        "", "## Cell measurements", "",
-        "| Dataset | Model | Mode | Input | CCU | Rep | Status | TTFT p95 ms | TPOT p95 ms | E2E p95 ms | Output tok/s | GPU used MiB |",
+        "", "## Serving measurements", "",
+        "| Dataset | Model | Mode | Text bin | CCU | Rep | Status | TTFT p95 ms | TPOT p95 ms | E2E p95 ms | Output tok/s | GPU used MiB |",
         "|---|---|---|---:|---:|---:|---|---:|---:|---:|---:|---:|",
     ]
-    for r in summary["rows"]:
-        def f(key):
-            val = r[key]
-            return "NOT_MEASURED" if val is None else f"{val:.2f}"
+    for row in summary["rows"]:
+        def metric(key):
+            v = row[key]
+            return "NOT_MEASURED" if v is None else f"{v:.2f}"
         lines.append(
-            f"| {r['dataset']} | {r['model']} | {r['mode']} | {r['input_length']} | "
-            f"{r['concurrency']} | {r['repetition']} | {r['status']} | "
-            f"{f('ttft_p95_ms')} | {f('tpot_p95_ms')} | {f('e2e_p95_ms')} | "
-            f"{f('output_tokens_per_s')} | {f('peak_total_gpu_used_mib')} |"
+            f"| {row['dataset']} | {row['model']} | {row['mode']} | "
+            f"{row['input_length']} | {row['concurrency']} | "
+            f"{row['repetition']} | {row['status']} | "
+            f"{metric('ttft_p95_ms')} | {metric('tpot_p95_ms')} | "
+            f"{metric('e2e_p95_ms')} | {metric('output_tokens_per_s')} | "
+            f"{metric('peak_total_gpu_used_mib')} |"
         )
     lines += [
-        "", "## Scientific limitations", "",
-        "- CCU denotes offered parallel requests; GPU active concurrency may be smaller due to vLLM queueing.",
-        "- Per-stream-chunk latency is not per-token latency under MTP batching.",
-        "- GPU used MiB is total GPU memory, not physical KV pages.",
-        "- Derived context bins are serving-only, not official dataset accuracy.",
-        "- Official quality score requires upstream scorer and independent audit.",
-        "- One A100 hardware SKU does not establish GPU-platform generalization.", "",
+        "", "## Matched Base versus MTP", "",
+        "| Dataset | Model | Bin | CCU | Repetitions | Median speedup | 95% bootstrap CI (descriptive) |",
+        "|---|---|---:|---:|---:|---:|---|",
+    ]
+    for x in summary["paired_comparisons"]:
+        speed = x["throughput_speedup_median"]
+        ci = x["ci95_bootstrap_descriptive"]
+        label = f"{speed:.3f}x" if speed is not None else "NOT_MEASURED"
+        ci_label = f"[{ci[0]:.3f}, {ci[1]:.3f}]" if ci else "NOT_ESTIMATED"
+        lines.append(f"| {x['dataset']} | {x['model']} | {x['input_length']} | "
+                     f"{x['concurrency']} | {x['paired_repetitions']} | "
+                     f"{label} | {ci_label} |")
+    lines += [
+        "", "## Native quality (external official scorer pending)", "",
+        "| Job | Status | Predictions | Failures | Official accuracy |",
+        "|---|---|---:|---:|---|",
+    ]
+    for x in summary["quality_receipts"]:
+        lines.append(f"| {x['filename']} | {x['status']} | {x['count']} | "
+                     f"{x['failures']} | {x['official_accuracy']} |")
+    lines += [
+        "", "## Caveats", "",
+        "- CCU measures offered requests; vLLM may queue excess requests.",
+        "- Input bin targets model-tokenized text, plus visual tokens separately.",
+        "- Streaming content chunks are not token-level ITL in MTP.",
+        "- Total GPU memory used is not physical KV resident bytes.",
+        "- MTP acceptance metrics require backend instrumentation.",
+        "- Truncated serving tasks never produce official accuracy.",
+        "- Official MemLens / MMLongBench scores require independent upstream scoring.",
+        "- Bootstrap CI with three repetitions is only descriptive.", "",
     ]
     return "\n".join(lines)
 
 
 def write_report(root: Path, config: dict) -> dict:
-    s = aggregate(root, config)
-    atomic_json(Path(root) / "summary.json", s)
-    (Path(root) / "RUNBOOK.md").write_text(render_markdown(s), encoding="utf8")
-    return s
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    summary = aggregate(root, config)
+    atomic_json(root / "summary.json", summary)
+    tmp = root / "RUNBOOK.md.pending"
+    tmp.write_text(render_markdown(summary), encoding="utf8")
+    tmp.replace(root / "RUNBOOK.md")
+    return summary
