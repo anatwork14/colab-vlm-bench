@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .artifacts import atomic_json, sha256, staged_copy, sync_files
-from .config import cell_id, fingerprint, load_config, plan_summary, planned_cells
+from .config import cell_id, fingerprint, load_config, plan_summary, planned_cells, selected_scope
 from .datasets import normalize_memlens, normalize_mmlong
 from .engine import a100_inventory, server_argv, start_server, stop_server, wait_ready
 from .quality import import_official, score_proxy
@@ -39,7 +39,8 @@ def run_job(args) -> int:
     cfg = load_config(args.config, execution=True)
     model = next((m for m in cfg["models"] if m["id"] == args.model), None)
     ds = next((d for d in cfg["datasets"] if d["id"] == args.dataset), None)
-    if model is None or ds is None or args.mode not in cfg["modes"]:
+    if (model is None or ds is None or args.mode not in cfg["modes"]
+            or args.model not in selected_scope(cfg)["model_ids"]):
         raise ValueError("Invalid model/dataset/mode selection")
     job_key = f"{args.model}__{args.mode}__{args.dataset}__{'quality' if args.quality else 'serving'}"
     root = Path(cfg["storage"]["local_scratch_dir"]) / cfg["campaign_id"]
@@ -158,6 +159,10 @@ def run_job(args) -> int:
             print(json.dumps({"cell": cell_id(cell), "status": result["status"]}), flush=True)
         if args.quality:
             quality_rows = load_jsonl(native_path, dataset=ds["id"], track="native_quality")
+            from .quality import deterministic_subset
+            quality_rows = deterministic_subset(
+                quality_rows, int(cfg["quality"].get("max_samples", 0)),
+                int(cfg["quality"].get("sample_seed", 42)))
             result = asyncio.run(run_quality_predictions(
                 cfg, args.model, args.mode, ds["id"], quality_rows, root, drive_root))
             print("Quality predictions:", result["status"])

@@ -1,0 +1,155 @@
+{
+  "schema_version": "1.0",
+  "campaign_id": "a100-qwen08b-4b-pilot-v1",
+  "status": "ENGINEERING_PILOT_NOT_RUN",
+  "dry_run": true,
+  "hardware": {
+    "provider": "google_colab",
+    "expected_gpu_substring": "A100",
+    "min_vram_mib": 39000,
+    "tensor_parallel_size": 1,
+    "dtype": "bfloat16",
+    "gpu_memory_utilization": 0.88
+  },
+  "serving": {
+    "backend": "vllm",
+    "backend_version": "0.29.0",
+    "port": 8000,
+    "max_model_len": 32768,
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 8192,
+    "enable_prefix_caching": false,
+    "temperature": 0,
+    "thinking": false,
+    "max_images_per_prompt": 256
+  },
+  "models": [
+    {
+      "id": "qwen35_08b",
+      "hf_id": "Qwen/Qwen3.5-0.8B",
+      "source_drive_path": "REPLACE_DRIVE_PATH",
+      "revision": "UNPINNED",
+      "mtp_tokens": 1,
+      "assistant_drive_path": null
+    },
+    {
+      "id": "qwen35_2b",
+      "hf_id": "Qwen/Qwen3.5-2B",
+      "source_drive_path": "REPLACE_DRIVE_PATH",
+      "revision": "UNPINNED",
+      "mtp_tokens": 1,
+      "assistant_drive_path": null
+    },
+    {
+      "id": "qwen35_4b",
+      "hf_id": "Qwen/Qwen3.5-4B",
+      "source_drive_path": "REPLACE_DRIVE_PATH",
+      "revision": "UNPINNED",
+      "mtp_tokens": 1,
+      "assistant_drive_path": null
+    },
+    {
+      "id": "qwen35_9b",
+      "hf_id": "Qwen/Qwen3.5-9B",
+      "source_drive_path": "REPLACE_DRIVE_PATH",
+      "revision": "UNPINNED",
+      "mtp_tokens": 1,
+      "assistant_drive_path": null
+    },
+    {
+      "id": "gemma4_e4b",
+      "hf_id": "google/gemma-4-E4B-it",
+      "source_drive_path": "REPLACE_DRIVE_PATH",
+      "revision": "UNPINNED",
+      "mtp_tokens": 1,
+      "assistant_drive_path": "REPLACE_MATCHING_ASSISTANT_DRIVE_PATH"
+    }
+  ],
+  "modes": [
+    "base",
+    "mtp"
+  ],
+  "datasets": [
+    {
+      "id": "memlens",
+      "native_path": "REPLACE_DRIVE_PATH/memlens_native.jsonl",
+      "derived_path": "REPLACE_DRIVE_PATH/memlens_serving.jsonl",
+      "scorer": "upstream_llm_judge_external"
+    },
+    {
+      "id": "mmlongbench_doc",
+      "native_path": "REPLACE_DRIVE_PATH/mmlong_native.jsonl",
+      "derived_path": "REPLACE_DRIVE_PATH/mmlong_serving.jsonl",
+      "scorer": "upstream_mmlong_external"
+    }
+  ],
+  "performance": {
+    "input_lengths": [
+      128,
+      512,
+      1024,
+      2048,
+      4096,
+      8192,
+      16384
+    ],
+    "concurrencies": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "output_tokens": 256,
+    "repetitions": 3,
+    "seeds": [
+      42,
+      43,
+      44
+    ],
+    "max_cells_per_session": 6,
+    "require_real_token_counts": true,
+    "max_bin_relative_error": 0.05,
+    "request_timeout_s": 600,
+    "cell_timeout_s": 1800,
+    "input_length_unit": "text_tokens"
+  },
+  "quality": {
+    "enabled": true,
+    "max_output_tokens": 256,
+    "concurrencies": [
+      1
+    ],
+    "require_full_native_context": true,
+    "official_scorer_required": true,
+    "max_model_len": 65536,
+    "max_num_seqs": 1,
+    "max_samples": 48,
+    "sample_seed": 42
+  },
+  "storage": {
+    "drive_results_dir": "REPLACE_DRIVE_PATH/results",
+    "local_scratch_dir": "/content/vlmbench",
+    "sync_after_each_cell": true
+  },
+  "execution_scope": {
+    "kind": "engineering_pilot",
+    "model_ids": [
+      "qwen35_08b",
+      "qwen35_4b"
+    ],
+    "input_lengths": [
+      2048,
+      16384
+    ],
+    "concurrencies": [
+      1,
+      8,
+      32
+    ],
+    "repetitions": [
+      0
+    ]
+  }
+}

@@ -1,11 +1,26 @@
 """Auxiliary EM/F1 only; official scores imported from independent upstream evaluator."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import unicodedata
 from collections import Counter
 from pathlib import Path
+
+
+def deterministic_subset(rows: list[dict], count: int, seed: int) -> list[dict]:
+    """Stable matched subset for engineering pilot only; never official full score."""
+    if count <= 0 or count >= len(rows):
+        return list(rows)
+    ranked = sorted(
+        rows,
+        key=lambda r: hashlib.sha256(
+            (str(seed) + "|" + str(r["id"])).encode("utf8")
+        ).hexdigest(),
+    )
+    ids = {str(row["id"]) for row in ranked[:count]}
+    return [row for row in rows if str(row["id"]) in ids]
 
 
 def normalize(s: str) -> list[str]:

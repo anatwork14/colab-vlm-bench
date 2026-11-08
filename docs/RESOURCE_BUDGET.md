@@ -1,5 +1,14 @@
 # A100 campaign resource/time budget — prospective planning only
 
+## First-results priority: Qwen3.5-0.8B + Qwen3.5-4B
+
+- **Pilot:** 2 models × 2 modes × 2 datasets × 2 text lengths (2K/16K) × 3 offered CCUs (1/8/32) × 1 repetition = **48 cells**, **2,816 measured requests**, **656 warmups**, **720,896 requested output tokens**.
+- **Confirmatory:** 2 models × 2 modes × 2 datasets × 7 lengths × 6 CCUs × 3 repetitions = **1,008 cells**, **45,696 measured requests**, **10,584 warmups** and **11,698,176 requested output tokens**.
+- **Native quality:** approximately 1,880 dataset questions × 4 model/mode configs = **up to 7,520 complete-context predictions**, actual publisher release frozen at execution. Pilot uses a deterministic 48-question subset per dataset/config (384 predictions total), explicitly **not an official full score**.
+- **Provisional GPU budget (unverified):** pilot around **3–10 A100 hours** including GPU qualification and annotation; two-model confirmatory serving **~14–30 A100 hours**, quality **~8–25 hours**, plus **~3–8 hours** for setup/restarts and Drive export. **Total first-priority full campaign approximately 25–65 GPU hours** before external judge and additional replay. Re-estimate from actual pilot receipts; no Colab runtime guarantee.
+- **Stop/go:** do not allocate GPU for Qwen 2B/9B or Gemma E4B until the priority pair has paired throughput/latency, capacity boundaries, failure receipts and quality evaluation status documented.
+
+
 Hardware: Google Colab 1× A100 40GB BF16 TP1. Colab GPU and per-session runtime are best-effort, not guaranteed; verify actual CU balance and availability on the owner's authenticated account before running.
 
 ## Planned volume

@@ -74,3 +74,14 @@ def test_empty_campaign_not_misreported_as_gpu(tmp_path):
     report = (tmp_path / "RUNBOOK.md").read_text()
     assert "NOT_MEASURED" in report
     assert "PASS_MEASURED" not in s["status_counts"]
+
+
+def test_deterministic_pilot_native_quality_subset():
+    from vlmbench.quality import deterministic_subset
+    rows = [{"id": f"sample-{i}"} for i in range(100)]
+    a = deterministic_subset(rows, 48, 42)
+    b = deterministic_subset(rows, 48, 42)
+    assert [x["id"] for x in a] == [x["id"] for x in b]
+    assert len({x["id"] for x in a}) == 48
+    assert deterministic_subset(rows, 0, 42) == rows
+    assert [x["id"] for x in deterministic_subset(rows, 48, 43)] != [x["id"] for x in a]

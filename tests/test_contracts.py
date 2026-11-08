@@ -89,3 +89,60 @@ def test_request_count_contract():
     assert [request_count(x) for x in [1, 2, 4, 8, 16, 32]] == [16, 16, 16, 32, 64, 128]
     with pytest.raises(ConfigError):
         request_count(3)
+
+
+def test_priority_pilot_scope_and_workload():
+    from vlmbench.config import selected_scope
+    config = load_config(CONFIG.parent / "a100_qwen_priority_pilot.json")
+    summary = plan_summary(config)
+    assert summary["model_count"] == 2
+    assert summary["registered_model_count"] == 5
+    assert summary["cell_count"] == 48
+    assert summary["measured_requests"] == 2816
+    assert summary["warmup_requests"] == 656
+    assert summary["nominal_output_tokens"] == 720896
+    assert summary["quality_jobs"] == 8
+    assert selected_scope(config)["kind"] == "engineering_pilot"
+    assert config["quality"]["max_samples"] == 48
+    assert {cell["model"] for cell in planned_cells(config)} == {"qwen35_08b", "qwen35_4b"}
+
+
+def test_priority_full_scope_and_outputs():
+    config = load_config(CONFIG.parent / "a100_qwen_priority_full.json")
+    summary = plan_summary(config)
+    assert summary["cell_count"] == 1008
+    assert summary["measured_requests"] == 45696
+    assert summary["warmup_requests"] == 10584
+    assert summary["nominal_output_tokens"] == 11698176
+    assert summary["quality_jobs"] == 8
+    assert config["quality"]["max_samples"] == 0
+
+
+def test_priority_scope_rejects_deferred_models_and_truncated_confirmatory():
+    from vlmbench.config import selected_scope
+    config = load_config(CONFIG.parent / "a100_qwen_priority_full.json")
+    config["execution_scope"]["model_ids"].append("qwen35_2b")
+    with pytest.raises(ConfigError, match="canonical order"):
+        validate(config)
+    config = load_config(CONFIG.parent / "a100_qwen_priority_full.json")
+    config["execution_scope"]["concurrencies"] = [1, 8, 32]
+    with pytest.raises(ConfigError, match="full 42-cell"):
+        validate(config)
+    config = load_config(CONFIG.parent / "a100_qwen_priority_full.json")
+    config["quality"]["max_samples"] = 48
+    with pytest.raises(ConfigError, match="restricted"):
+        validate(config)
+
+
+def test_priority_execution_checks_only_selected_model_credentials():
+    config = load_config(CONFIG.parent / "a100_qwen_priority_pilot.json")
+    config["dry_run"] = False
+    config["storage"]["drive_results_dir"] = "/content/drive/MyDrive/vlmbench-results"
+    for model in config["models"]:
+        if model["id"] in {"qwen35_08b", "qwen35_4b"}:
+            model["revision"] = "pinned_sha"
+            model["source_drive_path"] = "/content/drive/MyDrive/weights/" + model["id"]
+    for dataset in config["datasets"]:
+        dataset["native_path"] = "/content/drive/MyDrive/datasets/" + dataset["id"] + "/native.jsonl"
+        dataset["derived_path"] = "/content/drive/MyDrive/datasets/" + dataset["id"] + "/derived.jsonl"
+    validate(config, execution=True)
