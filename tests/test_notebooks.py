@@ -74,7 +74,8 @@ def test_memlens_colab_ram_regression_and_clean_outputs():
     assert "normalize_memlens(" in combined
     assert "ijson>=3.3" in combined
     assert "pyarrow>=15" in combined
-    assert 'merge", "--ff-only"' in combined
+    assert 'checkout", "--detach", "FETCH_HEAD"' in combined
+    assert "BENCH_SOURCE_REF" in combined
     assert "drive.mount" in combined
     for c in obj["cells"]:
         if c["cell_type"] == "code":
