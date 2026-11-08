@@ -53,7 +53,7 @@ def test_single_model_campaign_no_deferred_revision_requirements(tmp_path):
 @pytest.mark.parametrize("name", ["Qwen3.5-0.8B.ipynb", "Qwen3.5-4B.ipynb"])
 def test_seven_method_notebook_cells_and_hallucination_gate(name):
     notebook = json.loads((NBS / name).read_text(encoding="utf8"))
-    assert len(notebook["cells"]) == 38
+    assert len(notebook["cells"]) == (39 if name == "Qwen3.5-0.8B.ipynb" else 38)
     combined = "\n".join(str(c.get("source", "")) for c in notebook["cells"])
     for method in ("h2o_base", "da_base", "ecrd_base", "h2o_mtp", "da_mtp"):
         assert method in combined or "METHOD_SELECTION" in combined
@@ -94,10 +94,18 @@ def test_full_colab_resource_and_cost_guard_before_gpu_steps(name):
     assert preflight < staging < annotation < serving
     combined = "\n".join(cells)
     assert "CPU_PREFLIGHT_ONLY" in combined
-    assert "ANNOTATION_CALL_BUDGET = 8" in combined
+    assert ("ANNOTATION_CALL_BUDGET = 24" if name == "Qwen3.5-0.8B.ipynb"\
+            else "ANNOTATION_CALL_BUDGET = 8") in combined
     assert "serving_readiness(" in combined
     assert "ACTIVE_DATASETS" in combined
-    assert "RUN_GPU_ANNOTATION = False" in combined
-    assert "RUN_BASE = False" in combined
+    if name == "Qwen3.5-0.8B.ipynb":
+        assert "RUN_GPU_ANNOTATION = True" in combined
+        assert "RUN_BASE = True" in combined
+        assert "MAX_CELLS_PER_JOB = 1" in combined
+        assert "ready_datasets" in combined
+        assert "No verified-ready cells" in combined
+    else:
+        assert "RUN_GPU_ANNOTATION = False" in combined
+        assert "RUN_BASE = False" in combined
     assert "RUN_MTP = False" in combined
     assert "RUN_NATIVE_QUALITY = False" in combined
