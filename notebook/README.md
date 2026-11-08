@@ -1,6 +1,6 @@
 # Standalone-upload Colab notebooks — seven-arm campaign
 
-Each notebook now includes **7 independent methods**, not just Base/MTP: Base, H2O+Base, Declarative Attention+Base, ECRD Grounding+Base, native MTP, H2O+MTP, DA+MTP. Each .ipynb has 36 cells with a method planner, conditional dispatcher, temperature=0/top_p=1 checks and grounded-hallucination scoring from independent judge annotations. Five external-method arms are explicitly BLOCKED until real Qwen3.5+vLLM+A100 implementations are qualified. The notebooks DO NOT fake method results by reusing Base outputs.
+Each notebook now includes **7 independent methods**, not just Base/MTP: Base, H2O+Base, Declarative Attention+Base, ECRD Grounding+Base, native MTP, H2O+MTP, DA+MTP. Each .ipynb has 38 cells with a method planner, conditional dispatcher, temperature=0/top_p=1 checks and grounded-hallucination scoring from independent judge annotations. Five external-method arms are explicitly BLOCKED until real Qwen3.5+vLLM+A100 implementations are qualified. The notebooks DO NOT fake method results by reusing Base outputs.
 
 Methods manifest: `configs/a100_qwen_7methods_pilot.json` (168 planned cells, 48 native-routable) or `configs/a100_qwen_7methods_full.json` (3,528 planned cells, 1,008 native-routable). Raw native quality uses natural EOS; derived serving uses 256 fixed output tokens. Official quality and hallucination require external evaluation.
 
@@ -39,3 +39,11 @@ For MMLongBench-Doc, the adapter now supports publisher QA `.parquet` via PyArro
 If rerunning an existing Colab session, execute the setup cell to fast-forward the cloned repo to current `main` before retrying normalization. Upload the latest `.ipynb` from GitHub (old Colab tabs do not auto-update). Never commit executed notebook outputs, raw dataset answers, tokens or private runtime diagnostics into GitHub.
 
 For a full code-cell-by-code-cell review and RAM/SSD thresholds, see [COLAB_STEPWISE_AUDIT.md](../docs/COLAB_STEPWISE_AUDIT.md). This checklist distinguishes CPU test PASS from still-unverified A100 capacity.
+
+## Troubleshooting: preflight succeeds but the notebook says `NOT_RUN`
+
+This is the expected default, not evidence of a successful inference run. The Qwen3.5-0.8B notebook deliberately starts with `RUN_GPU_ANNOTATION=False`, `RUN_BASE=False`, `RUN_MTP=False`, `RUN_METHOD_MATRIX=False`, and `RUN_NATIVE_QUALITY=False` to avoid surprise GPU charges. After a successful CPU/SSD gate, weight staging, and normalization, the candidate JSONL still has **no vLLM-verified prompt-token counts**. Step 9 therefore reports `BLOCKED_NO_ANNOTATED_DATASET`; Step 10/11 skip inference when their switches are off.
+
+To obtain a real measurement, first set `RUN_GPU_ANNOTATION=True` in Step 1 and re-execute that configuration cell. Run Step 8 with the existing default **8 new requests per active dataset** and inspect the recorded `verified_total` and errors. On later executions the file resumes from prior verified rows; repeat only deliberately after checking the receipts. Run Step 9 again: it must show at least one `READY_CELLS_PRESENT` dataset and some eligible cells **before** enabling `RUN_BASE=True` and running Step 10. For a pilot, test Base before MTP and never enable all seven arms expecting unsupported H₂O/DA/ECRD variants to run. Raise annotation budget only with explicit compute approval and clear token-capacity evidence. Missing unique prompts at higher CCU cannot be fixed by GPU retries; leave such cells blocked or expand a source-qualified workload.
+
+The November 9 notebook repair removes a duplicate CPU guard, an extra Colab-badge cell, and saved execution counts/outputs introduced by the `cannot run` commit. Saved outputs fail `tests/test_notebooks.py` and can reveal local Drive paths; keep receipts on Drive rather than committing executed notebooks. **GitHub notebook checks do not demonstrate actual A100/vLLM runtime success.**
