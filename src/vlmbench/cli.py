@@ -245,6 +245,7 @@ def run_job(args) -> int:
         cells = [x for x in planned_cells(cfg)
                  if x["model"] == args.model and x["dataset"] == args.dataset and x["mode"] == args.mode]
         done = 0
+        pilot_failure = None
         limit = args.max_cells if args.max_cells > 0 else int(cfg["performance"]["max_cells_per_session"])
         if args.quality:
             cells = []
@@ -266,6 +267,13 @@ def run_job(args) -> int:
                 cfg, cell, rows, root, drive_root, args.model, derived_hash))
             done += 1
             print(json.dumps({"cell": cell_id(cell), "status": result["status"]}), flush=True)
+            if (selected_scope(cfg)["kind"] == "engineering_pilot" and
+                    result["status"] in {"ERROR", "TIMEOUT", "PARTIAL_FAILURE"}):
+                pilot_failure = {"cell": cell_id(cell), "status": result["status"]}
+                print("Pilot circuit breaker: stop remaining cells after first "
+                      "runtime failure. Inspect Drive receipt before continuing.",
+                      flush=True)
+                break
         if args.quality:
             quality_rows = quality_probe
             result = asyncio.run(run_quality_predictions(
@@ -274,7 +282,8 @@ def run_job(args) -> int:
         write_report(root, cfg)
         sync_files(root, drive_root)
         atomic_json(root / "run_status.json", {
-            "status": "JOB_PARTIAL_OR_COMPLETE",
+            "status": "JOB_PILOT_STOPPED_ON_FAILURE" if pilot_failure else "JOB_PARTIAL_OR_COMPLETE",
+            "pilot_failure": pilot_failure,
             "model": args.model, "mode": args.mode, "dataset": ds["id"],
             "cells_attempted_this_invocation": done,
             "gpu": inventory, "note": "GPU model execution does not certify native MTP correctness",

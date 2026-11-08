@@ -30,3 +30,8 @@ Metrics are divided into quality, evidence-grounded hallucination, end-to-end se
 **Capacity:** FAIL, OOM, TIMEOUT, UNSUPPORTED_CONTEXT and INSUFFICIENT_WORKLOAD are not zero latency values; they are reported separately. A model that only reaches CCU8 cannot be credited as CCU32 success. Median per-repetition Base/MTP throughput ratios are computed only on matched PASS rows, with descriptive bootstrap CI for n>=3.
 
 **Output:** Performance fixed target 256 actually generated tokens; if usage tokens are missing/mismatch, cell is PARTIAL_FAILURE even if HTTP 200. Native quality uses natural stopping.
+
+| Host RAM minimum available / peak used | Periodic system RAM available/used during measured cells | `psutil` on Colab Linux; independent of GPU memory | serving |
+| Local SSD minimum free | Periodic free space for `/content/vlmbench` filesystem | Linux disk usage; **not** Google Drive quota | serving |
+
+**Cost protection (pilot):** any ERROR, TIMEOUT or PARTIAL_FAILURE stops remaining cells in that invocation so owners can inspect the first failure before exhausting A100 compute units. The fixed confirmatory protocol retains all attempted capacity/failure cells, but never substitutes successful values for failed cells. 

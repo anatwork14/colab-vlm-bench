@@ -101,3 +101,20 @@ def test_greedy_accuracy_payload_is_frozen():
     c["serving"]["temperature"] = 0.7
     with pytest.raises(ConfigError, match="temperature=0"):
         validate(c)
+
+
+def test_host_gpu_memory_are_separately_named_in_sampler():
+    from vlmbench.telemetry import GPUSampler
+    monitor = GPUSampler()
+    monitor.samples = [
+        {"used_mib": 12000, "ram_available_gib": 62.0,
+         "ram_used_gib": 18.0, "disk_free_gib": 130.0},
+        {"used_mib": 14000, "ram_available_gib": 58.0,
+         "ram_used_gib": 22.0, "disk_free_gib": 128.0},
+    ]
+    report = monitor.report()
+    assert report["peak_total_gpu_used_mib"] == 14000
+    assert report["minimum_available_system_ram_gib"] == 58.0
+    assert report["minimum_free_local_ssd_gib"] == 128.0
+    assert report["peak_system_ram_used_gib"] == 22.0
+    assert report["physical_kv_bytes"] == "NOT_MEASURED"
