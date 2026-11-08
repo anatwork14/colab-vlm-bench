@@ -23,6 +23,8 @@ from .methods import manifest_from_path, plan as methods_plan, native_mode_or_bl
 from .hallucination import read_annotations, score_evidence_annotations
 
 from .derivation import generate_candidates, annotate_with_backend
+from .preflight import (PreflightError, assess_resources, checkpoint_inventory,
+                        host_resources, serving_readiness)
 
 
 def _installed(name: str) -> str:
@@ -77,6 +79,115 @@ def run_job(args) -> int:
     inventory = None
     proc = None
     try:
+        native_path, derived_path = Path(ds["native_path"]), Path(ds["derived_path"])
+        if args.quality and not native_path.is_file():
+            raise FileNotFoundError("Quality needs complete native Drive JSONL")
+        if not args.quality and not derived_path.is_file():
+            raise FileNotFoundError("Serving needs derived, processor-annotated Drive JSONL")
+
+        # Run CPU-only readiness and SSD/RAM checks BEFORE staging weights and
+        # launching vLLM. Avoid billable GPU time for deterministic missing-data
+        # errors. These checks do not claim a GPU inference pass.
+        src_files = checkpoint_inventory(Path(model["source_drive_path"]))
+        resources = assess_resources(
+            host_resources(Path(cfg["storage"]["local_scratch_dir"])),
+            src_files["total_bytes"],
+        )
+        atomic_json(root / "preflight" / (job_key + ".resources.json"), resources)
+        if resources["status"] != "CPU_PREFLIGHT_PASS":
+            atomic_json(root / "run_status.json", {
+                "status": "BLOCKED_CPU_RESOURCES",
+                "issues": resources["issues"], "job": job_key,
+            })
+            sync_files(root, drive_root)
+            print(json.dumps({"status": "BLOCKED_CPU_RESOURCES",
+                              "issues": resources["issues"]}), flush=True)
+            return 2
+        if not args.quality:
+            scoped_cells = [
+                x for x in planned_cells(cfg)
+                if x["model"] == args.model and x["dataset"] == args.dataset
+                and x["mode"] == args.mode
+            ]
+            pending_cells = [
+                cell for cell in scoped_cells
+                if not (root / "cells" / f"{cell_id(cell)}.json").is_file()
+            ]
+            if not pending_cells:
+                write_report(root, cfg)
+                atomic_json(root / "run_status.json", {
+                    "status": "NO_PENDING_CELLS_NO_GPU_START",
+                    "job": job_key, "recorded_cells": len(scoped_cells),
+                })
+                sync_files(root, drive_root)
+                print(json.dumps({"status": "NO_PENDING_CELLS_NO_GPU_START",
+                                  "recorded_cells": len(scoped_cells)}), flush=True)
+                return 0
+            readiness = serving_readiness(
+                derived_path, dataset=ds["id"], model_id=args.model,
+                cells=pending_cells,
+                tolerance=cfg["performance"]["max_bin_relative_error"],
+                max_model_len=cfg["serving"]["max_model_len"],
+            )
+            atomic_json(root / "preflight" / (job_key + ".workload.json"), readiness)
+            if not readiness["ready_cells"]:
+                atomic_json(root / "run_status.json", {
+                    "status": "BLOCKED_NO_ELIGIBLE_CELLS",
+                    "job": job_key, "eligible": readiness["eligible_by_text_bin"],
+                })
+                sync_files(root, drive_root)
+                print(json.dumps({"status": "BLOCKED_NO_ELIGIBLE_CELLS",
+                                  "eligible": readiness["eligible_by_text_bin"]}),
+                      flush=True)
+                return 2
+        if args.quality:
+            existing_receipt = root / "quality" / (
+                f"{ds['id']}__{args.model}__{args.mode}.receipt.json"
+            )
+            existing_predictions = root / "quality" / (
+                f"{ds['id']}__{args.model}__{args.mode}.jsonl"
+            )
+            if existing_receipt.is_file() and existing_predictions.is_file():
+                prior = json.loads(existing_receipt.read_text(encoding="utf8"))
+                if (prior.get("status") == "QUALITY_PREDICTIONS_UNSCORED" and
+                        prior.get("prediction_sha256") == sha256(existing_predictions)):
+                    write_report(root, cfg)
+                    atomic_json(root / "run_status.json", {
+                        "status": "QUALITY_ALREADY_RECORDED_NO_GPU_START",
+                        "job": job_key, "count": prior.get("count"),
+                    })
+                    sync_files(root, drive_root)
+                    print(json.dumps({"status": "QUALITY_ALREADY_RECORDED_NO_GPU_START",
+                                      "count": prior.get("count")}), flush=True)
+                    return 0
+        if args.quality:
+            # Check the *actual pilot subset* image count before allocating
+            # the 65,536-token quality server. No silently dropped images.
+            quality_probe = load_jsonl(native_path, dataset=ds["id"], track="native_quality")
+            from .quality import deterministic_subset
+            quality_probe = deterministic_subset(
+                quality_probe, int(cfg["quality"].get("max_samples", 0)),
+                int(cfg["quality"].get("sample_seed", 42)))
+            max_images = cfg["serving"]["max_images_per_prompt"]
+            over_limit = [
+                (str(row["id"]), sum(
+                    p.get("type") == "image_path"
+                    for m in row["messages"] if isinstance(m["content"], list)
+                    for p in m["content"]))
+                for row in quality_probe
+            ]
+            over_limit = [(sid, count) for sid, count in over_limit if count > max_images]
+            if over_limit:
+                atomic_json(root / "run_status.json", {
+                    "status": "BLOCKED_QUALITY_IMAGE_LIMIT",
+                    "limit": max_images, "over_limit_count": len(over_limit),
+                    "examples": over_limit[:8], "job": job_key,
+                })
+                sync_files(root, drive_root)
+                print(json.dumps({"status": "BLOCKED_QUALITY_IMAGE_LIMIT",
+                                  "over_limit_count": len(over_limit),
+                                  "limit": max_images}), flush=True)
+                return 2
         inventory = a100_inventory()
         import torch
         if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
@@ -88,11 +199,6 @@ def run_job(args) -> int:
         assistant = None
         if args.mode == "mtp" and model["id"] == "gemma4_e4b":
             assistant = staged_copy(model["assistant_drive_path"], staging_dir / "assistant")
-        native_path, derived_path = Path(ds["native_path"]), Path(ds["derived_path"])
-        if args.quality and not native_path.is_file():
-            raise FileNotFoundError("Quality needs complete native Drive JSONL")
-        if not args.quality and not derived_path.is_file():
-            raise FileNotFoundError("Serving needs derived, processor-annotated Drive JSONL")
         model_meta = {
             "checkpoint": model["hf_id"], "revision": model["revision"],
             "target_files": target["files"], "assistant_files": assistant["files"] if assistant else [],
@@ -128,7 +234,7 @@ def run_job(args) -> int:
             "mtp_method_qualification": "NEEDS_BACKEND_TRACE_REVIEW" if args.mode == "mtp" else "NA",
         })
         proc = start_server(command, root / "logs" / (job_key + ".server.log"))
-        wait_ready(proc, cfg["serving"]["port"])
+        wait_ready(proc, cfg["serving"]["port"], expected_model=args.model)
         atomic_json(root / "launch" / (job_key + ".json"), {
             "argv": command, "startup_status": "READY",
             "expected_method": args.mode,
@@ -139,6 +245,7 @@ def run_job(args) -> int:
         cells = [x for x in planned_cells(cfg)
                  if x["model"] == args.model and x["dataset"] == args.dataset and x["mode"] == args.mode]
         done = 0
+        pilot_failure = None
         limit = args.max_cells if args.max_cells > 0 else int(cfg["performance"]["max_cells_per_session"])
         if args.quality:
             cells = []
@@ -160,19 +267,23 @@ def run_job(args) -> int:
                 cfg, cell, rows, root, drive_root, args.model, derived_hash))
             done += 1
             print(json.dumps({"cell": cell_id(cell), "status": result["status"]}), flush=True)
+            if (selected_scope(cfg)["kind"] == "engineering_pilot" and
+                    result["status"] in {"ERROR", "TIMEOUT", "PARTIAL_FAILURE"}):
+                pilot_failure = {"cell": cell_id(cell), "status": result["status"]}
+                print("Pilot circuit breaker: stop remaining cells after first "
+                      "runtime failure. Inspect Drive receipt before continuing.",
+                      flush=True)
+                break
         if args.quality:
-            quality_rows = load_jsonl(native_path, dataset=ds["id"], track="native_quality")
-            from .quality import deterministic_subset
-            quality_rows = deterministic_subset(
-                quality_rows, int(cfg["quality"].get("max_samples", 0)),
-                int(cfg["quality"].get("sample_seed", 42)))
+            quality_rows = quality_probe
             result = asyncio.run(run_quality_predictions(
                 cfg, args.model, args.mode, ds["id"], quality_rows, root, drive_root))
             print("Quality predictions:", result["status"])
         write_report(root, cfg)
         sync_files(root, drive_root)
         atomic_json(root / "run_status.json", {
-            "status": "JOB_PARTIAL_OR_COMPLETE",
+            "status": "JOB_PILOT_STOPPED_ON_FAILURE" if pilot_failure else "JOB_PARTIAL_OR_COMPLETE",
+            "pilot_failure": pilot_failure,
             "model": args.model, "mode": args.mode, "dataset": ds["id"],
             "cells_attempted_this_invocation": done,
             "gpu": inventory, "note": "GPU model execution does not certify native MTP correctness",

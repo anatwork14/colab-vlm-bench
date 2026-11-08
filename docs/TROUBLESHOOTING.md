@@ -24,3 +24,12 @@ Always preserve raw logs and annotate failures under immutable run IDs. Do not m
 **Fix:** use upstream source `normalize_memlens` with `ijson.items(file, "item")`, in-place per-turn role canonicalization, per-example JSONL writes and an atomic rename. Do not create `patched_dataset_32k.json`. The derived prompt builder indexes byte offsets instead of loading all native 32K prompts into memory and bounds PDF text cache to two documents.
 
 **Check:** `pip install -e '.[dev]'`; `pytest tests/test_datasets.py tests/test_notebooks.py -q`. Google Colab must reload the latest `main` repo checkout and re-import modules from a fresh runtime. If a previous process wrote only `.pending`, remove that *uncommitted temp file only* after auditing; never delete normalized source data. The current implementation recomputes incomplete outputs from scratch, not via unreliable row-level resume.
+
+## Cost-aware preflight blocks / 16K and CCU32 (2026-11-08)
+
+- `CPU_PREFLIGHT_BLOCKED`: model path/config/tokenizer missing or actual free RAM/SSD below a conservative gate; move the GPU allocation decision until the input is corrected.
+- `BLOCKED_NO_ELIGIBLE_CELLS`: the annotated JSONL does not yet have enough real processor-verified unique prompts (CCU1 needs 17, CCU8 needs 40, CCU32 needs 160 including warmups). **No vLLM startup occurs.** Rerun annotation with a capped budget; do not fabricate repeated prompts.
+- Annotation files ending in `.state.json` pin original candidate source SHA + model ID for safe partial resume. If the source changed, create a new output/campaign ID; never reuse stale measurements.
+- `BLOCKED_QUALITY_IMAGE_LIMIT`: native question contains more original images than `max_images_per_prompt`. This is not permission to silently drop evidence. Increase only after A100 capacity smoke, or report unsupported.
+- `WARMUP_INVALID`, model boot failure, GPU OOM and timeout are truthful experiment outcomes. Diagnose with launch log; do not re-label as PASS or switch hardware during confirmatory study.
+- Reusing a Colab checkout now fetches and fast-forwards `main`. Do not execute an older notebook already cached in another Colab tab.

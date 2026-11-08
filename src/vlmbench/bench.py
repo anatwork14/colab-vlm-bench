@@ -149,8 +149,10 @@ async def run_performance_cell(
                                               max_tokens=cell["output_tokens"],
                                               streaming=True, fixed_output=True)
                     return await stream_completion(client, url, payload, str(sample["id"]))
-            for warmup in warmups:
-                warm = await one(warmup)
+            # Warm up the actual offered parallelism. Thirty-two sequential
+            # 16K requests are slow, costly, and not a CCU32 warmup.
+            warm_observations = await asyncio.gather(*(one(w) for w in warmups))
+            for warm in warm_observations:
                 if warm["status"] != "HTTP_OK" or warm["output_tokens"] != cell["output_tokens"]:
                     raise WorkloadError(f"WARMUP_INVALID: {warm['error']} / {warm['output_tokens']}")
             start_cell = perf_counter()
@@ -193,6 +195,9 @@ async def run_performance_cell(
         "requests_per_s": len(valid) / total_time,
         "cell_elapsed_s": total_time,
         "peak_total_gpu_used_mib": gpu_report["peak_total_gpu_used_mib"],
+        "minimum_available_system_ram_gib": gpu_report["minimum_available_system_ram_gib"],
+        "minimum_free_local_ssd_gib": gpu_report["minimum_free_local_ssd_gib"],
+        "peak_system_ram_used_gib": gpu_report["peak_system_ram_used_gib"],
         "physical_kv_bytes": "NOT_MEASURED",
         "mtp_acceptance_rate": "NOT_MEASURED",
         "queue_wait_ms": "NOT_MEASURED",
@@ -239,6 +244,8 @@ async def run_quality_predictions(cfg: dict, model_id: str, mode: str,
         if len(actual_ids) != len(set(actual_ids)) or actual_ids != expected_ids[:len(actual_ids)]:
             raise ValueError("Quality resume order or IDs conflict with frozen native dataset")
     url = f"http://127.0.0.1:{s['port']}/v1/chat/completions"
+    consecutive_failures = 0
+    aborted_quality = False
     async with httpx.AsyncClient(timeout=httpx.Timeout(900.0, connect=30.0)) as client:
         for row in rows[len(results):]:
             try:
@@ -253,17 +260,29 @@ async def run_quality_predictions(cfg: dict, model_id: str, mode: str,
                 results.append({"id": row["id"], "status": "SUCCESS",
                                 "prediction": pred, "usage": data.get("usage", {}),
                                 "e2e_ms": (perf_counter() - start) * 1000})
+                consecutive_failures = 0
             except Exception as exc:
                 results.append({"id": row["id"], "status": "FAILED",
                                 "error": f"{type(exc).__name__}: {exc}", "prediction": None})
+                consecutive_failures += 1
             # Avoid losing all quality predictions if Colab disconnects.
             atomic_jsonl(output, results)
-            if len(results) % 10 == 0:
-                sync_files(root, drive_root)
+            sync_files(root / "quality", drive_root / "quality")
+            # Protect A100 budget: two consecutive native long-context
+            # inference failures stop the engineering pilot.
+            if (cfg.get("execution_scope", {}).get("kind") == "engineering_pilot"
+                    and consecutive_failures >= 2):
+                aborted_quality = True
+                print("Native quality pilot stopped after 2 consecutive failures; "
+                      "inspect receipts before retrying.", flush=True)
+                break
     receipt = {
         "dataset": dataset, "model": model_id, "mode": mode,
-        "status": "QUALITY_PREDICTIONS_UNSCORED",
+        "status": ("QUALITY_STOPPED_AFTER_REPEATED_FAILURES" if aborted_quality
+                   else "QUALITY_PREDICTIONS_UNSCORED"),
         "count": len(results),
+        "expected_count": len(rows),
+        "circuit_breaker_after_consecutive_failures": 2 if aborted_quality else None,
         "sample_id_sha256": sample_digest(rows),
         "sample_ids": [str(row["id"]) for row in rows],
         "evaluation_scope": "FROZEN_NATIVE_SUBSET_OR_FULL_UNSCORED",

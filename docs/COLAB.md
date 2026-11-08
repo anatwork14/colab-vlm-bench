@@ -55,3 +55,14 @@ After receipts are durable and controller downloaded report:
 colab stop -s vlmbench-a100
 ```
 User/operator confirms session actually stopped to avoid charges.
+
+## Prioritize low-cost failure discovery (Colab RAM ~80 GiB, SSD ~200 GiB)
+
+1. **CPU runtime first**: use the Qwen notebook `CPU_PREFLIGHT_ONLY=True`; mount Drive; validate model/config/tokenizer and small QA/PDF samples, actual **available** RAM and free SSD. No CUDA model, no vLLM server. Minimum available RAM 10 GiB and free local SSD max(18 GiB, 10 GiB + 1.35×checkpoint GiB); choose a larger margin for full PDF rendering. Drive space is separate.
+2. **GPU smoke**: after CPU PASS manually select A100 40GB, set `CPU_PREFLIGHT_ONLY=False`; validate driver/vLLM and one actual multimodal image request before bulk annotation.
+3. **Annotation budget**: begin with 8 new one-token requests per active dataset per invocation. Resume partial verified annotations. Check readiness per 2K/16K text bin and offered CCU 1/8/32; 160 unique requests required for CCU32, including warmups.
+4. **Serving**: Base before MTP, max six cells per invocation; no experiment with zero eligible cells starts vLLM. Do not conclude full GPU readiness from CPU tests.
+5. **Native quality**: run only with explicit switch, verify full-context image count fits configured max; report unanswerable, OOM and not-measured rather than truncating PDF/history.
+6. **Durability**: per-cell results and each expensive native quality prediction are copied to Drive. Do not remove failed receipts or re-use a campaign ID with edited protocol.
+
+A100 GPU time and system RAM are independent resources. A 200 GiB disk *total* does not imply 200 GiB is free. Always read the measured preflight report.

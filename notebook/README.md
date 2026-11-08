@@ -37,3 +37,5 @@ After Colab saved commit `1b8542d`, the notebook included a recursive whole-data
 For MMLongBench-Doc, the adapter now supports publisher QA `.parquet` via PyArrow small batches as well as JSON, while PDF images remain on disk. Normalizing full documents may consume substantial SSD/Drive space and can exceed the A100 inference context window even if preprocessing succeeds. Dataset-specific publisher prompt/scorer parity remains unverified.
 
 If rerunning an existing Colab session, execute the setup cell to fast-forward the cloned repo to current `main` before retrying normalization. Upload the latest `.ipynb` from GitHub (old Colab tabs do not auto-update). Never commit executed notebook outputs, raw dataset answers, tokens or private runtime diagnostics into GitHub.
+
+For a full code-cell-by-code-cell review and RAM/SSD thresholds, see [COLAB_STEPWISE_AUDIT.md](../docs/COLAB_STEPWISE_AUDIT.md). This checklist distinguishes CPU test PASS from still-unverified A100 capacity.
