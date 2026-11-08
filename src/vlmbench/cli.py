@@ -45,6 +45,22 @@ def run_job(args) -> int:
     drive_root = Path(cfg["storage"]["drive_results_dir"]) / cfg["campaign_id"]
     root.mkdir(parents=True, exist_ok=True)
     drive_root.mkdir(parents=True, exist_ok=True)
+    # Colab local SSD disappears across sessions: restore only resumable receipts and
+    # the frozen campaign manifest from durable Drive, rejecting conflicting copies.
+    for old in drive_root.rglob("*"):
+        if not old.is_file():
+            continue
+        rel = old.relative_to(drive_root)
+        if rel.parts[0] not in {"cells", "quality"} and rel.name != "frozen_config.json":
+            continue
+        if old.is_symlink():
+            raise RuntimeError(f"Unexpected symlink in Drive receipts: {old}")
+        local = root / rel
+        local.parent.mkdir(parents=True, exist_ok=True)
+        if local.exists() and sha256(local) != sha256(old):
+            raise RuntimeError(f"Conflicting remote/local receipt: {rel}")
+        if not local.exists():
+            shutil.copy2(old, local)
     fp = fingerprint(cfg)
     frozen_path = root / "frozen_config.json"
     if frozen_path.exists():

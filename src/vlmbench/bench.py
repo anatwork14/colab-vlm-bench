@@ -214,12 +214,21 @@ async def run_quality_predictions(cfg: dict, model_id: str, mode: str,
     s = cfg["serving"]
     output = root / "quality" / f"{dataset}__{model_id}__{mode}.jsonl"
     receipt_path = root / "quality" / f"{dataset}__{model_id}__{mode}.receipt.json"
-    if output.exists() or receipt_path.exists():
-        raise ValueError("Quality output already exists; use new run ID or review before retry")
-    url = f"http://127.0.0.1:{s['port']}/v1/chat/completions"
+    if receipt_path.exists():
+        completed = json.loads(receipt_path.read_text(encoding="utf8"))
+        if completed.get("count") == len(rows) and output.exists():
+            return {**completed, "resume_status": "RESUMED_COMPLETE"}
+        raise ValueError("Quality receipt inconsistent; preserve it and audit before retry")
     results = []
+    if output.exists():
+        results = [json.loads(line) for line in output.read_text(encoding="utf8").splitlines() if line.strip()]
+        expected_ids = [str(r["id"]) for r in rows]
+        actual_ids = [str(r["id"]) for r in results]
+        if len(actual_ids) != len(set(actual_ids)) or actual_ids != expected_ids[:len(actual_ids)]:
+            raise ValueError("Quality resume order or IDs conflict with frozen native dataset")
+    url = f"http://127.0.0.1:{s['port']}/v1/chat/completions"
     async with httpx.AsyncClient(timeout=httpx.Timeout(900.0, connect=30.0)) as client:
-        for row in rows:
+        for row in rows[len(results):]:
             try:
                 payload = request_payload(row, model_id=model_id,
                                           max_tokens=cfg["quality"]["max_output_tokens"],

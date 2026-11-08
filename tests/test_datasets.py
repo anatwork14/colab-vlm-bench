@@ -27,9 +27,9 @@ def test_memlens_preserves_all_sessions_and_gold_isolated(tmp_path):
     assert result["count"] == 1
     records = load_jsonl(output, dataset="memlens", track="native_quality")
     r = records[0]
-    assert len(r["messages"]) == 3
+    assert len(r["messages"]) == 1
     assert r["reference"] == "June"
-    assert "June" not in r["messages"][-1]["content"]
+    assert "Question: What did we discuss?" in r["messages"][-1]["content"][-1]["text"]
     assert r["meta"]["image_count"] == 1
     request = {"model": "x", "messages": r["messages"]}
     ensure_no_gold_in_request(r, request)
@@ -82,5 +82,5 @@ def test_derived_missing_origin_refused(tmp_path):
     p = tmp_path / "derived.jsonl"
     p.write_text(json.dumps({"id": "q1", "dataset": "memlens", "track": "derived_serving",
                             "messages": [{"role": "user", "content": "prompt"}]}) + "\n")
-    with pytest.raises(WorkloadError, match="derived"):
+    with pytest.raises(WorkloadError, match="[Dd]erived"):
         load_jsonl(p, dataset="memlens", track="derived_serving")

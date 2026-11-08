@@ -22,7 +22,9 @@ def normalize_memlens(source: Path, images_root: Path, output: Path, limit: int 
         if qid in seen:
             raise ValueError(f"Duplicate MemLens question id: {qid}")
         seen.add(qid)
-        messages = []
+        # One long multimodal user prompt, preserving all archived sessions.
+        # Avoid injecting many system messages: some Gemma chat templates reject them.
+        parts = []
         session_ids = item["haystack_session_ids"]
         sessions = item["haystack_sessions"]
         dates = item["haystack_dates"]
@@ -30,12 +32,12 @@ def normalize_memlens(source: Path, images_root: Path, output: Path, limit: int 
             raise ValueError(f"Inconsistent MemLens session metadata: {qid}")
         image_count = 0
         for sid, date, session in zip(session_ids, dates, sessions):
-            messages.append({"role": "system", "content": f"Archive session {sid} — {date}."})
+            parts.append({"type": "text", "text": f"\\n[Session {sid} — {date}]\\n"})
             for turn in session:
                 role = turn["role"]
                 if role not in ("user", "assistant"):
                     raise ValueError(f"Unknown MemLens role {role}")
-                parts = [{"type": "text", "text": str(turn.get("content", ""))}]
+                parts.append({"type": "text", "text": f"[{role}] {turn.get('content', '')}\\n"})
                 for image_ref in turn.get("images", []):
                     relative = Path(image_ref["file"])
                     path = (images_root / "release_images" / relative).resolve()
@@ -43,8 +45,8 @@ def normalize_memlens(source: Path, images_root: Path, output: Path, limit: int 
                         raise ValueError(f"Missing or escaping MemLens image: {relative}")
                     parts.append({"type": "image_path", "path": str(path), "asset_root": str(images_root)})
                     image_count += 1
-                messages.append({"role": role, "content": parts})
-        messages.append({"role": "user", "content": str(item["question"])})
+        parts.append({"type": "text", "text": f"\\nQuestion: {item['question']}"})
+        messages = [{"role": "user", "content": parts}]
         records.append({
             "id": qid, "dataset": "memlens", "track": "native_quality",
             "messages": messages, "reference": str(item["answer"]),

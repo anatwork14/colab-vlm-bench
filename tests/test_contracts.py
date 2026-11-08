@@ -57,6 +57,7 @@ def test_gpu_job_refuses_placeholders():
     with pytest.raises(ConfigError, match="dry_run"):
         validate(c, execution=True)
     c["dry_run"] = False
+    c["storage"]["drive_results_dir"] = "/content/drive/MyDrive/results"
     with pytest.raises(ConfigError, match="Pin checkpoint"):
         validate(c, execution=True)
 
