@@ -1,11 +1,17 @@
 # Metrics and evaluation contracts
 
-Metrics are divided into quality, end-to-end serving and internal inference diagnostics. Every metric has an operational definition and a measurement scope. Do not fill a missing metric with zero.
+Metrics are divided into quality, evidence-grounded hallucination, end-to-end serving and internal inference diagnostics. **All arms use `temperature=0`, `top_p=1.0`** for greedy decoding; speculative decoding is not presumed bitwise identical under all GPU schedules. Hallucination metrics require independently judged factual claims, not token F1. See [HALLUCINATION_EVALUATION.md](HALLUCINATION_EVALUATION.md). Every metric has an operational definition and a measurement scope. Do not fill a missing metric with zero.
 
 | Metric | Definition / data | Requires | Scope |
 |---|---|---|---|
 | MemLens official accuracy | publisher LLM judge output, question type breakdown | independent judge + scorer revision | native |
 | MMLongBench official F1 | publisher multi-stage scorer, reference answer + format | upstream scorer revision + whole document | native |
+| Unsupported factual claim rate | UNSUPPORTED / evidence-evaluable claims; evidence required | independent evidence judge + provenance | native |
+| Answer hallucination rate | responses with >=1 unsupported/contradicted claim / evidence-evaluable answered responses | independent claim/evidence labels | native |
+| Contradiction rate | CONTRADICTED / evidence-evaluable claims | cited evidence IDs | native |
+| False assertion rate / correct abstention | assert or abstain on independently labeled unanswerable items | publisher answerability + independent abstention labels | native |
+| False refusal rate / answer coverage | abstention on answerable items; fraction of requests actually answered | independent answerability + abstention labels | native |
+| Judge coverage, unverifiable count | annotated / expected; unknowns kept separate | frozen manifest and judge revision | native |
 | Proxy EM / token F1 | normalized exact match and overlap, failures count zero | references held evaluator-only | auxiliary only |
 | TTFT | HTTP arrival to first nonempty streamed content chunk | streaming server + client clock | serving |
 | TPOT | (response finish - first content)/ (actual generated tokens-1) | completion usage metadata | serving |

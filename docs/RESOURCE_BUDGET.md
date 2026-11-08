@@ -1,5 +1,13 @@
 # A100 campaign resource/time budget — prospective planning only
 
+## Expanded seven-method research budget (not a timing measurement)
+
+Two Qwen3.5 models × seven method arms × two datasets × seven input lengths × six CCUs × three repeats = **3,528 proposed serving cells**. Pilot (2K/16K × CCU1/8/32 × one repetition) = **168 planned cells**. The original Base/MTP 1,008 confirmatory cells are the **2/7 subset**, not a separate comparable 7-arm study.
+
+A proportional extrapolation from the earlier two-arm 25–65 GPU-hour planning budget suggests approximately **88–228 A100 GPU-hours**, **before** uncertain H2O/DA/ECRD porting, extra evidence extraction/decider inference, judges and restart overhead. This is only a rough capacity upper/lower planning exercise and is **not validated**; external arm runtime could be far slower or blocked completely. Do not reserve a full paid 7-arm campaign until individual method GPU pilots produce real timing receipts. Stop/go via docs/SEVEN_ARM_PROTOCOL.md.
+
+
+
 ## First-results priority: Qwen3.5-0.8B + Qwen3.5-4B
 
 - **Pilot:** 2 models × 2 modes × 2 datasets × 2 text lengths (2K/16K) × 3 offered CCUs (1/8/32) × 1 repetition = **48 cells**, **2,816 measured requests**, **656 warmups**, **720,896 requested output tokens**.

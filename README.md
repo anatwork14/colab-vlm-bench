@@ -1,6 +1,23 @@
 # Colab VLM Bench
 
-## ACTIVE PRIORITY — Qwen3.5-0.8B and 4B first
+## ACTIVE PRIORITY — 7 methods on Qwen3.5-0.8B and 4B first
+
+**Expanded research objective (2026-11-08):** Improve official accuracy/F1 and grounded factual reliability; reduce unsupported or contradicted claims, latency, and VRAM; improve output throughput and supported CCU. Every benefit is a **hypothesis**, not a result.
+
+The seven frozen arms are **Base**, **H2O+Base**, **Declarative Attention+Base**, **ECRD Grounding+Base**, **MTP Speculative Decoding**, **H2O+MTP**, and **Declarative Attention+MTP**. These methods are *not all supported by stock vLLM*. H2O/DA/ECRD and their combinations require verified Qwen3.5 A100 backend implementations and must never be emulated by simply changing a method label.
+
+- [Seven-arm pilot, 168 planned cells](configs/a100_qwen_7methods_pilot.json)
+- [Seven-arm confirmatory, 3,528 planned cells](configs/a100_qwen_7methods_full.json)
+- [Scientific seven-arm protocol](docs/SEVEN_ARM_PROTOCOL.md)
+- [Hallucination evaluation protocol](docs/HALLUCINATION_EVALUATION.md)
+- [Upstream compatibility and porting checklist](docs/THIRD_PARTY_METHODS.md)
+- [Pinned upstream source fetch and SHA verification](docs/UPSTREAM_BOOTSTRAP.md)
+- [Agent work order](docs/SEVEN_ARM_AGENT_TASKS.md)
+- [Expanded runbook — NOT_RUN](runbooks/SEVEN_ARM_QWEN.md)
+
+**Control:** greedy `temperature=0`, `top_p=1.0` for *all* arms and native quality/serving workloads; independent judge evidence is necessary to claim hallucination reduction. Prior two-arm Base/MTP configs remain valid and can produce early real results while external methods are being ported.
+
+
 
 Run **Qwen3.5-0.8B + Qwen3.5-4B**, each **Base and native MTP**, on **MemLens + MMLongBench-Doc** using a single approved **Colab A100 40GB**. Complete a 48-cell engineering pilot before attempting their 1,008-cell confirmatory serving grid; 2B/9B/Gemma E4B remain **deferred**, not removed.
 

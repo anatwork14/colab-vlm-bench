@@ -23,3 +23,7 @@ jobs:
         run: pytest -q
       - name: Plan
         run: python -m vlmbench.cli plan --config configs/a100_campaign.json
+      - name: Seven-arm research plans (CPU only)
+        run: |
+          python -m vlmbench.cli methods-plan --config configs/a100_qwen_7methods_pilot.json
+          python -m vlmbench.cli methods-plan --config configs/a100_qwen_7methods_full.json

@@ -19,6 +19,9 @@ from .quality import import_official, score_proxy
 from .report import write_report
 from .workloads import load_jsonl
 from .bench import run_performance_cell, run_quality_predictions
+from .methods import manifest_from_path, plan as methods_plan, native_mode_or_block, blocked_method_receipt, MethodUnqualified
+from .hallucination import read_annotations, score_evidence_annotations
+
 from .derivation import generate_candidates, annotate_with_backend
 
 
@@ -221,6 +224,22 @@ def main(argv=None):
     annotation.add_argument("--base-url", default="http://127.0.0.1:8000")
     annotation.add_argument("--limit", type=int, default=0)
 
+    methods = sub.add_parser("methods-plan", help="Plan all seven method arms (CPU only, no inference)")
+    methods.add_argument("--config", required=True, type=Path)
+
+    check = sub.add_parser("methods-check", help="Refuse unqualified external methods")
+    check.add_argument("--config", required=True, type=Path)
+    check.add_argument("--method", required=True)
+    check.add_argument("--model", required=True)
+    check.add_argument("--dataset", required=True)
+    check.add_argument("--blocked-out", type=Path)
+
+    score = sub.add_parser("hallucination-score", help="Score pre-audited claim/evidence judge labels")
+    score.add_argument("--annotations", required=True, type=Path)
+    score.add_argument("--expected-ids-json", type=Path)
+    score.add_argument("--allow-partial", action="store_true")
+    score.add_argument("--output", required=True, type=Path)
+
     job = sub.add_parser("run-job")
     job.add_argument("--config", required=True, type=Path)
     job.add_argument("--model", required=True)
@@ -249,6 +268,41 @@ def main(argv=None):
     if args.command in ("plan", "validate"):
         cfg = load_config(args.config)
         print(json.dumps(plan_summary(cfg), indent=2))
+        return 0
+    if args.command == "methods-plan":
+        print(json.dumps(methods_plan(manifest_from_path(args.config)), indent=2))
+        return 0
+    if args.command == "methods-check":
+        manifest = manifest_from_path(args.config)
+        if args.model not in manifest["models"] or args.dataset not in manifest["datasets"]:
+            raise ValueError("Model/dataset not in frozen seven-arm manifest")
+        if args.method not in manifest["methods"]:
+            raise ValueError("Unknown method in seven-arm manifest")
+        try:
+            mode = native_mode_or_block(args.method)
+        except MethodUnqualified as exc:
+            receipt = blocked_method_receipt(args.method, args.model, args.dataset)
+            if args.blocked_out is not None:
+                atomic_json(args.blocked_out, receipt)
+            print(json.dumps(receipt, indent=2))
+            return 2
+        print(json.dumps({"method": args.method, "native_mode": mode,
+                          "status": "REQUIRES_REAL_A100_GPU_QUALIFICATION",
+                          "temperature": 0, "top_p": 1.0}, indent=2))
+        return 0
+    if args.command == "hallucination-score":
+        expected = None
+        if args.expected_ids_json is not None:
+            expected = json.loads(args.expected_ids_json.read_text(encoding="utf8"))
+            if not isinstance(expected, list):
+                raise ValueError("Expected IDs must be a JSON array")
+        scores = score_evidence_annotations(
+            read_annotations(args.annotations),
+            expected_ids=expected,
+            require_complete=not args.allow_partial)
+        atomic_json(args.output, scores)
+        print(json.dumps({key: val for key, val in scores.items()
+                          if key != "per_answer"}, indent=2))
         return 0
     if args.command == "prepare-memlens":
         print(json.dumps(normalize_memlens(args.input, args.images_root, args.output, args.limit), indent=2))
