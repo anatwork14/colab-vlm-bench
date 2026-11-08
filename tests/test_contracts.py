@@ -78,6 +78,13 @@ def test_qwen_mtp_native_and_gemma_assistant():
         server_argv(c, g, "mtp", "/tmp/g")
 
 
+def test_quality_uses_separate_long_context_profile():
+    c = load_config(CONFIG)
+    assert c["serving"]["max_model_len"] == 32768
+    assert c["quality"]["max_model_len"] == 65536
+    assert c["quality"]["max_num_seqs"] == 1
+
+
 def test_request_count_contract():
     assert [request_count(x) for x in [1, 2, 4, 8, 16, 32]] == [16, 16, 16, 32, 64, 128]
     with pytest.raises(ConfigError):

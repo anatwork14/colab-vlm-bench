@@ -122,7 +122,9 @@
       1
     ],
     "require_full_native_context": true,
-    "official_scorer_required": true
+    "official_scorer_required": true,
+    "max_model_len": 65536,
+    "max_num_seqs": 1
   },
   "storage": {
     "drive_results_dir": "REPLACE_DRIVE_PATH/results",

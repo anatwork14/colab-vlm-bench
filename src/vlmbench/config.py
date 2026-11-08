@@ -78,6 +78,8 @@ def validate(c: dict, *, execution: bool = False) -> None:
         raise ConfigError("Three independent fixed seeds required")
     if not p["require_real_token_counts"] or not (0.0 < p["max_bin_relative_error"] <= 0.05):
         raise ConfigError("Model-specific effective tokens must be verified")
+    if q.get("max_model_len", 0) < 32768 or q.get("max_num_seqs") != 1:
+        raise ConfigError("Quality needs independent long-context runtime profile, CCU=1")
     if q["require_full_native_context"] is not True or q["official_scorer_required"] is not True:
         raise ConfigError("Official quality evaluation cannot be truncated or proxy-only")
     if execution:

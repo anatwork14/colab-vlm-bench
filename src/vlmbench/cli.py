@@ -41,7 +41,7 @@ def run_job(args) -> int:
     ds = next((d for d in cfg["datasets"] if d["id"] == args.dataset), None)
     if model is None or ds is None or args.mode not in cfg["modes"]:
         raise ValueError("Invalid model/dataset/mode selection")
-    job_key = f"{args.model}__{args.mode}__{args.dataset}"
+    job_key = f"{args.model}__{args.mode}__{args.dataset}__{'quality' if args.quality else 'serving'}"
     root = Path(cfg["storage"]["local_scratch_dir"]) / cfg["campaign_id"]
     drive_root = Path(cfg["storage"]["drive_results_dir"]) / cfg["campaign_id"]
     root.mkdir(parents=True, exist_ok=True)
@@ -85,8 +85,10 @@ def run_job(args) -> int:
         if args.mode == "mtp" and model["id"] == "gemma4_e4b":
             assistant = staged_copy(model["assistant_drive_path"], staging_dir / "assistant")
         native_path, derived_path = Path(ds["native_path"]), Path(ds["derived_path"])
-        if not native_path.exists() or not derived_path.exists():
-            raise FileNotFoundError("Expected both prepared native and derived Drive datasets")
+        if args.quality and not native_path.is_file():
+            raise FileNotFoundError("Quality needs complete native Drive JSONL")
+        if not args.quality and not derived_path.is_file():
+            raise FileNotFoundError("Serving needs derived, processor-annotated Drive JSONL")
         model_meta = {
             "checkpoint": model["hf_id"], "revision": model["revision"],
             "target_files": target["files"], "assistant_files": assistant["files"] if assistant else [],
@@ -101,14 +103,19 @@ def run_job(args) -> int:
             "campaign_sha256": fp,
             "recorded_utc": datetime.now(timezone.utc).isoformat(),
         })
-        derived_hash, native_hash = sha256(derived_path), sha256(native_path)
+        derived_hash = sha256(derived_path) if derived_path.is_file() else "NOT_AVAILABLE"
+        native_hash = sha256(native_path) if native_path.is_file() else "NOT_AVAILABLE"
         job_manifest = {"dataset": ds["id"], "model": args.model, "mode": args.mode,
                         "dataset_native_sha256": native_hash,
                         "dataset_derived_sha256": derived_hash,
                         "config_sha256": fp, "gpu": inventory}
         atomic_json(root / "jobs" / (job_key + ".json"), job_manifest)
         sync_files(root, drive_root)
-        command = server_argv(cfg, model, args.mode,
+        runtime_cfg = json.loads(json.dumps(cfg))
+        if args.quality:
+            runtime_cfg["serving"]["max_model_len"] = cfg["quality"]["max_model_len"]
+            runtime_cfg["serving"]["max_num_seqs"] = cfg["quality"]["max_num_seqs"]
+        command = server_argv(runtime_cfg, model, args.mode,
                               target["local_path"],
                               assistant["local_path"] if assistant else None)
         atomic_json(root / "launch" / (job_key + ".json"), {
@@ -123,11 +130,14 @@ def run_job(args) -> int:
             "expected_method": args.mode,
             "mtp_method_qualification": "NEEDS_BACKEND_TRACE_REVIEW" if args.mode == "mtp" else "NA",
         })
-        rows = load_jsonl(derived_path, dataset=ds["id"], track="derived_serving")
+        rows = (load_jsonl(derived_path, dataset=ds["id"], track="derived_serving")
+                if not args.quality else [])
         cells = [x for x in planned_cells(cfg)
                  if x["model"] == args.model and x["dataset"] == args.dataset and x["mode"] == args.mode]
         done = 0
         limit = args.max_cells if args.max_cells > 0 else int(cfg["performance"]["max_cells_per_session"])
+        if args.quality:
+            cells = []
         for cell in cells:
             # Resume independently at cell level; a full successful cell does not consume job cap.
             existing = root / "cells" / f"{cell_id(cell)}.json"

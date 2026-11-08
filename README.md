@@ -32,6 +32,7 @@
 - Repetitions: 3; warmup not included in metrics, prefix caching disabled, streaming, thinking disabled when verified.
 - 5 checkpoints × 2 modes × 2 datasets × 42 cells × 3 reps = **2,520 serving cells** (subject to explicit capacity/support results), plus native accuracy tasks.
 - Main GPU: only 1× A100 40GB, BF16, TP1; report unsupported/OOM cells rather than changing GPU, quantization or CCU silently.
+- Native quality runs use a **separate** 65,536-token CCU1 server profile, still subject to A100 capacity. Use the controller `--quality` flag for quality-only.
 
 [Scientific protocol](docs/PROTOCOL.md) · [Operations/Colab](docs/COLAB.md) · [Agent task contract](AGENTS.md) · [Repo architecture](docs/ARCHITECTURE.md) · [Runbooks](runbooks/README.md)
 
