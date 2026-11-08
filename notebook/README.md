@@ -1,6 +1,6 @@
 # Standalone-upload Colab notebooks — seven-arm campaign
 
-Each notebook now includes **7 independent methods**, not just Base/MTP: Base, H2O+Base, Declarative Attention+Base, ECRD Grounding+Base, native MTP, H2O+MTP, DA+MTP. The Qwen3.5-0.8B notebook has 39 cells (including a Colab launch badge); the 4B notebook has 38 with a method planner, conditional dispatcher, temperature=0/top_p=1 checks and grounded-hallucination scoring from independent judge annotations. Five external-method arms are explicitly BLOCKED until real Qwen3.5+vLLM+A100 implementations are qualified. The notebooks DO NOT fake method results by reusing Base outputs.
+Each notebook now includes **7 independent methods**, not just Base/MTP: Base, H2O+Base, Declarative Attention+Base, ECRD Grounding+Base, native MTP, H2O+MTP, DA+MTP. Both notebooks have 38 cells; the 0.8B Colab launch badge lives inside the introduction Markdown cell with a method planner, conditional dispatcher, temperature=0/top_p=1 checks and grounded-hallucination scoring from independent judge annotations. Five external-method arms are explicitly BLOCKED until real Qwen3.5+vLLM+A100 implementations are qualified. The notebooks DO NOT fake method results by reusing Base outputs.
 
 Methods manifest: `configs/a100_qwen_7methods_pilot.json` (168 planned cells, 48 native-routable) or `configs/a100_qwen_7methods_full.json` (3,528 planned cells, 1,008 native-routable). Raw native quality uses natural EOS; derived serving uses 256 fixed output tokens. Official quality and hallucination require external evaluation.
 
