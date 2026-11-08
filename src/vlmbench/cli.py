@@ -40,6 +40,23 @@ def _persist_error(root: Path, drive_root: Path, tag: str, message: str) -> None
     sync_files(root, drive_root)
 
 
+def eligible_pending_cells(cells: list[dict], readiness: dict) -> list[dict]:
+    """Only verified workload-ready cells are GPU-eligible.
+
+    Incomplete bins are *not attempted*: emitting INSUFFICIENT_WORKLOAD
+    receipts would permanently exclude them from the same frozen campaign
+    when later GPU annotation makes the bin ready.
+    """
+    allowed = {
+        (int(r["text_bin"]), int(r["ccu"]), int(r["repetition"]))
+        for r in readiness.get("ready_cells", [])
+    }
+    return [
+        cell for cell in cells
+        if (cell["input_length"], cell["concurrency"], cell["repetition"]) in allowed
+    ]
+
+
 def run_job(args) -> int:
     cfg = load_config(args.config, execution=True)
     model = next((m for m in cfg["models"] if m["id"] == args.model), None)
@@ -130,7 +147,8 @@ def run_job(args) -> int:
                 max_model_len=cfg["serving"]["max_model_len"],
             )
             atomic_json(root / "preflight" / (job_key + ".workload.json"), readiness)
-            if not readiness["ready_cells"]:
+            runnable_cells = eligible_pending_cells(pending_cells, readiness)
+            if not runnable_cells:
                 atomic_json(root / "run_status.json", {
                     "status": "BLOCKED_NO_ELIGIBLE_CELLS",
                     "job": job_key, "eligible": readiness["eligible_by_text_bin"],
@@ -249,7 +267,11 @@ def run_job(args) -> int:
         limit = args.max_cells if args.max_cells > 0 else int(cfg["performance"]["max_cells_per_session"])
         if args.quality:
             cells = []
+        runnable_ids = {cell_id(cell) for cell in runnable_cells} if not args.quality else set()
         for cell in cells:
+            # Unready cells remain pending, not stamped as permanent failures.
+            if not args.quality and cell_id(cell) not in runnable_ids:
+                continue
             # Resume independently at cell level; a full successful cell does not consume job cap.
             existing = root / "cells" / f"{cell_id(cell)}.json"
             if existing.is_file():
