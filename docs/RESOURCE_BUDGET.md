@@ -1,0 +1,28 @@
+# A100 campaign resource/time budget — prospective planning only
+
+Hardware: Google Colab 1× A100 40GB BF16 TP1. Colab GPU and per-session runtime are best-effort, not guaranteed; verify actual CU balance and availability on the owner's authenticated account before running.
+
+## Planned volume
+
+- 5 checkpoints × Base/MTP = 10 configs
+- 2 datasets × 7 context bins × 6 CCUs × 3 reps = 2520 serving cells
+- Exactly 114,240 measured requests and 26,460 warmup requests according to the frozen count function, before quality evaluation
+- Nominal 29,245,440 requested output tokens (=114,240×256), provided no cell is blocked and all output lengths are honored
+- Native quality: MemLens 789 + MMLongBench-Doc **publisher current 1091** = 1880 responses per configuration, or up to 18,800 responses across 10 configs. Publisher releases can change; freeze actual IDs rather than trusting README totals.
+
+## GPU-hour forecast (not measured on this repository)
+
+| Component | Low | High |
+|---|---:|---:|
+| Serving grid (two datasets, three reps) | 44.7h | 99h |
+| Native quality 18,800 outputs | 20h | 60h |
+| GPU qualification, restarts, storage verification | 5h | 14h |
+| Optional long-running replay | 4h | 12h |
+| Combined | ~74h | ~185h |
+
+**The above is a budgeting assumption, not a guaranteed Colab duration.** Missing native full-context fits, different streaming output sizes, media decode and model loading can alter runtime substantially. External MemLens LLM judge costs/GPU are not included. A single session should run small bounded pilots and persist receipts before it expires.
+
+## Calibration pilot — no scientific claims
+Start with Qwen3.5-0.8B Base/MTP, then Gemma E4B Base/MTP on a handful of 2K and 16K bins, CCU 1/8/32. Record actual elapsed, model load and stage seconds, success/OOM/timeout, and how much Drive export time each cell uses. Recompute projected GPU-hours from real receipts before enabling full 42-cell runs.
+
+Campaign config starts with max_cells_per_session=6 for a capped pilot invocation. Set to 0 for full matrix only after explicitly approving an adequate session budget and artifact recovery plan. The controller does not allocate or release Colab GPU; the operator owns lifecycle and compute-unit spending.

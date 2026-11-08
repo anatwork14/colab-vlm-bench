@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this benchmark harness, cite the repository and the original MemLens/MMLongBench-Doc papers."
+title: "Colab VLM Bench: Reproducible Multimodal Serving and Native Quality Benchmark Harness"
+type: software
+authors:
+  - family-names: "anatwork14"
+repository-code: "https://github.com/anatwork14/colab-vlm-bench"
+license: MIT
+version: "0.1.0"
+date-released: "2026-11-08"
