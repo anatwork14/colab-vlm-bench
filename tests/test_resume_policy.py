@@ -521,3 +521,36 @@ def test_single_route_run_records_its_label_in_manifest_and_receipts(monkeypatch
     assert job["derivation"] == "memlens_7bin_builder_v2"
     receipt = json.loads((root / "cells" / f"{cell_id(_scoped(cfg)[0])}.json").read_text())
     assert receipt["derivation"] == "memlens_7bin_builder_v2"
+
+
+# ---------- R3-B: MISSING cells are not "in progress" unless the cap was reached ----------
+
+def _outcome_cells(n=6):
+    return _scoped(load_config(CONFIG))[:n]
+
+
+def test_uncapped_missing_cells_are_non_completed_not_in_progress():
+    cells = _outcome_cells()
+    pre = {cell_id(c): (resume.MISSING, "no receipt") for c in cells}
+    status, rc, counts = cli._serving_outcome(cells, pre, {}, None, cap_reached=False)
+    assert rc == 6
+    assert status == "INCOMPLETE_NOT_ATTEMPTED"
+    assert counts["non_completed"] == len(cells)
+
+
+def test_cap_reached_with_missing_cells_is_in_progress_rc0():
+    cells = _outcome_cells()
+    pre = {cell_id(c): (resume.MISSING, "no receipt") for c in cells}
+    status, rc, counts = cli._serving_outcome(cells, pre, {cell_id(cells[0]): "PASS_MEASURED"},
+                                              None, cap_reached=True)
+    assert (status, rc) == ("IN_PROGRESS", 0)
+    assert counts["non_completed"] == 0
+
+
+def test_uncapped_missing_after_some_passes_is_partial_not_in_progress():
+    cells = _outcome_cells()
+    pre = {cell_id(c): (resume.MISSING, "no receipt") for c in cells}
+    status, rc, counts = cli._serving_outcome(cells, pre, {cell_id(cells[0]): "PASS_MEASURED"},
+                                              None, cap_reached=False)
+    assert (status, rc) == ("PARTIAL_FAILURE", 6)
+    assert counts["non_completed"] == len(cells) - 1
