@@ -15,13 +15,14 @@ from typing import Any
 import torch
 from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
+from vlmbench.infrastructure.parity import LOGITS_PARITY_TOLERANCE, logits_parity_passes
 from vlmbench.infrastructure.real_engine import Qwen35ModelConfig, Qwen35NeuralModel
 
 
 CHECKPOINT_DIR = Path("/mnt/ssd/genos2/research_workspace/models/Qwen/Qwen3.5-0.8B")
 INDEX_FILE = CHECKPOINT_DIR / "model.safetensors.index.json"
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PARITY_TOLERANCE = 1e-4
+PARITY_TOLERANCE = LOGITS_PARITY_TOLERANCE
 RUNS_DIR = REPO_ROOT / "artifacts" / "runs"
 
 
@@ -46,7 +47,7 @@ def write_receipt(path: Path, receipt: dict[str, Any], force: bool = False) -> N
 
 def parity_status(max_diff: float, tolerance: float = PARITY_TOLERANCE) -> str:
     """NaN compares false, so a non-finite difference is a FAIL."""
-    return "PASS" if max_diff < tolerance else "FAIL"
+    return "PASS" if logits_parity_passes(max_diff, tolerance) else "FAIL"
 
 
 def scaffold_scientific_status(coverage_pct: float) -> str:

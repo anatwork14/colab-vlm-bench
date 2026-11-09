@@ -34,6 +34,7 @@ from transformers.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from vlmbench.infrastructure.parity import logits_parity_passes  # noqa: E402 - sys.path must be extended first
 from vlmbench.infrastructure import (  # noqa: E402 - sys.path must be extended first
     Qwen35ModelConfig,
     RealSevenArmEngine,
@@ -113,7 +114,7 @@ def run_test_a_architecture(model_dir: Path, device: str = "cpu") -> dict[str, A
     assert inv["tensor_coverage_ratio"] == 1.0
     assert inv["parameter_coverage_ratio"] == 1.0
     assert inv["logits_parity"]["verified"] is True
-    assert inv["logits_parity"]["max_abs_logits_diff"] <= 1e-5
+    assert logits_parity_passes(inv["logits_parity"]["max_abs_logits_diff"]), "logits parity exceeds LOGITS_PARITY_TOLERANCE"
     assert inv["logits_parity"]["top1_match"] is True
     engine.close()
 
