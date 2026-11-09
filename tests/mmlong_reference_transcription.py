@@ -4,7 +4,14 @@ Transcribed by reading eval/eval_score.py at commit d73f0dc0be7e0a2ff6a403d5fe65
 (sha256 cafa268358b08521cfc9a805c67d86732d943677e4408c5751f336123d09631f), Apache-2.0.
 Logic is copied line for line. Two changes, neither of which changes a result on the inputs tested:
   * the official print() debugging calls are removed;
-  * eval() on list-looking strings is replaced by ast.literal_eval (the port's documented deviation).
+  * eval() on list-looking strings is replaced by ast.literal_eval (the port's documented deviation);
+  * the upstream bare `except:` clauses (in is_float_equal, eval_score and eval_acc_and_f1) are written as
+    `except Exception:`. This is NOT a result change on the inputs tested: a bare except also catches
+    KeyboardInterrupt and SystemExit, and neither is raised by these functions on data. It is kept
+    deliberately: the ported scorer in src/vlmbench/datasets/mmlong_official_scorer.py uses `except Exception:`,
+    and a bare except here would make the differential fuzz disagree with the port on interrupts
+    rather than on results. Found by the ITER2 adversarial review (C-8), which diffed this file against
+    upstream text; upstream was not executed.
 This is a second copy of the same logic, so agreement shows the port matches the transcription,
 not that the transcription is correct. The hand-checked cases in test_mmlong_fuzz_vs_reference.py are the
 independent check.

@@ -122,3 +122,11 @@ def test_fuzz_acc_and_f1_port_agrees_with_the_transcription_on_500_sample_sets()
             samples.append({"answer": answer, "pred": p, "score": score, "answer_format": answer_format})
         mine, theirs = port.eval_acc_and_f1(samples), ref.eval_acc_and_f1(samples)
         assert mine == pytest.approx(theirs, abs=1e-12)
+
+
+def test_C8_transcription_header_documents_every_deviation_from_upstream():
+    # ITER3 round 2 (C-8): the auditor's diff found a bare `except:` replaced by `except Exception:`.
+    # The header must say so, and say why it is not restored, so the transcription is not silently different.
+    header = Path(__file__).with_name("mmlong_reference_transcription.py").read_text(encoding="utf8").split('"""')[1]
+    assert "bare" in header and "except" in header
+    assert "KeyboardInterrupt" in header
