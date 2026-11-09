@@ -383,16 +383,16 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
         assert v_trace["visual_token_embeddings_count"] == 300
         assert len(task_res.output_text) > 0
 
-        text_lower = task_res.output_text.lower()
-        if fix.evidence_id == "coco_cats_01":
-            task_verified = "yes" in text_lower or "cat" in text_lower
-        elif fix.evidence_id == "coco_neg_dog_01":
-            task_verified = "no" in text_lower
-        elif fix.evidence_id == "coco_attr_couch_01":
-            task_verified = any(w in text_lower for w in ("pink", "yellow", "color", "pattern", "couch"))
-        else:
-            task_verified = "yes" in text_lower or "remote" in text_lower
-        assert task_verified, f"Task {fix.evidence_id} failed semantic check: {task_res.output_text!r}"
+        # The four questions are only neural/ViT smoke fixtures. A substring
+        # match is NOT accuracy: e.g. the attribute gold says Yellow but the
+        # word "pink" or even "color" used to be counted as PASS. Never turn
+        # these fixtures into reported benchmark correctness.
+        inference_smoke_pass = (
+            v_trace["invoked"] is True
+            and len(task_res.tokens_generated) == max_toks
+            and bool(task_res.output_text)
+        )
+        assert inference_smoke_pass
 
         task_results[fix.evidence_id] = {
             "task_type": fix.task_type,
@@ -400,10 +400,17 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
             "ground_truth_label": fix.ground_truth_label,
             "output_text": task_res.output_text,
             "tokens_generated": task_res.tokens_generated,
-            "semantic_verification_pass": task_verified,
+            "inference_smoke_pass": True,
+            "semantic_verification_pass": None,
+            "ground_truth_match": None,
+            "quality_score_qualified": False,
+            "quality_scoring_status": "UNSCORED_SMOKE_ONLY_USE_OFFICIAL_AMBER_FOR_QUALITY",
             "visual_encoder_trace": v_trace,
         }
-        print(f"  Task [{fix.evidence_id:18s} ({fix.task_type:9s})] -> Output: {task_res.output_text!r} (Verified: {task_verified})")
+        print(
+            f"  Task [{fix.evidence_id:18s} ({fix.task_type:9s})]"
+            f" -> Inference smoke PASS; ground-truth accuracy NOT SCORED"
+        )
 
     task_engine.close()
 
@@ -415,7 +422,7 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
         "arms": arm_results,
         "canonical_four_tasks": task_results,
     }
-    print(f"Test D PASSED in {dt:.2f}s (All 7 arms + 4 canonical multimodal tasks qualified with 100% official HF hooks)")
+    print(f"Test D INFERENCE SMOKE PASSED in {dt:.2f}s (7 arms + 4 image tasks; accuracy NOT SCORED)")
     return result
 
 
