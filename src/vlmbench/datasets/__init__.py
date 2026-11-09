@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from .amber import (
     AMBER_SPLITS,
+    AMBER_UPSTREAM_MANIFEST,
     DISCRIMINATIVE_DIMENSIONS,
     PASS_TYPES,
     AmberError,
@@ -22,6 +23,7 @@ from .mmlong import normalize_mmlong
 
 __all__ = [
     "AMBER_SPLITS",
+    "AMBER_UPSTREAM_MANIFEST",
     "CANONICAL_LENGTHS",
     "DISCRIMINATIVE_DIMENSIONS",
     "PASS_TYPES",

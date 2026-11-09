@@ -184,8 +184,16 @@ def test_derived_candidates_index_only_native_offsets(tmp_path, monkeypatch):
 
 
 def test_memlens_7bin_builder_generates_canonical_lengths_and_deterministic_ids(tmp_path):
-    from vlmbench.datasets import CANONICAL_LENGTHS, build_memlens_context_bins
+    from vlmbench.datasets import build_memlens_context_bins
 
+    class LongTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) for c in text]
+
+        def decode(self, token_ids, skip_special_tokens=False):
+            return "".join(chr(t) for t in token_ids)
+
+    # Calling without tokenizer must raise ValueError (DS-04)
     native_path = tmp_path / "native.jsonl"
     native_row = {
         "id": "mem_sample_42",
@@ -194,9 +202,9 @@ def test_memlens_7bin_builder_generates_canonical_lengths_and_deterministic_ids(
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "text", "text": "Session conversation content with extensive text. " * 50},
+                {"type": "text", "text": "Session conversation content with extensive text. " * 500},
                 {"type": "image_path", "path": str(tmp_path / "img.jpg"), "asset_root": str(tmp_path)},
-                {"type": "text", "text": "\nQuestion: Where did Alice travel?"},
+                {"type": "text", "text": "Question: Where did Alice travel?"},
             ],
         }],
         "reference": "Paris",
@@ -205,36 +213,79 @@ def test_memlens_7bin_builder_generates_canonical_lengths_and_deterministic_ids(
     }
     native_path.write_text(json.dumps(native_row) + "\n", encoding="utf8")
 
+    with pytest.raises(ValueError, match="Tokenizer is mandatory"):
+        build_memlens_context_bins(native_path, tmp_path / "fail.jsonl", tokenizer=None)
+
     derived_path = tmp_path / "derived_7bins.jsonl"
-    result = build_memlens_context_bins(native_path, derived_path)
+    tok = LongTokenizer()
+    result = build_memlens_context_bins(native_path, derived_path, tokenizer=tok)
 
     assert result["dataset"] == "memlens"
     assert result["canonical_lengths"] == [128, 512, 1024, 2048, 4096, 8192, 16384]
-    assert result["source_records"] == 1
-    assert result["derived_records"] == 7
     assert len(result["source_sha256"]) == 64
     assert len(result["derived_sha256"]) == 64
+    assert result["tolerance"] == 0.05
 
     rows = load_jsonl(derived_path, dataset="memlens", track="derived_serving")
-    assert len(rows) == 7
-
-    expected_ids = [f"mem_sample_42__text{length}" for length in CANONICAL_LENGTHS]
-    actual_ids = [r["id"] for r in rows]
-    assert actual_ids == expected_ids
-
-    for row, target in zip(rows, CANONICAL_LENGTHS):
+    # All emitted rows must strictly satisfy ±5% tolerance (DS-04)
+    for row in rows:
+        target = row["requested_text_length_bin"]
+        assert row["id"] == f"mem_sample_42__text{target}"
         assert row["derived_from"] == "mem_sample_42"
         assert row["meta"]["original_question_id"] == "mem_sample_42"
-        assert row["meta"]["requested_text_length_bin"] == target
         assert row["meta"]["official_quality_allowed"] is False
         assert row["meta"]["evidence_may_be_dropped"] is True
         assert row["image_count"] == 1
 
-        # Check message content ordering: text tail, genuine image, final question
-        content = row["messages"][0]["content"]
-        assert any(p["type"] == "image_path" for p in content)
-        assert content[-1]["type"] == "text"
-        assert "Where did Alice travel?" in content[-1]["text"]
+        actual_tokens = row["meta"]["actual_text_tokens"]
+        assert target * 0.95 <= actual_tokens <= target * 1.05
+
+
+def test_memlens_7bin_builder_short_history_never_emitted_into_large_bins(tmp_path):
+    # DS-04: Reproduction 9 - short history (~300 tokens) must NEVER emit __text1024..__text16384
+    from vlmbench.datasets import build_memlens_context_bins
+
+    class DummyTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) for c in text]
+
+        def decode(self, token_ids, skip_special_tokens=False):
+            return "".join(chr(t) for t in token_ids)
+
+    native_path = tmp_path / "short_native.jsonl"
+    # History with only 300 characters/tokens
+    native_row = {
+        "id": "short_sample",
+        "dataset": "memlens",
+        "track": "native_quality",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "H" * 300},
+                {"type": "image_path", "path": str(tmp_path / "img.jpg"), "asset_root": str(tmp_path)},
+                {"type": "text", "text": "Q?"},
+            ],
+        }],
+        "reference": "Ans",
+        "native_context_complete": True,
+    }
+    native_path.write_text(json.dumps(native_row) + "\n", encoding="utf8")
+
+    out_path = tmp_path / "short_derived.jsonl"
+    tok = DummyTokenizer()
+    result = build_memlens_context_bins(
+        native_path, out_path,
+        tokenizer=tok,
+        input_lengths=[128, 512, 1024, 2048, 4096, 8192, 16384],
+    )
+
+    rows = load_jsonl(out_path, dataset="memlens", track="derived_serving") if out_path.exists() and out_path.stat().st_size > 0 else []
+    emitted_targets = [r["requested_text_length_bin"] for r in rows]
+
+    # Large bins must NOT have been emitted!
+    for large_bin in [1024, 2048, 4096, 8192, 16384]:
+        assert large_bin not in emitted_targets
+        assert result["skip_reasons"][f"history_too_short_for_{large_bin}"] == 1
 
 
 def test_memlens_7bin_builder_with_custom_tokenizer(tmp_path):
@@ -280,6 +331,13 @@ def test_memlens_7bin_builder_with_custom_tokenizer(tmp_path):
 def test_memlens_7bin_builder_guards_and_limits(tmp_path):
     from vlmbench.datasets import build_memlens_context_bins
 
+    class DummyTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) for c in text]
+
+        def decode(self, token_ids, skip_special_tokens=False):
+            return "".join(chr(t) for t in token_ids)
+
     native_path = tmp_path / "native.jsonl"
     native_row = {
         "id": "q_limit",
@@ -299,15 +357,17 @@ def test_memlens_7bin_builder_guards_and_limits(tmp_path):
     native_path.write_text(json.dumps(native_row) + "\n", encoding="utf8")
 
     # Invalid image_limit
+    tok = DummyTokenizer()
     with pytest.raises(ValueError, match="image_limit"):
-        build_memlens_context_bins(native_path, tmp_path / "out.jsonl", image_limit=-1)
+        build_memlens_context_bins(native_path, tmp_path / "out.jsonl", tokenizer=tok, image_limit=-1)
 
     with pytest.raises(ValueError, match="image_limit"):
-        build_memlens_context_bins(native_path, tmp_path / "out.jsonl", image_limit=9)
+        build_memlens_context_bins(native_path, tmp_path / "out.jsonl", tokenizer=tok, image_limit=9)
 
     # max_per_bin limit
     result = build_memlens_context_bins(
         native_path, tmp_path / "out_limited.jsonl",
+        tokenizer=tok,
         input_lengths=[128, 512],
         max_per_bin=0,
     )

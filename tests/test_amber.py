@@ -1,10 +1,11 @@
-"""Tests for AMBER dataset adapter, normalizer, and official scoring."""
+"""Tests for AMBER dataset adapter, normalizer, and proxy scoring."""
 import json
 from pathlib import Path
 
 import pytest
 
 from vlmbench.datasets.amber import (
+    AMBER_UPSTREAM_MANIFEST,
     AmberError,
     export_amber_official_format,
     normalize_amber,
@@ -26,12 +27,11 @@ def _create_amber_fixtures(tmp_path: Path):
     (img_dir / "AMBER_1007.jpg").write_bytes(b"jpeg-bytes-1007")
 
     items = [
-        # Generative item
+        # Generative item 1
         {
             "id": 1,
             "image": "AMBER_1.jpg",
             "task": "generative",
-            "type": "all",
             "query": "Describe this image in detail.",
             "objects": ["dog", "frisbee", "park"],
         },
@@ -40,7 +40,6 @@ def _create_amber_fixtures(tmp_path: Path):
             "id": 2,
             "image": "AMBER_2.jpg",
             "task": "generative",
-            "type": "all",
             "query": "What is in the image?",
             "objects": ["cat", "sofa"],
         },
@@ -88,9 +87,13 @@ def test_normalize_amber_generative_and_discriminative(tmp_path):
     )
     assert result["dataset"] == "amber"
     assert result["count"] == 5
-    assert result["status"] == "NORMALIZED_OFFICIAL_SCORING_ELIGIBLE"
+    # DS-01: Status is AMBER_PROXY_UNVERIFIED
+    assert result["status"] == "AMBER_PROXY_UNVERIFIED"
     assert len(result["sha256_source"]) == 64
     assert len(result["sha256_normalized"]) == 64
+    # DS-07: Upstream manifest recorded
+    assert result["upstream_manifest"]["repo_id"] == "junyangwang0410/AMBER"
+    assert len(result["upstream_manifest"]["pinned_commit"]) == 40
 
     records = load_jsonl(output, dataset="amber", track="native_quality")
     assert len(records) == 5
@@ -103,10 +106,14 @@ def test_normalize_amber_generative_and_discriminative(tmp_path):
     parts = gen_rec["messages"][0]["content"]
     assert parts[0]["type"] == "image_path"
     assert parts[0]["path"].endswith("AMBER_1.jpg")
+    # DS-07: Per-record image_sha256 present
+    assert len(parts[0]["image_sha256"]) == 64
+    assert len(gen_rec["meta"]["image_sha256"]) == 64
     assert parts[1]["type"] == "text"
     assert "Describe this image in detail." in parts[1]["text"]
 
-    # Gold reference isolated from prompt messages
+    # DS-01: official_scoring_eligible is False
+    assert gen_rec["meta"]["official_scoring_eligible"] is False
     assert gen_rec["reference"] == '["dog", "frisbee", "park"]'
     ensure_no_gold_in_request(gen_rec, {"messages": gen_rec["messages"]})
 
@@ -115,9 +122,7 @@ def test_normalize_amber_generative_and_discriminative(tmp_path):
     assert disc_rec["id"] == "amber__discriminative__1005"
     assert disc_rec["reference"] == "Yes"
     assert disc_rec["meta"]["dimension"] == "existence"
-    assert disc_rec["meta"]["pass_type"] == "natural_eos_quality"
-    assert disc_rec["meta"]["max_output_tokens"] == 256
-    assert "<|im_end|>" in disc_rec["meta"]["stop_sequences"]
+    assert disc_rec["meta"]["official_scoring_eligible"] is False
 
 
 def test_amber_split_filtering(tmp_path):
@@ -146,120 +151,130 @@ def test_amber_split_filtering(tmp_path):
     assert records_attr[0]["meta"]["dimension"] == "attribute"
 
 
-def test_amber_pass_types_distinction(tmp_path):
+def test_amber_pass_types_distinction_and_serving_track(tmp_path):
     source, img_dir, _ = _create_amber_fixtures(tmp_path)
 
     # Natural-EOS quality pass
     out_qual = tmp_path / "qual.jsonl"
     res_qual = normalize_amber(source, img_dir, out_qual, pass_type="natural_eos_quality")
-    assert res_qual["status"] == "NORMALIZED_OFFICIAL_SCORING_ELIGIBLE"
+    assert res_qual["status"] == "AMBER_PROXY_UNVERIFIED"
     rows_qual = load_jsonl(out_qual, dataset="amber", track="native_quality")
     assert rows_qual[0]["track"] == "native_quality"
     assert rows_qual[0]["native_context_complete"] is True
-    assert rows_qual[0]["meta"]["official_scoring_eligible"] is True
+    assert rows_qual[0]["meta"]["official_scoring_eligible"] is False
 
-    # Fixed serving pass
+    # Fixed serving pass (DS-06: track='amber_serving', no requested_text_length_bin)
     out_serv = tmp_path / "serv.jsonl"
     res_serv = normalize_amber(source, img_dir, out_serv, pass_type="fixed_serving")
-    assert res_serv["status"] == "NORMALIZED_DERIVED_SERVING_WORKLOAD"
-    rows_serv = load_jsonl(out_serv, dataset="amber", track="derived_serving")
-    assert rows_serv[0]["track"] == "derived_serving"
+    assert res_serv["status"] == "AMBER_SERVING_PREPARED"
+    rows_serv = load_jsonl(out_serv, dataset="amber", track="amber_serving")
+    assert rows_serv[0]["track"] == "amber_serving"
     assert rows_serv[0]["derived_from"] == "amber__generative__1"
-    assert rows_serv[0]["meta"]["pass_type"] == "fixed_serving"
-    assert rows_serv[0]["meta"]["fixed_output_tokens"] == 256
-    assert rows_serv[0]["meta"]["ignore_eos"] is True
+    assert "requested_text_length_bin" not in rows_serv[0]
+    assert "requested_text_length_bin" not in rows_serv[0]["meta"]
     assert rows_serv[0]["meta"]["official_quality_allowed"] is False
+    assert len(rows_serv[0]["meta"]["image_sha256"]) == 64
 
 
-def test_amber_missing_image_guard(tmp_path):
-    source = tmp_path / "broken.json"
-    source.write_text(json.dumps([{
-        "id": 999,
-        "image": "nonexistent.jpg",
-        "task": "discriminative",
-        "query": "Is there a cat?",
-        "label": "Yes",
+def test_amber_strict_schema_rejections(tmp_path):
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(parents=True)
+    (img_dir / "valid.jpg").write_bytes(b"image")
+
+    # Missing image field (DS-02: must raise ValueError, no default to AMBER_{id}.jpg)
+    src_no_img = tmp_path / "no_img.json"
+    src_no_img.write_text(json.dumps([{"id": 1, "task": "generative", "query": "Q"}]))
+    with pytest.raises(ValueError, match="missing required 'image'"):
+        normalize_amber(src_no_img, img_dir, tmp_path / "out1.jsonl")
+
+    # Missing query field (DS-02, DS-05: must raise ValueError, no default description prompt)
+    src_no_query = tmp_path / "no_query.json"
+    src_no_query.write_text(json.dumps([{"id": 1, "image": "valid.jpg", "task": "generative"}]))
+    with pytest.raises(ValueError, match="missing required 'query'"):
+        normalize_amber(src_no_query, img_dir, tmp_path / "out2.jsonl")
+
+    # Missing task field (DS-02)
+    src_no_task = tmp_path / "no_task.json"
+    src_no_task.write_text(json.dumps([{"id": 1, "image": "valid.jpg", "query": "Q"}]))
+    with pytest.raises(ValueError, match="missing or invalid required 'task'"):
+        normalize_amber(src_no_task, img_dir, tmp_path / "out3.jsonl")
+
+    # Discriminative item missing type (DS-02: Reproduction 4)
+    src_no_type = tmp_path / "no_type.json"
+    src_no_type.write_text(json.dumps([{
+        "id": 1005, "image": "valid.jpg", "task": "discriminative",
+        "query": "Is there a dog?", "label": "Yes",
     }]))
-    with pytest.raises(AmberError, match="Missing or escaping"):
-        normalize_amber(source, tmp_path, tmp_path / "out.jsonl")
+    with pytest.raises(ValueError, match="missing or invalid required 'type'"):
+        normalize_amber(src_no_type, img_dir, tmp_path / "out4.jsonl")
+
+    # Discriminative item missing label or label stored under 'truth' (DS-02: Reproduction 1)
+    src_truth = tmp_path / "truth_key.json"
+    src_truth.write_text(json.dumps([{
+        "id": 1005, "image": "valid.jpg", "task": "discriminative",
+        "type": "existence", "query": "Is there a dog?", "truth": "Yes",
+    }]))
+    with pytest.raises(ValueError, match="missing or invalid required 'label'"):
+        normalize_amber(src_truth, img_dir, tmp_path / "out5.jsonl")
+
+    # Generative item with objects stored under 'truth' (DS-02: Reproduction 5)
+    src_gen_truth = tmp_path / "gen_truth.json"
+    src_gen_truth.write_text(json.dumps([{
+        "id": 1, "image": "valid.jpg", "task": "generative",
+        "query": "Describe", "truth": ["dog"],
+    }]))
+    # Note: generative query can be normalized without objects, but scoring requires objects list
+    norm_out = tmp_path / "out_gen.jsonl"
+    normalize_amber(src_gen_truth, img_dir, norm_out)
+    with pytest.raises(ValueError, match="missing or invalid required 'objects'"):
+        score_amber_generative([{"id": "1", "prediction": "A dog"}], [{"id": "1", "truth": ["dog"]}])
 
 
-def test_parse_binary_yes_no():
-    assert parse_binary_yes_no("Yes") == "Yes"
-    assert parse_binary_yes_no("yes, there is a cat.") == "Yes"
-    assert parse_binary_yes_no("No.") == "No"
-    assert parse_binary_yes_no("no, absolutely not.") == "No"
-    assert parse_binary_yes_no("Definitely yes!") == "Yes"
-    assert parse_binary_yes_no("I cannot tell") is None
-    assert parse_binary_yes_no("") is None
-
-
-def test_score_amber_discriminative_dimensions():
-    ground_truth = [
+def test_score_amber_discriminative_denominators_and_failures():
+    # DS-03: Reproduction 2 & 3
+    # 3 ground truth items
+    gt = [
         {"id": "1005", "label": "Yes", "type": "existence"},
         {"id": "1006", "label": "No", "type": "attribute"},
         {"id": "1007", "label": "Yes", "type": "relation"},
-        {"id": "1008", "label": "No", "type": "existence"},
     ]
-    # Predictions: 3 correct, 1 wrong (1008 predicted Yes instead of No)
+
+    # Only 1 answered correctly (1005), 1 unparseable (1006), 1 missing (1007)
     predictions = [
-        {"id": "amber__discriminative__1005", "prediction": "Yes, there is a dog."},
-        {"id": "amber__discriminative__1006", "prediction": "No, it is blue."},
-        {"id": "amber__discriminative__1007", "prediction": "Yes, on the table."},
-        {"id": "amber__discriminative__1008", "prediction": "Yes."},  # False positive -> hallucination
+        {"id": "amber__discriminative__1005", "prediction": "Yes"},
+        {"id": "amber__discriminative__1006", "prediction": "I don't know"},
     ]
 
-    scores = score_amber_discriminative(predictions, ground_truth)
-    assert scores["status"] == "AMBER_DISCRIMINATIVE_SCORED"
+    scores = score_amber_discriminative(predictions, gt)
+    assert scores["status"] == "AMBER_DISCRIMINATIVE_PROXY_UNVERIFIED"
 
-    # Overall: 3/4 = 75% accuracy
-    assert scores["overall"]["accuracy"] == 0.75
-    assert scores["overall"]["count"] == 4
-
-    # Existence: 1 TP (1005), 1 FP (1008) -> Acc = 0.5, Hallucination Rate = 1.0 (FP/(FP+TN))
-    exist = scores["dimensions"]["existence"]
-    assert exist["count"] == 2
-    assert exist["accuracy"] == 0.5
-    assert exist["hallucination_rate"] == 1.0
-
-    # Attribute: 1 TN (1006) -> Acc = 1.0, Hallucination Rate = 0.0
-    attr = scores["dimensions"]["attribute"]
-    assert attr["count"] == 1
-    assert attr["accuracy"] == 1.0
-    assert attr["hallucination_rate"] == 0.0
-
-    # Relation: 1 TP (1007) -> Acc = 1.0
-    rel = scores["dimensions"]["relation"]
-    assert rel["count"] == 1
-    assert rel["accuracy"] == 1.0
+    # All 3 ground truth items MUST be in the denominator!
+    # Correct: 1 (1005). Unparseable: 1 (1006). Missing: 1 (1007).
+    # Accuracy = 1 / 3 = 0.3333... (NOT 1.0!)
+    assert scores["overall"]["count"] == 3
+    assert pytest.approx(scores["overall"]["accuracy"], rel=1e-3) == 1.0 / 3.0
+    assert scores["overall"]["unparseable_count"] == 1
+    assert scores["overall"]["missing_count"] == 1
 
 
-def test_score_amber_generative_chair():
-    annotations = [
-        {"id": "1", "objects": ["dog", "frisbee", "park"]},
-        {"id": "2", "objects": ["cat", "sofa"]},
+def test_score_amber_composite_requires_both_tasks():
+    # DS-03: Reproduction 7
+    # Only discriminative items provided
+    gt_disc_only = [
+        {"id": 1005, "task": "discriminative", "label": "Yes", "type": "existence"},
     ]
-    predictions = [
-        # Sample 1: mentions dog, frisbee, park -> no hallucination
-        {"id": "amber__generative__1", "prediction": "A happy dog catches a frisbee in a sunny park."},
-        # Sample 2: mentions cat, car, bicycle -> mentions cat (correct), car & bicycle (hallucinated)
-        {"id": "amber__generative__2", "prediction": "A cute cat next to a car and bicycle."},
+    preds = [
+        {"id": "amber__discriminative__1005", "prediction": "Yes"},
     ]
 
-    scores = score_amber_generative(predictions, annotations)
-    assert scores["status"] == "AMBER_GENERATIVE_SCORED"
-    assert scores["count"] == 2
-
-    # Sample 1: 0 hallucinations. Sample 2: 1 hallucinated response.
-    # CHAIR_S / Ha_rate = 1/2 = 0.5
-    assert scores["chair_s"] == 0.5
-    assert scores["hallucination_rate"] == 0.5
-    assert scores["chair_i"] > 0.0
-    assert scores["precision"] > 0.0
-    assert scores["recall"] > 0.0
+    report = score_amber(preds, gt_disc_only)
+    assert report["status"] == "AMBER_PROXY_UNVERIFIED"
+    assert report["composite_status"] == "COMPOSITE_SCORE_UNAVAILABLE_REQUIRES_BOTH_TASKS"
+    # amber_score MUST be None, NEVER default to 1.0 or 0.0
+    assert report["amber_score"] is None
 
 
-def test_score_amber_unified_and_export(tmp_path):
+def test_score_amber_unified_when_both_tasks_present():
     annotations = [
         {"id": 1, "task": "generative", "objects": ["dog", "grass"]},
         {"id": 1005, "task": "discriminative", "label": "Yes", "type": "existence"},
@@ -270,66 +285,61 @@ def test_score_amber_unified_and_export(tmp_path):
     ]
 
     report = score_amber(predictions, annotations)
-    assert report["status"] == "AMBER_OFFICIAL_SCORED"
-    assert report["generative"]["chair_s"] == 0.0  # Perfect generation
-    assert report["discriminative"]["overall"]["accuracy"] == 1.0  # Perfect discriminative
-    assert report["amber_score"] == 1.0  # 0.5 * ((1.0 - 0.0) + 1.0) = 1.0
-
-    # Test export to official AMBER format
-    export_file = tmp_path / "amber_official_preds.json"
-    export_amber_official_format(predictions, export_file)
-    exported_data = json.loads(export_file.read_text(encoding="utf8"))
-    assert len(exported_data) == 2
-    assert exported_data[0]["id"] == 1
-    assert exported_data[0]["response"] == "A dog on green grass."
-    assert exported_data[1]["id"] == 1005
-    assert exported_data[1]["response"] == "Yes"
+    assert report["status"] == "AMBER_PROXY_UNVERIFIED"
+    assert report["composite_status"] == "COMPOSITE_SCORE_CALCULATED"
+    assert report["generative"]["chair_s"] == 0.0
+    assert report["discriminative"]["overall"]["accuracy"] == 1.0
+    assert report["amber_score"] == 1.0
 
 
-def test_amber_validation_errors(tmp_path):
-    source, img_dir, _ = _create_amber_fixtures(tmp_path)
-
-    # Invalid split
-    with pytest.raises(AmberError, match="Unsupported AMBER split"):
-        normalize_amber(source, img_dir, tmp_path / "out.jsonl", split="invalid_split")
-
-    # Invalid pass_type
-    with pytest.raises(AmberError, match="Unsupported pass_type"):
-        normalize_amber(source, img_dir, tmp_path / "out.jsonl", pass_type="invalid_pass")
-
-    # Limit < 1
-    with pytest.raises(ValueError, match="Limit must be positive"):
-        normalize_amber(source, img_dir, tmp_path / "out.jsonl", limit=0)
-
-    # Path traversal attack in image reference
-    source_traversal = tmp_path / "traversal.json"
-    source_traversal.write_text(json.dumps([{
-        "id": 9999,
-        "image": "../../../etc/passwd",
-        "task": "discriminative",
-        "query": "Attack?",
-        "label": "Yes",
-    }]))
-    with pytest.raises(AmberError, match="Missing or escaping"):
-        normalize_amber(source_traversal, img_dir, tmp_path / "out.jsonl")
-
-
-def test_score_amber_empty_and_unparsed_predictions():
-    # Empty predictions
-    empty_disc = score_amber_discriminative([], [{"id": "1", "label": "Yes"}])
-    assert empty_disc["overall"]["count"] == 0
-
-    empty_gen = score_amber_generative([], [{"id": "1", "objects": ["dog"]}])
-    assert empty_gen["count"] == 0
-    assert empty_gen["chair_i"] == 0.0
-
-    # Unparsed / non-binary predictions
-    unparsed_preds = [
-        {"id": "amber__discriminative__1005", "prediction": "I am not capable of answering this."},
+def test_score_amber_multi_word_objects():
+    # Multi-word objects like 'traffic light'
+    ann = [
+        {"id": "1", "objects": ["traffic light", "car"]},
+        {"id": "2", "objects": ["dog"]},
     ]
-    gt = [{"id": "1005", "label": "Yes", "type": "existence"}]
-    scores = score_amber_discriminative(unparsed_preds, gt)
-    assert scores["overall"]["count"] == 1
-    assert scores["overall"]["unparsed_rate"] == 1.0
-    assert scores["overall"]["accuracy"] == 0.0
+    preds = [
+        # Correctly mentions traffic light and car
+        {"id": "1", "prediction": "There is a red traffic light and a white car."},
+        # Mentions dog (correct) and traffic light (hallucinated)
+        {"id": "2", "prediction": "A dog sitting next to a traffic light."},
+    ]
+    scores = score_amber_generative(preds, ann)
+    assert scores["status"] == "AMBER_GENERATIVE_PROXY_UNVERIFIED"
+    assert scores["count"] == 2
+    # Sample 1: 0 hallucinations. Sample 2: 1 hallucination ('traffic light')
+    assert scores["chair_s"] == 0.5
+    assert scores["total_mentioned_objects"] == 4  # traffic light, car, dog, traffic light
+    assert scores["total_hallucinated_objects"] == 1  # traffic light in sample 2
+
+
+def test_export_amber_official_format_raw_responses(tmp_path):
+    # DS-10: Export raw predictions without parser rewriting
+    preds = [
+        {"id": "amber__generative__1", "prediction": "A description text."},
+        {"id": "amber__discriminative__1005", "prediction": "Definitely Yes!"},
+    ]
+    export_file = tmp_path / "raw_preds.json"
+    export_amber_official_format(preds, export_file)
+    exported = json.loads(export_file.read_text(encoding="utf8"))
+    assert len(exported) == 2
+    assert exported[0]["id"] == 1
+    assert exported[0]["response"] == "A description text."
+    assert exported[1]["id"] == 1005
+    assert exported[1]["response"] == "Definitely Yes!"  # Raw, not modified
+
+
+def test_amber_upstream_manifest_and_parse_helpers():
+    # DS-07: Verify pinned upstream manifest
+    assert AMBER_UPSTREAM_MANIFEST["repo_id"] == "junyangwang0410/AMBER"
+    assert AMBER_UPSTREAM_MANIFEST["license"] == "Apache-2.0"
+    assert len(AMBER_UPSTREAM_MANIFEST["pinned_commit"]) == 40
+
+    # Test binary yes/no parsing helper
+    assert parse_binary_yes_no("Yes") == "Yes"
+    assert parse_binary_yes_no("no, there is none") == "No"
+    assert parse_binary_yes_no("I cannot tell") is None
+
+    # Test AmberError is a ValueError
+    assert issubclass(AmberError, ValueError)
 

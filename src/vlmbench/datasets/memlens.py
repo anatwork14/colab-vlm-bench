@@ -131,9 +131,9 @@ def build_memlens_context_bins(
     native_path: Path | str,
     output_path: Path | str,
     *,
+    tokenizer: Any,
     input_lengths: tuple[int, ...] | list[int] = CANONICAL_LENGTHS,
     image_limit: int = 1,
-    tokenizer: Any | None = None,
     tolerance: float = 0.05,
     max_per_bin: int | None = None,
 ) -> dict[str, Any]:
@@ -142,7 +142,15 @@ def build_memlens_context_bins(
     Canonical lengths: (128, 512, 1024, 2048, 4096, 8192, 16384).
     Deterministic source IDs: <source_id>__text<length>.
     Preserves genuine visual inputs and original source question IDs.
+
+    DS-04: Enforces strict ±5% tolerance. Rows are NEVER emitted into bins
+    where history is too short. Skip reasons are tracked and reported.
+    Tokenizer is mandatory.
+    DS-09: Encodes history once per row and uses identical ' ' join rule.
     """
+    if tokenizer is None:
+        raise ValueError("Tokenizer is mandatory for build_memlens_context_bins to enforce ±5% token tolerance")
+
     native_path = Path(native_path)
     output_path = Path(output_path)
     if not 0 <= image_limit <= 8:
@@ -153,6 +161,7 @@ def build_memlens_context_bins(
 
     candidates: list[dict[str, Any]] = []
     bin_counts: Counter[int] = Counter()
+    skip_reasons: Counter[str] = Counter()
 
     for row in rows:
         if len(row["messages"]) != 1:
@@ -164,7 +173,6 @@ def build_memlens_context_bins(
         question_part = content[-1]
         history_parts = content[:-1]
 
-        # Preserve genuine visual inputs exactly from original sessions
         selected_images = [
             part for part in history_parts if part.get("type") == "image_path"
         ][-image_limit:] if image_limit else []
@@ -176,46 +184,48 @@ def build_memlens_context_bins(
         question_text = str(question_part["text"])
         source_id = str(row["id"])
 
+        # Encode history and question tokens ONCE per native record (DS-09)
+        token_history = tokenizer.encode(history_full_text, add_special_tokens=False)
+        token_question = tokenizer.encode(question_text, add_special_tokens=False)
+        n_question = len(token_question)
+
         for target in canonical_targets:
             if max_per_bin is not None and bin_counts[target] >= max_per_bin:
                 continue
 
-            # Deterministic ID formatted exactly as <source_id>__text<length>
-            derived_id = f"{source_id}__text{target}"
+            budget = target - n_question - 1
+            # DS-04: If history is too short for the target bin, DO NOT EMIT!
+            if budget <= 0 or len(token_history) < budget:
+                skip_reasons[f"history_too_short_for_{target}"] += 1
+                continue
 
-            if tokenizer is not None:
-                q_tokens = tokenizer.encode(question_text, add_special_tokens=False)
-                hist_tokens = tokenizer.encode(history_full_text, add_special_tokens=False)
-                budget = target - len(q_tokens) - 1
-                if budget <= 0:
-                    trimmed_text = ""
+            # Binary search to find slice of history matching target length
+            lo, hi = max(1, budget // 2), min(len(token_history), int(budget * 1.3) + 16)
+            best: tuple[int, str] | None = None
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                excerpt = tokenizer.decode(
+                    token_history[-mid:], skip_special_tokens=False
+                )
+                # Same join rule as annotation: ' ' (DS-09)
+                merged = excerpt + " " + question_text
+                actual = len(tokenizer.encode(merged, add_special_tokens=False))
+                if best is None or abs(actual - target) < abs(best[0] - target):
+                    best = (actual, excerpt)
+                if actual < target:
+                    lo = mid + 1
+                elif actual > target:
+                    hi = mid - 1
                 else:
-                    lo, hi = max(1, budget // 2), min(len(hist_tokens), int(budget * 1.3) + 16)
-                    best = None
-                    while lo <= hi:
-                        mid = (lo + hi) // 2
-                        excerpt = tokenizer.decode(
-                            hist_tokens[-mid:], skip_special_tokens=False
-                        )
-                        merged = excerpt + "\n" + question_text
-                        actual = len(tokenizer.encode(merged, add_special_tokens=False))
-                        if best is None or abs(actual - target) < abs(best[0] - target):
-                            best = (actual, excerpt)
-                        if actual < target:
-                            lo = mid + 1
-                        elif actual > target:
-                            hi = mid - 1
-                        else:
-                            break
-                    trimmed_text = best[1] if best else ""
-            else:
-                # Word-based heuristic when tokenizer not present on CPU
-                word_target = max(1, int(target * 0.72))
-                q_words = question_text.split()
-                rem = max(0, word_target - len(q_words))
-                hist_words = history_full_text.split()
-                tail = hist_words[-rem:] if rem > 0 else []
-                trimmed_text = " ".join(tail) if tail else ""
+                    break
+
+            # DS-04: Enforce strict tolerance (e.g. ±5%)
+            if best is None or (abs(best[0] - target) / target) > tolerance:
+                skip_reasons[f"tolerance_mismatch_for_{target}"] += 1
+                continue
+
+            actual_tokens, trimmed_text = best
+            derived_id = f"{source_id}__text{target}"
 
             parts = []
             if trimmed_text:
@@ -236,6 +246,8 @@ def build_memlens_context_bins(
                 "meta": {
                     "original_question_id": source_id,
                     "requested_text_length_bin": target,
+                    "actual_text_tokens": actual_tokens,
+                    "derivation_id": "memlens_7bin_builder_v2",
                     "evidence_may_be_dropped": True,
                     "official_quality_allowed": False,
                     "image_count": len(selected_images),
@@ -248,12 +260,15 @@ def build_memlens_context_bins(
     return {
         "dataset": "memlens",
         "track": "derived_serving",
+        "derivation_id": "memlens_7bin_builder_v2",
         "canonical_lengths": list(canonical_targets),
+        "tolerance": tolerance,
         "source_sha256": sha256(native_path),
         "derived_sha256": sha256(output_path),
         "source_records": len(rows),
         "derived_records": len(candidates),
         "counts_per_bin": {str(k): bin_counts[k] for k in canonical_targets},
+        "skip_reasons": dict(skip_reasons),
         "output": str(output_path),
         "status": "CANDIDATES_REQUIRE_MODEL_TOKEN_ANNOTATION",
     }
