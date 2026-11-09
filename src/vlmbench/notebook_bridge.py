@@ -181,6 +181,199 @@ def build_serving_candidates(
     }
 
 
+
+def validate_serving_candidates(
+    path: str | Path, *, dataset: str, input_lengths: list[int],
+) -> dict:
+    """CPU-only full JSONL integrity check, before any paid vLLM startup.
+
+    Merely finding a file on Drive does not prove that its contents survived
+    interruption/sync. Validate every record, all IDs and bin memberships;
+    never silently drop a malformed line, image or scientific sample.
+    """
+    from .workloads import WorkloadError
+
+    candidate = Path(path)
+    if not candidate.is_file():
+        raise FileNotFoundError(f"Candidate source missing: {candidate}")
+    expected = set(input_lengths)
+    if not expected or any(type(n) is not int or n <= 0 for n in expected):
+        raise ValueError("input_lengths must be positive integer token bins")
+    counts = Counter()
+    seen = set()
+    with candidate.open("r", encoding="utf-8") as stream:
+        for lineno, line in enumerate(stream, 1):
+            if not line.strip():
+                raise WorkloadError(
+                    f"{candidate}: blank JSONL line {lineno}; source must be regenerated")
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise WorkloadError(
+                    f"{candidate}: INVALID_CANDIDATE_JSONL line {lineno}, "
+                    f"column {exc.colno}: {exc.msg}. Existing file is malformed "
+                    "or incomplete; do not start GPU until CPU repair succeeds."
+                ) from exc
+            if not isinstance(item, dict):
+                raise WorkloadError(f"{candidate}: JSONL line {lineno} is not an object")
+            sid = item.get("id")
+            if not isinstance(sid, str) or not sid or sid in seen:
+                raise WorkloadError(
+                    f"{candidate}: missing/duplicate sample ID at line {lineno}")
+            seen.add(sid)
+            if (item.get("dataset") != dataset
+                    or item.get("track") != "derived_serving"
+                    or not item.get("derived_from")):
+                raise WorkloadError(
+                    f"{candidate}: invalid dataset/track/origin at line {lineno}")
+            token_bin = item.get("requested_text_length_bin")
+            if type(token_bin) is not int or token_bin not in expected:
+                raise WorkloadError(
+                    f"{candidate}: invalid text token bin at line {lineno}")
+            messages = item.get("messages")
+            if not isinstance(messages, list) or len(messages) != 1:
+                raise WorkloadError(
+                    f"{candidate}: expected one chat message at line {lineno}")
+            parts = messages[0].get("content", [])
+            if (messages[0].get("role") != "user" or not isinstance(parts, list)
+                    or not any(p.get("type") == "image_path" and p.get("path")
+                               and p.get("asset_root") for p in parts if isinstance(p, dict))
+                    or not any(p.get("type") == "text" and p.get("text")
+                               for p in parts if isinstance(p, dict))):
+                raise WorkloadError(
+                    f"{candidate}: missing real image/text reference at line {lineno}")
+            if item.get("image_count") != 1:
+                raise WorkloadError(
+                    f"{candidate}: unexpected image count at line {lineno}")
+            counts[token_bin] += 1
+    if not seen:
+        raise WorkloadError(f"{candidate}: empty candidate JSONL")
+    return {
+        "status": "VALIDATED_SOURCE_DERIVED_CANDIDATES",
+        "path": str(candidate),
+        "records": len(seen),
+        "per_text_bin": {str(n): counts[n] for n in sorted(expected)},
+        "source_sha256": sha256(candidate),
+    }
+
+
+def validate_annotation_resume_source(
+    candidates: str | Path, annotated: str | Path, *, model_id: str,
+) -> None:
+    """Fail early if saved annotation state references different source bytes."""
+    from .workloads import WorkloadError
+
+    annotated = Path(annotated)
+    state = annotated.with_name(annotated.name + ".state.json")
+    if not annotated.exists() and not state.exists():
+        return
+    if not annotated.is_file() or not state.is_file():
+        raise WorkloadError(
+            "Incomplete annotated dataset/state pair on Drive; manually audit "
+            f"{annotated} and {state} before GPU. Neither was overwritten.")
+    try:
+        receipt = json.loads(state.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as exc:
+        raise WorkloadError(f"Unreadable annotation state {state}") from exc
+    if (receipt.get("source_sha256") != sha256(candidates)
+            or receipt.get("model") != model_id):
+        raise WorkloadError(
+            "Annotation resume source SHA/model mismatch. Preserve existing "
+            f"{annotated}; use new campaign paths or audit before rerunning GPU.")
+
+
+def prepare_serving_candidates(
+    native_path: str | Path,
+    output_path: str | Path,
+    *,
+    annotated_path: str | Path,
+    dataset: str,
+    model_id: str,
+    model_directory: str | Path,
+    input_lengths: list[int],
+    max_per_bin: int,
+    local_scratch_dir: str | Path,
+    pdf_root: str | Path | None = None,
+) -> dict:
+    """Reuse only complete candidates; safely rebuild corrupt Drive JSONL on SSD.
+
+    A corrupt source is preserved as a content-addressed .corrupt backup on
+    Drive. Rebuilding is forbidden if an annotation campaign already exists;
+    those receipts must never be silently invalidated.
+    """
+    import shutil
+    from .workloads import WorkloadError
+
+    output = Path(output_path)
+    prior_error = None
+    if output.is_file():
+        try:
+            audit = validate_serving_candidates(
+                output, dataset=dataset, input_lengths=input_lengths)
+        except (WorkloadError, UnicodeError, OSError) as exc:
+            prior_error = str(exc)
+        else:
+            validate_annotation_resume_source(
+                output, annotated_path, model_id=model_id)
+            return {**audit, "status": "REUSED_VALIDATED_CANDIDATES"}
+    if (Path(annotated_path).exists()
+            or Path(str(annotated_path) + ".state.json").exists()):
+        raise WorkloadError(
+            "Candidate regeneration refused: annotated data/state exists; "
+            "preserve and audit provenance before any replacement. "
+            f"Candidates: {output}; annotations: {annotated_path}")
+
+    # Generate on local SSD first. Never publish a partially built JSONL to
+    # Drive, and never overwrite the damaged file if generation or audit fails.
+    local = Path(local_scratch_dir) / (
+        f"{model_id}_{dataset}_candidate_rebuild.jsonl")
+    local.parent.mkdir(parents=True, exist_ok=True)
+    result = build_serving_candidates(
+        native_path, local, dataset=dataset,
+        model_directory=model_directory, input_lengths=input_lengths,
+        max_per_bin=max_per_bin, pdf_root=pdf_root)
+    checked = validate_serving_candidates(
+        local, dataset=dataset, input_lengths=input_lengths)
+    verified_digest = checked["source_sha256"]
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    backup = None
+    if output.exists():
+        bad_digest = sha256(output)
+        backup = output.with_name(
+            output.stem + f".corrupt-{bad_digest[:12]}" + output.suffix)
+        if backup.is_file():
+            if sha256(backup) != bad_digest:
+                raise WorkloadError(f"Corrupt candidate backup conflict: {backup}")
+        else:
+            shutil.copy2(output, backup)
+            if sha256(backup) != bad_digest:
+                raise IOError(f"Corrupt candidate backup verification failed: {backup}")
+        if sha256(output) != bad_digest:
+            raise WorkloadError("Candidate file changed during repair; refusing overwrite")
+
+    pending = output.with_name(output.name + ".repair.pending")
+    try:
+        shutil.copy2(local, pending)
+        if sha256(pending) != verified_digest:
+            raise IOError("Local-to-Drive candidate staging SHA mismatch")
+        pending.replace(output)
+    finally:
+        pending.unlink(missing_ok=True)
+    published = validate_serving_candidates(
+        output, dataset=dataset, input_lengths=input_lengths)
+    if published["source_sha256"] != verified_digest:
+        raise IOError("Published candidate digest differs from local validation")
+    return {
+        **published,
+        "status": "REBUILT_CORRUPT_CANDIDATES" if prior_error
+                  else "BUILT_VALIDATED_CANDIDATES",
+        "prior_error": prior_error,
+        "preserved_corrupt_backup": str(backup) if backup else None,
+        "builder": result.get("status"),
+    }
+
+
 def write_local_campaign(
     template: str | Path, output: str | Path, *,
     model_id: str, drive_model: str, drive_results: str,

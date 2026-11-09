@@ -1,6 +1,6 @@
 # Standalone-upload Colab notebooks — seven-arm campaign
 
-Each notebook now includes **7 independent methods**, not just Base/MTP: Base, H2O+Base, Declarative Attention+Base, ECRD Grounding+Base, native MTP, H2O+MTP, DA+MTP. Each .ipynb has 36 cells with a method planner, conditional dispatcher, temperature=0/top_p=1 checks and grounded-hallucination scoring from independent judge annotations. Five external-method arms are explicitly BLOCKED until real Qwen3.5+vLLM+A100 implementations are qualified. The notebooks DO NOT fake method results by reusing Base outputs.
+Each notebook now includes **7 independent methods**, not just Base/MTP: Base, H2O+Base, Declarative Attention+Base, ECRD Grounding+Base, native MTP, H2O+MTP, DA+MTP. Both notebooks have 38 cells; the 0.8B Colab launch badge lives inside the introduction Markdown cell with a method planner, conditional dispatcher, temperature=0/top_p=1 checks and grounded-hallucination scoring from independent judge annotations. Five external-method arms are explicitly BLOCKED until real Qwen3.5+vLLM+A100 implementations are qualified. The notebooks DO NOT fake method results by reusing Base outputs.
 
 Methods manifest: `configs/a100_qwen_7methods_pilot.json` (168 planned cells, 48 native-routable) or `configs/a100_qwen_7methods_full.json` (3,528 planned cells, 1,008 native-routable). Raw native quality uses natural EOS; derived serving uses 256 fixed output tokens. Official quality and hallucination require external evaluation.
 
@@ -39,3 +39,49 @@ For MMLongBench-Doc, the adapter now supports publisher QA `.parquet` via PyArro
 If rerunning an existing Colab session, execute the setup cell to fast-forward the cloned repo to current `main` before retrying normalization. Upload the latest `.ipynb` from GitHub (old Colab tabs do not auto-update). Never commit executed notebook outputs, raw dataset answers, tokens or private runtime diagnostics into GitHub.
 
 For a full code-cell-by-code-cell review and RAM/SSD thresholds, see [COLAB_STEPWISE_AUDIT.md](../docs/COLAB_STEPWISE_AUDIT.md). This checklist distinguishes CPU test PASS from still-unverified A100 capacity.
+
+## Recovered A100 startup — first-image smoke blocked by corrupt Drive JSONL
+
+If vLLM starts normally and reports `GET /v1/models 200 OK` but the first smoke request fails with `JSONDecodeError: Unterminated string` in `load_jsonl(CANDIDATES[first_ds], ...)`, the problem is **invalid candidate JSONL on Drive**, not CUDA or vLLM. Old Step 6 checked only `Path.exists()` and silently reused damaged files.
+
+The new Step 6 uses `prepare_serving_candidates` and `validate_serving_candidates`: it streams **every JSONL line on CPU**, checks unique sample IDs, text bins and image/text content structure. If the candidate is invalid and no annotation/state exists, it rebuilds from the existing normalized dataset **on local SSD first**, validates, copies the original damaged file to a SHA-tagged `.corrupt-<sha>.jsonl` backup on Drive, verifies the new Drive copy's SHA, and prints a receipt. If annotation/state already exists, it **refuses** automatic regeneration to preserve scientific provenance. The paid Step 8 repeats this validation **before** calling `start_server`.
+
+To use the repair, **open a fresh copy of the updated notebook**: fetching the Git branch does not replace code inside an already-open Colab notebook cell. Do not repeat costly model-weight staging or normalization if existing files are intact. Alternatively, in an already-open session with the Step 6 variables defined, run this standalone **CPU-only recovery cell** to update the repository and safely repair each candidate JSONL without starting vLLM:
+
+```python
+import subprocess
+import importlib
+
+subprocess.run(["git", "-C", str(REPO), "fetch", "origin", BENCH_SOURCE_REF], check=True)
+subprocess.run(["git", "-C", str(REPO), "checkout", "--detach", "FETCH_HEAD"], check=True)
+import vlmbench.notebook_bridge as repaired_bridge
+importlib.reload(repaired_bridge)
+
+for ds in ACTIVE_DATASETS:
+    receipt = repaired_bridge.prepare_serving_candidates(
+        NATIVE[ds], CANDIDATES[ds], annotated_path=ANNOTATED[ds],
+        dataset=ds, model_id=MODEL_ID, model_directory=STAGED_MODEL,
+        input_lengths=TEXT_BINS, max_per_bin=MAX_ROWS_PER_BIN,
+        local_scratch_dir="/content/vlmbench/prepared_candidates",
+        pdf_root=MMLONG_PDF_ROOT if ds == "mmlongbench_doc" else None)
+    print(ds, receipt["status"], receipt["records"],
+          receipt["per_text_bin"], receipt["preserved_corrupt_backup"])
+```
+
+Only after all active datasets print `REBUILT_CORRUPT_CANDIDATES` or `REUSED_VALIDATED_CANDIDATES` should the previously failed Step 8 be retried. On an updated notebook, Step 8 additionally prints `PRE_GPU_CANDIDATE_PASS`. The next failure, if any, can then be investigated as an actual VLM image-request/server issue. Actual A100 image-request success remains unproven until that run.
+
+## Qwen3.5-0.8B bounded A100 Base pilot (branch fix)
+
+The Qwen3.5-0.8B branch notebook is now configured for a **paid first Base pilot when Run All is invoked on an allocated A100**. Step 1 explicitly prints `RUN_GPU_ANNOTATION=True`, `RUN_BASE=True`, `ANNOTATION_CALL_BUDGET=24`, and `MAX_CELLS_PER_JOB=1`. This is at most 24 **new** one-token annotation requests per active dataset, plus one smoke prompt, then at most one ready Base serving cell per dataset. MTP/full quality/external methods stay disabled. Switch both `RUN_GPU_ANNOTATION` and `RUN_BASE` to `False` for preprocessing-only runs. GPU compute units can also be billed during CPU-heavy preparation if the A100 is already allocated.
+
+**Runtime source correctness:** While this notebook repair is in PR #18, the 0.8B setup cell explicitly fetches the fix branch into `/content/colab-vlm-bench` and prints its SHA. Prior notebooks cloned `main` even when opened from a PR branch, silently missing all PR-only runtime patches. Once merged, switch to an immutable release SHA or `main` as appropriate and record the actual SHA in the campaign results.
+
+The shared `run-job` runner now **executes only ready cells**. A cell needing more unique annotated prompts stays pending rather than writing an `INSUFFICIENT_WORKLOAD` failure that could block future measurement. This applies to the agent-operated Colab CLI as well. If Step 9 has no ready bin, the notebook raises an actionable error rather than silently exporting a `NOT_RUN` report. If vLLM fails startup or an image prompt is rejected, Step 8 prints the last 80 vLLM log lines; that is the next runtime evidence required. No successful actual A100 model execution is claimed by this software change.
+
+## Troubleshooting: preflight succeeds but the notebook says `NOT_RUN`
+
+This was the old safe-preparation default, not evidence of successful inference. The 0.8B branch now enables a capped paid Base pilot; the 4B notebook still defaults to preparation-only. `RUN_MTP`, `RUN_METHOD_MATRIX`, and `RUN_NATIVE_QUALITY` remain disabled in the 0.8B pilot. After a successful CPU/SSD gate, weight staging, and normalization, the candidate JSONL still has **no vLLM-verified prompt-token counts**. Step 9 therefore reports `BLOCKED_NO_ANNOTATED_DATASET`; Step 10/11 skip inference when their switches are off.
+
+To obtain a real measurement, verify the new 0.8B Step 1 has `RUN_GPU_ANNOTATION=True` and re-execute that configuration cell. Run Step 8 with the new bound **24 new requests per active dataset** and inspect the recorded `verified_total` and errors. On later executions the file resumes from prior verified rows; repeat only deliberately after checking the receipts. Run Step 9 again: it must show at least one `READY_CELLS_PRESENT` dataset and some eligible cells **before** enabling `RUN_BASE=True` and running Step 10. For a pilot, test Base before MTP and never enable all seven arms expecting unsupported H₂O/DA/ECRD variants to run. Raise annotation budget only with explicit compute approval and clear token-capacity evidence. Missing unique prompts at higher CCU cannot be fixed by GPU retries; leave such cells blocked or expand a source-qualified workload.
+
+The November 9 notebook repair removes a duplicate CPU guard, an extra Colab-badge cell, and saved execution counts/outputs introduced by the `cannot run` commit. Saved outputs fail `tests/test_notebooks.py` and can reveal local Drive paths; keep receipts on Drive rather than committing executed notebooks. **GitHub notebook checks do not demonstrate actual A100/vLLM runtime success.**

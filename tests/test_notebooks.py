@@ -80,7 +80,8 @@ def test_memlens_colab_ram_regression_and_clean_outputs():
     assert "normalize_memlens(" in combined
     assert "ijson>=3.3" in combined
     assert "pyarrow>=15" in combined
-    assert 'merge", "--ff-only"' in combined
+    assert 'checkout", "--detach", "FETCH_HEAD"' in combined
+    assert "BENCH_SOURCE_REF" in combined
     assert "drive.mount" in combined
     for c in obj["cells"]:
         if c["cell_type"] == "code":
@@ -100,10 +101,18 @@ def test_full_colab_resource_and_cost_guard_before_gpu_steps(name):
     assert preflight < staging < annotation < serving
     combined = "\n".join(cells)
     assert "CPU_PREFLIGHT_ONLY" in combined
-    assert "ANNOTATION_CALL_BUDGET = 8" in combined
+    assert ("ANNOTATION_CALL_BUDGET = 24" if name == "Qwen3.5-0.8B.ipynb"\
+            else "ANNOTATION_CALL_BUDGET = 8") in combined
     assert "serving_readiness(" in combined
     assert "ACTIVE_DATASETS" in combined
-    assert "RUN_GPU_ANNOTATION = False" in combined
-    assert "RUN_BASE = False" in combined
+    if name == "Qwen3.5-0.8B.ipynb":
+        assert "RUN_GPU_ANNOTATION = True" in combined
+        assert "RUN_BASE = True" in combined
+        assert "MAX_CELLS_PER_JOB = 1" in combined
+        assert "ready_datasets" in combined
+        assert "No verified-ready cells" in combined
+    else:
+        assert "RUN_GPU_ANNOTATION = False" in combined
+        assert "RUN_BASE = False" in combined
     assert "RUN_MTP = False" in combined
     assert "RUN_NATIVE_QUALITY = False" in combined

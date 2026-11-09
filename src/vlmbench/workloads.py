@@ -18,24 +18,32 @@ def load_jsonl(path: str | Path, *, dataset: str, track: str) -> list[dict]:
     if not path.is_file():
         raise FileNotFoundError(str(path))
     results, seen = [], set()
-    for line_no, line in enumerate(path.read_text(encoding="utf8").splitlines(), 1):
-        if not line.strip():
-            continue
-        row = json.loads(line)
-        if not isinstance(row.get("id"), (str, int)):
-            raise WorkloadError(f"Missing sample id at line {line_no}")
-        if row["dataset"] != dataset or row["track"] != track:
-            raise WorkloadError(f"Incorrect dataset/track at line {line_no}")
-        if not isinstance(row.get("messages"), list) or not row["messages"]:
-            raise WorkloadError(f"Missing chat messages at line {line_no}")
-        if row["id"] in seen:
-            raise WorkloadError(f"Duplicate question id at line {line_no}")
-        seen.add(row["id"])
-        if track == "native_quality" and not row.get("native_context_complete", False):
-            raise WorkloadError("Native quality input missing complete context declaration")
-        if track == "derived_serving" and row.get("derived_from") is None:
-            raise WorkloadError("Derived serving input must record origin")
-        results.append(row)
+    with path.open("r", encoding="utf8") as stream:
+        for line_no, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise WorkloadError(
+                    f"INVALID_JSONL {path} line {line_no} col {exc.colno}: "
+                    f"{exc.msg}; inspect/rebuild source before GPU") from exc
+            if not isinstance(row, dict):
+                raise WorkloadError(f"Expected JSON object at {path}:{line_no}")
+            if not isinstance(row.get("id"), (str, int)):
+                raise WorkloadError(f"Missing sample id at line {line_no}")
+            if row["dataset"] != dataset or row["track"] != track:
+                raise WorkloadError(f"Incorrect dataset/track at line {line_no}")
+            if not isinstance(row.get("messages"), list) or not row["messages"]:
+                raise WorkloadError(f"Missing chat messages at line {line_no}")
+            if row["id"] in seen:
+                raise WorkloadError(f"Duplicate question id at line {line_no}")
+            seen.add(row["id"])
+            if track == "native_quality" and not row.get("native_context_complete", False):
+                raise WorkloadError("Native quality input missing complete context declaration")
+            if track == "derived_serving" and row.get("derived_from") is None:
+                raise WorkloadError("Derived serving input must record origin")
+            results.append(row)
     if not results:
         raise WorkloadError("Empty workload")
     return results
