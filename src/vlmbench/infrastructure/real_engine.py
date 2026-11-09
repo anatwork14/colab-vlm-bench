@@ -1032,6 +1032,8 @@ class RealSevenArmEngine:
         h2o_budget_ratio: float = 0.5,
         target_backend: str = "pytorch",
         h2o_min_budget: int = 32,
+        stop_at_eos: bool = True,
+        eos_token_ids: Sequence[int] | None = None,
         tokenizer: Any | None = None,
         checkpoint_dir: str | Path | None = None,
     ):
@@ -1040,6 +1042,12 @@ class RealSevenArmEngine:
 
         self.method_arm = method_arm
         self.config = config or Qwen35ModelConfig.qwen35_08b()
+        # Protocol (methods.py quality track, native_full_context): natural EOS stop. Latency
+        # runs must pass stop_at_eos=False explicitly. EOS defaults to the pinned config's id.
+        self.stop_at_eos = bool(stop_at_eos)
+        self.eos_token_ids: tuple[int, ...] = tuple(
+            int(t) for t in (eos_token_ids if eos_token_ids is not None else (self.config.eos_token_id,))
+        )
         self.device = device
         self.backend = target_backend
         self.tokenizer = tokenizer
@@ -1548,11 +1556,17 @@ class RealSevenArmEngine:
             current_token = int(np.argmax(reweighted_np0))
         else:
             current_token = int(torch.argmax(logits[0]).item())
-        tokens_generated.append(current_token)
+        stop_reason = "max_new_tokens"
+        if self.stop_at_eos and current_token in self.eos_token_ids:
+            stop_reason = "eos"  # EOS is never emitted into the output
+        else:
+            tokens_generated.append(current_token)
 
         # Autoregressive generation loop for up to max_new_tokens
         curr_len = len(full_prompt) + 1
         for step in range(1, max_new_tokens):
+            if stop_reason == "eos":
+                break
             step_t0 = time.perf_counter()
             next_input = torch.tensor([[current_token]], device=self.device, dtype=torch.long)
 
@@ -1680,6 +1694,10 @@ class RealSevenArmEngine:
             else:
                 current_token = int(torch.argmax(step_logits).item())
 
+            if self.stop_at_eos and current_token in self.eos_token_ids:
+                stop_reason = "eos"  # shared check for every arm; EOS is not emitted
+                break
+
             # 5. P0 source-correct MTP PROPOSAL DIAGNOSTIC, not speculative serving.
             # Qwen3.5's single trained MTP layer proposes t+2 from h(t) and
             # the embedding of target-selected t+1. Verify that proposal only
@@ -1769,6 +1787,14 @@ class RealSevenArmEngine:
                 "architectural_status": arch_status,
                 "is_official_hf_hooked": self.is_official_hf_hooked,
                 "forward_path_executed": forward_path_executed,
+                "generation": {
+                    "stop_at_eos": self.stop_at_eos,
+                    "eos_token_ids": list(self.eos_token_ids),
+                    "stop_reason": stop_reason,
+                    "generated_token_count": len(tokens_generated),
+                    "eos_token_excluded_from_output": True,
+                    "protocol_reference": "methods.py quality track natural_eos=True; latency runs set stop_at_eos=False",
+                },
                 "vllm_backend_status": "MOCKED_PYTORCH_FALLBACK" if not self.has_vllm_backend else "ATTACHED_VLLM_0_29_0",
                 "pretrained_weights": self.pretrained_weight_summary,
                 "kv_memory_accounting": {
