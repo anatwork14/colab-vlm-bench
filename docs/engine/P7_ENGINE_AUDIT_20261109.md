@@ -11,6 +11,46 @@ vLLM launch helper with no arm logic. All runs are CPU, `PYTHONPATH=src`, using 
 - Round 1 end (`b68cc9f`): 281 passed, 10 skipped, 0 failed.
 - Round 2 end (`1050cdc`): **306 passed, 10 skipped, 0 failed.**
 
+## Round 3 (lead directives D1, D2, R3-1, R3-2)
+
+Test counts for round 3 are reported in the lead message at the final HEAD, not repeated here.
+
+### D1. DA masking: flag-consistency test kept, constructed official case added
+- The round-2 relaxation (accepting a readable question with zero restricted reads) is kept as a flag-consistency test only. It is not evidence that masking works.
+- Constructed official-checkpoint case (`2953f6f` red, `78d1d2f` fix): 14 decode steps with a DA mask that restricts real reads. The test spies `engine.model.forward` and asserts (a) the restricted-read ratio is > 0 and (b) every masked key has attention weight exactly 0.
+- Gate: `DA_MASKING_EXERCISED` = `PASS` only when restricted decode reads occurred; otherwise `NOT_EXERCISED_NO_RESTRICTED_READS`; `NOT_APPLICABLE` for non-DA arms.
+- Limit: DA is decode-only and scripted. Prefill is unmasked (see Qualification boundaries).
+
+### D2. H2O: protected-inside-budget kept; limitation recorded; alternative needs owner approval
+- Semantics kept: sinks and visual tokens sit inside the fixed budget B. This is a deliberate protocol choice, not an accident.
+- Telemetry (`9ccb944` red, `68390d3` fix): `h2o_logical_selection_accounting` now carries `protected_vision_tokens_in_prompt`, `multimodal_kv_compression_evidence`, and a `limitation` string stating that on VLM prompts the protected visual block dominates the budget, so KV compression is near zero and not evidence of memory savings.
+- **Protocol revisions needing owner approval (NOT implemented):**
+  1. Unprotected original-H2O variant: protected tokens outside the budget, so compression acts on the full cache. Telemetry field `unprotected_original_h2o_variant = "NOT_IMPLEMENTED_OWNER_DECISION"`.
+  2. DA question span tagged GLOBAL (documented deviation from the scripted geometry; affects which reads are restricted).
+  3. ECRD alpha: 3.5 for official+image, 20.0 otherwise. Uncalibrated, not comparable across conditions. Calibrate or fix one value.
+  4. `unsupported_penalty` is inert. Implement an unsupported-token detector or delete the parameter.
+  5. Unpinned legacy defaults `pad_token_id=151643` and `mtp_num_speculative_tokens=2`: not in `config.json`; need an owner value.
+
+### R3-1. Real-forward gate fix (`7b19b87` red, `f9445b2` fix)
+- `REAL_MODEL_FORWARD_PASS` is `PASS` only when `is_official_hf_hooked` is true.
+- A partial checkpoint (coverage below full) emits `PARTIAL_COVERAGE_NOT_QUALIFIED`, not PASS.
+- **Disclosed test changes:** earlier partial-load assertions expected PASS. They now expect `PARTIAL_COVERAGE_NOT_QUALIFIED`. A low-coverage fixture (unmapped 9600x64 visual tensor, coverage < 0.15) is added.
+
+### R3-2. MTP: real CPU greedy k=1 speculative reference on the official checkpoint (label `cpu_greedy_k1_reference_not_vllm_mtp`)
+- Implementation (`d6e0b0f`): `RealSevenArmEngine._speculative_mtp_greedy_k1`. The official MTP head proposes one draft per step. One target forward over `[pending, draft]` verifies it from a KV plus Gated-DeltaNet snapshot. Accept iff draft == target greedy argmax. On reject the snapshot is restored and `pending` is re-fed alone. The committed stream is always the target's greedy stream. `Qwen35NeuralModel.forward` gained `logits_to_keep` (scaffold path accepts only 1).
+- Tests (`3f7e9ad` red, `7ed0fba` revised): `tests/test_mtp_speculative_official.py`, 6 tests on the official 0.8B checkpoint.
+  - Natural MTP drafts: token-identical to greedy over 16 tokens.
+  - Every draft rejected: token-identical, accepted = 0, proposed > 0.
+  - Oracle accept/reject mix: token-identical, accepted > 0 and rejected > 0, proposed > 0.
+  - Rejected verify rolled back: KV and DeltaNet tensors bit-identical to the snapshot. The test asserts the verify changed the state first.
+  - Multi-call isolation: second turn matches a fresh greedy reference.
+  - Serving-arm `mtp_acceptance_rate` is `None`.
+- **Disclosed revisions to the red set (`7ed0fba`):** the original prompt was `range(100,140)`, random token ids with 0 natural accepts. It is now a real text prompt via the official tokenizer. The forced accept/reject test relied on natural MTP accepts, which is data-dependent, so it now uses oracle hooks. Both changes are disclosed in that commit message.
+- **Measured (CPU, text prompt, not a benchmark):** natural MTP drafts: 3/12 accepted over 16 tokens; 8/23 accepted over 32 tokens. Token output equals greedy. These are correctness-path counts, not speed.
+- **Acceptance is now `None` when unverified** (`d6e0b0f`): `mtp_acc_rate = 0.0` in `execute_request` is replaced by `None`. Literal `== 0.0` assertions in `tests/test_real_engine.py` (2) and `tests/test_mtp_da_upstream_contracts.py` (1) are changed to `is None` (disclosed). The scaffold `test_p7_mtp_reference_path_is_token_identical_to_base` is narrowed: it checks only that the serving arm commits target tokens.
+- **Not done:** the serving-style `mtp` arm (`execute_request`) does not use the verifier; its acceptance is `None` and its gate remains `GATED_NATIVE_MTP_VERIFIER_REQUIRED`. Native vLLM MTP is not verified and is not claimed.
+- **MTP layer position note:** the draft layer attends only to its own token (no persistent MTP KV history), so RoPE position has no effect on the draft. In a diagnostic with teacher forcing, match counts were identical under three position conventions (9/23 each). The position convention is therefore not the binding constraint here.
+
 ## Round 2 corrections (lead audit wF:p9)
 
 ### 1. H2O budget collapse: CRITICAL, fixed
@@ -58,7 +98,7 @@ vLLM launch helper with no arm logic. All runs are CPU, `PYTHONPATH=src`, using 
 ## Qualification boundaries (open)
 - **DA:** decode-only, scripted, not the model-emitted `<da:focus>` protocol. Restricts nothing on short official decodes (see 4). Prefill is unmasked by decision.
 - **H2O on VLM prompts:** protected visual tokens dominate the prompt, so the budget barely evicts. Bytes freed are per-step tensor deltas, not VRAM savings.
-- **MTP:** proposal diagnostic only. No drafts committed. Acceptance 0.0 by design. Native verifier gated. The MTP layer attends only to its own position.
+- **MTP:** serving arm proposes only; acceptance is `None` (unverified). The CPU reference (`cpu_greedy_k1_reference_not_vllm_mtp`) measures verifier-derived acceptance on the official checkpoint but is not vLLM MTP and makes no speed claim. Native vLLM verifier still gated. The MTP layer attends only to its own token, so position ids do not affect the draft.
 - **ECRD:** alpha is condition-dependent and uncalibrated (see 3). `unsupported_penalty` is inert.
 - **Partial scaffold loader:** `mtp.fc` is mapped into `mtp_proj` (approximate semantics). Scaffold only.
 - **Unverified:** whether same-`request_id` concurrent requests collide on the H2O tracker (`reset=True`). Not exercised.
