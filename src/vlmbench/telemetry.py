@@ -18,6 +18,22 @@ from time import monotonic
 GPU_QUERY = ["nvidia-smi", "--query-gpu=index,uuid,memory.used,utilization.gpu",
              "--format=csv,noheader,nounits"]
 
+# R4-A (review 1i): CUDA's default device order is FASTEST_FIRST, while nvidia-smi lists
+# devices in PCI bus order. An integer in CUDA_VISIBLE_DEVICES names the same GPU in both only
+# when CUDA_DEVICE_ORDER=PCI_BUS_ID. UUIDs name the device in any order.
+REQUIRED_DEVICE_ORDER = "PCI_BUS_ID"
+
+
+def ensure_pci_bus_order(env: dict | None = None) -> str:
+    """Default CUDA_DEVICE_ORDER to PCI_BUS_ID for a child process; an explicit value is kept.
+
+    Call before the first CUDA use in this process or before spawning children: CUDA reads the
+    variable at context creation.
+    """
+    target = os.environ if env is None else env
+    target.setdefault("CUDA_DEVICE_ORDER", REQUIRED_DEVICE_ORDER)
+    return target["CUDA_DEVICE_ORDER"]
+
 
 class VisibilityError(ValueError):
     """No device on the host matches CUDA_VISIBLE_DEVICES; a sample would be meaningless."""
@@ -60,6 +76,10 @@ def _token_matches(token: str, row: dict) -> bool:
     return _strip_gpu_prefix(token) == _strip_gpu_prefix(row["uuid"])
 
 
+def has_index_tokens(tokens: list[str] | None) -> bool:
+    return bool(tokens) and any(token.isdigit() for token in tokens)
+
+
 def select_visible_rows(rows: list[dict], tokens: list[str] | None) -> list[dict]:
     if tokens is None:
         return rows
@@ -86,6 +106,11 @@ class GPUSampler:
         # Visibility is read once, when the sampler is created, so a run cannot change it midway.
         self.cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
         self.visible_tokens = parse_cuda_visible_devices(self.cuda_visible_devices)
+        self.cuda_device_order = os.environ.get("CUDA_DEVICE_ORDER")
+        # Index tokens are trusted only when CUDA and nvidia-smi share the PCI_BUS_ID order.
+        self.index_unverified = (has_index_tokens(self.visible_tokens)
+                                 and self.cuda_device_order != REQUIRED_DEVICE_ORDER)
+        self.ordering_unverified = 0
         self.device_indices_seen: set[str] = set()
         # Visible failure counters: a silent drop would make a broken sampler look like
         # NOT_MEASURED with no explanation.
@@ -101,6 +126,11 @@ class GPUSampler:
                                    text=True, timeout=4, check=True)
             except (OSError, subprocess.SubprocessError):
                 self.query_failures += 1
+                self.stop_event.wait(self.interval_s)
+                continue
+            if self.index_unverified:
+                # Refuse to claim a filtered scope: the index may name a different GPU.
+                self.ordering_unverified += 1
                 self.stop_event.wait(self.interval_s)
                 continue
             try:
@@ -150,11 +180,20 @@ class GPUSampler:
 
     def report(self):
         visible = self.visible_tokens is not None
+        if not has_index_tokens(self.visible_tokens):
+            index_ordering = "NOT_APPLICABLE"
+        elif self.index_unverified:
+            index_ordering = "UNVERIFIED"
+        else:
+            index_ordering = REQUIRED_DEVICE_ORDER
         return {
             "peak_total_gpu_used_mib": max((x["used_mib"] for x in self.samples), default=None),
             "samples": len(self.samples), "sample_period_s": self.interval_s,
             "parse_failures": self.parse_failures, "query_failures": self.query_failures,
             "visibility_mismatch": self.visibility_mismatch,
+            "ordering_unverified": self.ordering_unverified,
+            "cuda_device_order": self.cuda_device_order,
+            "index_ordering": index_ordering,
             "gpu_count_max": self.gpu_count_max,
             "device_count": self.gpu_count_max,
             "device_indices": sorted(self.device_indices_seen, key=int),

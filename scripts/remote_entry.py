@@ -41,6 +41,7 @@ def main():
         raise RuntimeError("Drive unmounted: operator must run colab drivemount")
     os.environ["VLMBENCH_SOURCE_SHA"]=job["source_sha"]
     env=dict(os.environ)
+    env.setdefault("CUDA_DEVICE_ORDER","PCI_BUS_ID")  # R4-A: match nvidia-smi PCI order
     env["PYTHONPATH"]=str(checkout/"src")+os.pathsep+env.get("PYTHONPATH","")
     cmd=[sys.executable,"-m","vlmbench.cli","run-job","--config",str(camp),
          "--model",job["model"],"--mode",job["mode"],

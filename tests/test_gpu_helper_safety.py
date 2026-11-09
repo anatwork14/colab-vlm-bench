@@ -50,3 +50,13 @@ def test_remote_entry_verifies_bundle_digest_before_extracting():
     assert 'job["bundle_sha256"]' in text or "job.get(\"bundle_sha256\")" in text
     assert "hashlib.sha256" in text
     assert text.index("hashlib.sha256") < text.index("extractall")
+
+
+def test_gpu_launch_points_default_cuda_device_order_to_pci_bus_id():
+    # R4-A (review 1i): integer CUDA_VISIBLE_DEVICES matches nvidia-smi only under PCI_BUS_ID.
+    # This is a source check: it does not start a GPU process.
+    remote = REMOTE_ENTRY.read_text(encoding="utf8")
+    assert 'env.setdefault("CUDA_DEVICE_ORDER","PCI_BUS_ID")' in remote.replace(" ", "")
+    cli = (ROOT / "src/vlmbench/cli.py").read_text(encoding="utf8")
+    run_job_body = cli.split("def run_job(args) -> int:", 1)[1].split("\ndef ", 1)[0]
+    assert "ensure_pci_bus_order()" in run_job_body

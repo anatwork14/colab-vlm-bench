@@ -21,7 +21,7 @@ Metrics are divided into quality, evidence-grounded hallucination, end-to-end se
 
 **E2E comparability (review F-02, R3-F).** E2E now includes the client CCU-slot wait, so it is **not comparable** with receipts written before that change. Those receipts carry no `client_queue_wait_p50_ms` / `client_queue_wait_p95_ms` fields. Detection: `vlmbench.analysis.e2e_definition(receipt)` returns `INCLUDES_CLIENT_QUEUE_WAIT` or `LEGACY_NO_QUEUE_FIELD`. Rules:
 - `report` withholds the E2E value of a legacy receipt (`e2e_p95_status = NOT_COMPARABLE_LEGACY_DEFINITION`) and sets `e2e_comparability = MIXED_NOT_COMPARABLE` when a campaign mixes definitions.
-- `paired_speedups` does not pool a Base/MTP pair whose two receipts have different definitions. Those pairs are counted in `excluded_mixed_e2e_definition`.
+- `paired_speedups` computes the throughput speedup from `output_tokens_per_s` only, so it does not depend on E2E. A Base/MTP pair whose receipts have different E2E definitions is still pooled. Such pairs are counted in `mixed_e2e_definition_pairs` and shown in the report. No E2E-based comparison exists in this module.
 - Throughput and TTFT are not affected by this change. Only E2E is.
 | Throughput | committed *successful user-facing* output tokens / wall clock | verified completion_tokens | serving |
 | Requests/s | successful requests / complete measured-cell wall clock | per request PASS | serving |

@@ -60,15 +60,19 @@ def test_report_marks_legacy_e2e_not_comparable_and_keeps_current_value(tmp_path
     assert "111" not in text
 
 
-def test_paired_speedups_do_not_pool_base_and_mtp_with_different_e2e_definitions():
+def test_throughput_pairs_are_not_dropped_for_an_e2e_definition_mismatch():
+    # R4-B (review 1k): the speedup is output tokens / wall time and does not use E2E.
+    # A definition mismatch therefore does not drop the pair. It is counted and reported.
     records = [
-        {"cell": _cell("base"), **_receipt(_cell("base"), _metrics(1, current=False), "S")},
-        {"cell": _cell("mtp"), **_receipt(_cell("mtp"), _metrics(1, current=True), "S")},
+        {"cell": _cell("base"), **_receipt(_cell("base"), _metrics(1, current=False, tps=100.0), "S")},
+        {"cell": _cell("mtp"), **_receipt(_cell("mtp"), _metrics(1, current=True, tps=150.0), "S")},
     ]
     (cohort,) = paired_speedups(records)
-    assert cohort["paired_repetitions"] == 0
-    assert cohort["excluded_mixed_e2e_definition"] == 1
-    assert cohort["throughput_speedup_median"] is None
+    assert cohort["paired_repetitions"] == 1
+    assert cohort["excluded_repetitions"] == 0
+    assert cohort["mixed_e2e_definition_pairs"] == 1
+    assert round(cohort["throughput_speedup_median"], 6) == 1.5
+    assert cohort["per_rep"][0]["e2e_definitions"] == [E2E_LEGACY, E2E_CURRENT]
 
 
 def test_paired_speedups_pool_repetitions_with_the_same_definition():
@@ -79,5 +83,29 @@ def test_paired_speedups_pool_repetitions_with_the_same_definition():
             records.append({"cell": c, **_receipt(c, _metrics(1, current=True, tps=tps), "S")})
     (cohort,) = paired_speedups(records)
     assert cohort["paired_repetitions"] == 3
-    assert cohort["excluded_mixed_e2e_definition"] == 0
+    assert cohort["mixed_e2e_definition_pairs"] == 0
     assert round(cohort["throughput_speedup_median"], 6) == 1.5
+
+
+def test_report_shows_mixed_definition_pairs_and_keeps_throughput_speedup(tmp_path):
+    # R4-B: the matched table counts the mixed-definition pair and still reports its speedup.
+    config = load_config(CONFIG)
+    cells = list(planned_cells(config))
+    base = next(c for c in cells if c["mode"] == "base")
+    mtp = next(c for c in cells if c["mode"] == "mtp" and
+               {k: v for k, v in c.items() if k != "mode"} ==
+               {k: v for k, v in base.items() if k != "mode"})
+    root = tmp_path / "campaign"
+    atomic_json(root / "cells" / f"{cell_id(base)}.json",
+                {"cell": base, "status": "PASS_MEASURED", "sample_id_sha256": "S",
+                 "metrics": _metrics(111.0, current=False, tps=100.0)})
+    atomic_json(root / "cells" / f"{cell_id(mtp)}.json",
+                {"cell": mtp, "status": "PASS_MEASURED", "sample_id_sha256": "S",
+                 "metrics": _metrics(222.0, current=True, tps=150.0)})
+    summary = report.aggregate(root, config)
+    (pair,) = [x for x in summary["paired_comparisons"] if x["paired_repetitions"] == 1]
+    assert pair["mixed_e2e_definition_pairs"] == 1
+    assert round(pair["throughput_speedup_median"], 6) == 1.5
+    text = report.render_markdown(summary)
+    assert "Mixed-E2E-definition pairs" in text
+    assert "pairs with different E2E definitions are included" in text

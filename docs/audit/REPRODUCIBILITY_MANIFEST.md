@@ -151,3 +151,28 @@ A run is reproducible only if these exist under the run root and on Drive:
 - No dataset counts, checksums, or licence status are verified against the publisher.
 - No GPU behaviour, throughput, latency, memory, or MTP correctness is measured.
 - No team-level scientific approval is claimed. Independent review is still required for the metric-definition changes (ledger §7).
+
+## 9. Offline Colab / agent-CLI smoke (R4-D)
+
+Run at HEAD `da4b6ec` with a clean tree before and after. CPU only, no GPU, no network call. Python `colab-vlm-bench/.venv` (3.11.16), `PYTHONPATH=src`, `CUDA_VISIBLE_DEVICES` empty. Raw outputs are in the session scratchpad (`r4d_*.txt`, `r4d_preflight.json`), not in the repo.
+
+| Command (config `configs/a100_qwen_priority_pilot.json`) | Exit | Output summary |
+|---|---|---|
+| `python -m vlmbench.cli plan --config …` | 0 | `status` ENGINEERING_PILOT_NOT_RUN; `dry_run` true; 2 models in scope (`qwen35_08b`, `qwen35_4b`) of 5 registered; `cell_count` 48; `quality_jobs` 8; `measured_requests` 2816; `warmup_requests` 656; `nominal_output_tokens` 720896; `config_sha256` 33d41cb1…61d6 |
+| `python -m vlmbench.cli validate --config …` | 0 | Same scope summary; `dry_run` true |
+| `python -m vlmbench.cli run-job --config … --model qwen35_08b --mode base --dataset memlens` (no approval) | 1 | `PermissionError: GPU execution requires owner_approved_compute=True (--approve-paid)` |
+| `python -m vlmbench.preflight --checkpoint /nonexistent/ckpt --scratch <scratch> --report <file>` | 2 | `CPU_PREFLIGHT_BLOCKED`; `Missing checkpoint directory: /nonexistent/ckpt`; `memlens` and `mmlong` null |
+
+**Two hashes, two definitions.** The SHA-256 of the file bytes is `e98fd1a78a4948eb0a5c48b3055c410bee9fae8cc1655214f6987b1e09d3c01a`. It matches `docs/audit/PINNED_INPUTS.md`. The `config_sha256` printed by `plan` (`33d41cb1…61d6`) is the canonical-JSON fingerprint from `config.fingerprint`. Receipts use the fingerprint, so the two are not interchangeable.
+
+**What this proves**
+
+- The pilot plan reconciles with the ledger's C4 totals: 48 cells, 2,816 measured requests, 656 warmups and 720,896 nominal output tokens.
+- A paid `run-job` is refused on this host without `--approve-paid`.
+- Preflight blocks on a missing checkpoint and writes a `CPU_PREFLIGHT_BLOCKED` report.
+
+**What this does not prove**
+
+- No checkpoint or dataset was present. Preflight stopped at the first check, so the model-load, dataset-presence, vLLM, GPU and telemetry checks never ran.
+- `validate` reports `dry_run: true` and nothing more. It does not establish that revisions are pinned. §6 and `PINNED_INPUTS.md` still show `qwen35_08b` and `qwen35_4b` as UNPINNED, and both dataset revisions as BLOCKED.
+- No GPU, vLLM server, Colab session or `colab_agent.py` call was made. No measurement exists from this smoke.
