@@ -260,7 +260,7 @@ def test_ablation_no_da_removes_only_the_da_signal_and_does_not_enable_da_maskin
     no_da = _engine("starlight_s1_no_da", tokenizer=tok, stop_at_eos=False, h2o_min_budget=16,
                     h2o_budget_ratio=0.2).execute_request(
         request_id="abl", prompt_token_ids=prompt, image_present=False, max_new_tokens=4, evidence_pool=pool)
-    assert no_da.telemetry["starlight"]["signals_enabled"] == ["grounding"]
+    assert no_da.telemetry["starlight"]["signals_enabled"] == ["grounding", "structural"]
     assert no_da.telemetry["starlight"]["protected_count_by_source"]["da"] == 0
     assert no_da.telemetry["starlight"]["conflicts_by_source"]["da"] == 0
     assert full.telemetry["starlight"]["protected_count_by_source"]["da"] > 0
@@ -273,7 +273,7 @@ def test_starlight_arms_report_cpu_reference_labels_and_recurrent_exemption():
         request_id="labels", prompt_token_ids=list(range(100, 120)), image_present=False, max_new_tokens=2)
     s = result.telemetry["starlight"]
     assert s["measurement_label"] == "cpu_pytorch_reference_not_vllm"
-    assert s["method_variant"] == "starlight_stage1::da+grounding"
+    assert s["method_variant"] == "starlight_stage1::da+grounding+structural"
     assert s["method_variant_is_upstream_h2o"] is False
     assert s["recurrent_layers_exempt"] == [0, 1, 2, 4, 5, 6]
     assert s["recurrent_exemption_label"] == "RECURRENT_STATE_NOT_TOKEN_ADDRESSABLE_KV"

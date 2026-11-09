@@ -110,7 +110,7 @@ def test_I1_I2_eligibility_formula_and_protection_recomputed_from_records():
     checked = 0
     for rec in _records(result):
         for e in rec["entries"]:
-            protected = e["da_protected"] or e["grounding_protected"]
+            protected = e["da_protected"] or e["grounding_protected"] or e["structural_protected"]
             eligible = e["h2o_candidate"] and not protected  # I-1 recomputed from the record
             assert (e["decision"] == "EVICT") == eligible, e
             assert not (e["decision"] == "EVICT" and protected), e  # I-2
@@ -208,7 +208,8 @@ def test_HC13_structural_vision_tokens_are_measured_and_policy_marked_unratified
     result = _run("starlight_s1", pool=_pool("oracle_run", ["the"]))
     s = result.telemetry["starlight"]
     assert isinstance(s["structural_tokens_evicted"], int)
-    assert s["structural_policy"] == "NOT_RATIFIED_A4_POLICY_DEPENDENT"
+    assert s["structural_policy"] == "PROTECTED_LEAD_DECISION_Q2"
+    assert s["structural_tokens_evicted"] == 0
 
 
 def test_HC14_cache_length_counter_matches_retained_count_every_step():
