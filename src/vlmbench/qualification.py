@@ -246,12 +246,21 @@ def qualify_amber_assets(
                     item = dict(raw_item)
                     ann = ann_by_id.get(str(item.get("id")))
                     if ann:
-                        if "label" not in item and "label" in ann:
-                            item["label"] = ann["label"]
-                        if "type" not in item and "type" in ann:
-                            item["type"] = ann["type"]
-                        if "objects" not in item and "objects" in ann:
-                            item["objects"] = ann["objects"]
+                        for k, v in ann.items():
+                            if k not in item:
+                                item[k] = v
+                        if "task" not in item:
+                            ann_type = str(ann.get("type", "")).lower()
+                            if ann_type == "generative":
+                                item["task"] = "generative"
+                            elif ann_type.startswith("discriminative"):
+                                item["task"] = "discriminative"
+                        if "objects" not in item:
+                            item["objects"] = ann.get("truth") or ann.get("objects")
+                        if "label" not in item and "truth" in ann:
+                            truth_val = ann["truth"]
+                            if isinstance(truth_val, str):
+                                item["label"] = truth_val.strip().capitalize()
 
                     img_name = item["image"]
                     # Locate image member in zip

@@ -223,6 +223,14 @@ def normalize_amber(
         # Discriminative-specific strict validation
         if item_task == "discriminative":
             sub_type = item.get("type")
+            if sub_type and isinstance(sub_type, str):
+                st_lower = sub_type.lower().strip()
+                if "attribute" in st_lower:
+                    sub_type = "attribute"
+                elif "relation" in st_lower:
+                    sub_type = "relation"
+                elif "existence" in st_lower:
+                    sub_type = "existence"
             if not sub_type or not isinstance(sub_type, str) or sub_type.lower() not in DISCRIMINATIVE_DIMENSIONS:
                 raise ValueError(
                     f"AMBER discriminative item {source_id} missing or invalid required 'type' "
