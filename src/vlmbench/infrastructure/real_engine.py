@@ -2363,6 +2363,9 @@ class RealSevenArmEngine:
                 "recurrent_exemption_label": "RECURRENT_STATE_NOT_TOKEN_ADDRESSABLE_KV",
                 "steps": summary["steps"],
                 "status_counts": summary["status_counts"],
+                # ITER2 D4 S-3: an INFEASIBLE step keeps the physical KV above budget (no eviction).
+                "kv_budget_violated": summary["kv_budget_violated_layers"] > 0,
+                "kv_budget_violated_layers": summary["kv_budget_violated_layers"],
                 "infeasible_steps": summary["status_counts"].get(STATUS_INFEASIBLE, 0),
                 "evicted_total": summary["evicted_total"],
                 "retained_total": summary["retained_total"],

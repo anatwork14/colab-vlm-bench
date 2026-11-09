@@ -34,6 +34,7 @@ STATUS_INFEASIBLE = "INFEASIBLE_PROTECTED_EXCEEDS_BUDGET"
 DECISION_EVICT = "EVICT"
 DECISION_RETAIN_PROTECTED_VETOED = "RETAIN_PROTECTED_VETOED_H2O_CANDIDATE"
 DECISION_RETAIN_PROTECTED = "RETAIN_PROTECTED"
+DECISION_RETAIN_INFEASIBLE = "RETAIN_INFEASIBLE_NO_EVICTION"
 DECISION_RETAIN_H2O_KEPT = "RETAIN_H2O_KEPT"
 
 SIGNAL_SOURCES: tuple[str, ...] = ("da", "grounding", "structural")
@@ -45,6 +46,7 @@ REASON_VETOED_GROUNDING = "H2O_CANDIDATE_VETOED_BY_GROUNDING"
 REASON_VETOED_STRUCTURAL = "H2O_CANDIDATE_VETOED_BY_STRUCTURAL"
 REASON_PROTECTED = "PROTECTED_NOT_H2O_CANDIDATE"
 REASON_KEPT = "H2O_KEPT"
+REASON_INFEASIBLE_NO_EVICTION = "INFEASIBLE_NO_EVICTION"
 REASON_CODES: tuple[str, ...] = (
     REASON_EVICT, REASON_VETOED_DA, REASON_VETOED_GROUNDING, REASON_VETOED_STRUCTURAL,
     REASON_PROTECTED, REASON_KEPT,
@@ -88,6 +90,11 @@ class StarlightLayerPlan:
     @property
     def retained_count(self) -> int:
         return len(self.retained)
+
+    @property
+    def kv_budget_violated(self) -> bool:
+        """True when the step is INFEASIBLE and the physical KV retains more than the budget."""
+        return self.status == STATUS_INFEASIBLE and len(self.retained) > self.budget
 
     @property
     def conflicts_resolved_by_protection(self) -> int:
@@ -204,11 +211,14 @@ def plan_starlight_layer(
             )
 
     eligible = candidates - protected
-    retained_set = set(range(length)) - eligible
-    if status == STATUS_OK and len(retained_set) > budget:
+    if status == STATUS_OK and length - len(eligible) > budget:
         # Budget unmet after evicting every eligible candidate (lead decision Q3): explicit status.
         status = STATUS_INFEASIBLE
         infeasible_reason = INFEASIBLE_UNMET_AFTER_ELIGIBLE
+    if status == STATUS_INFEASIBLE:
+        # ITER2 D4 S-3 (lead ruling): an INFEASIBLE step evicts NOTHING; every entry is retained.
+        eligible = set()
+    retained_set = set(range(length)) - eligible
 
     vetoed = candidates & protected
     conflicts = {src: 0 for src in SIGNAL_SOURCES}
@@ -232,6 +242,11 @@ def plan_starlight_layer(
             decision = DECISION_RETAIN_PROTECTED
             reason = f"protected by {', '.join(fired)}; not an h2o candidate"
             code = REASON_PROTECTED
+        elif is_cand:
+            # Unprotected H2O candidate that would have been evicted, but the step is INFEASIBLE.
+            decision = DECISION_RETAIN_INFEASIBLE
+            reason = "h2o candidate retained: step INFEASIBLE, no eviction this step"
+            code = REASON_INFEASIBLE_NO_EVICTION
         else:
             decision = DECISION_RETAIN_H2O_KEPT
             reason = "not an h2o candidate; retained"
@@ -273,7 +288,7 @@ def summarize_plans(plans: Sequence[StarlightLayerPlan]) -> dict[str, Any]:
     conflicts: Counter[str] = Counter()
     protected: Counter[str] = Counter()
     statuses: Counter[str] = Counter()
-    vetoed = evicted = retained = protected_evicted = evicted_not_candidate = 0
+    vetoed = evicted = retained = protected_evicted = evicted_not_candidate = kv_violated = 0
     max_retained = 0
     for p in plans:
         vetoed += p.h2o_candidates_vetoed
@@ -281,6 +296,7 @@ def summarize_plans(plans: Sequence[StarlightLayerPlan]) -> dict[str, Any]:
         retained += len(p.retained)
         max_retained = max(max_retained, len(p.retained))
         statuses[p.status] += 1
+        kv_violated += int(p.kv_budget_violated)
         conflicts.update(p.conflicts_by_source)
         protected.update(p.protected_count_by_source)
         for d in p.decisions:
@@ -306,6 +322,7 @@ def summarize_plans(plans: Sequence[StarlightLayerPlan]) -> dict[str, Any]:
         "max_retained_per_layer": max_retained,
         "protected_evicted": protected_evicted,
         "evicted_not_candidate": evicted_not_candidate,
+        "kv_budget_violated_layers": kv_violated,
     }
 
 
@@ -324,11 +341,13 @@ def combine_summaries(summaries: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "max_retained_per_layer": 0,
         "protected_evicted": 0,
         "evicted_not_candidate": 0,
+        "kv_budget_violated_layers": 0,
     }
     for s in summaries:
         total["steps"] += 1
         for key in ("h2o_candidates_vetoed", "conflicts_resolved_by_protection", "evicted_total",
-                    "retained_total", "protected_evicted", "evicted_not_candidate"):
+                    "retained_total", "protected_evicted", "evicted_not_candidate",
+                    "kv_budget_violated_layers"):
             total[key] += int(s[key])
         total["max_retained_per_layer"] = max(total["max_retained_per_layer"], int(s["max_retained_per_layer"]))
         for src in SIGNAL_SOURCES:

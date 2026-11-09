@@ -86,9 +86,10 @@ def test_protection_exceeding_budget_is_infeasible_and_never_evicts_protected():
     assert plan.status == STATUS_INFEASIBLE
     assert set(protected) <= set(plan.retained)
     assert not (set(protected) & set(plan.evicted))
-    assert plan.retained == (0, 1, 2, 3, 4)
+    assert plan.retained == tuple(range(10))  # ITER2 D4 S-3: INFEASIBLE evicts nothing this step
     assert len(plan.retained) > plan.budget  # overflow is reported, not hidden
-    assert plan.evicted == (5, 6, 7, 8, 9)
+    assert plan.evicted == ()
+    assert plan.kv_budget_violated is True
 
 
 def test_infeasible_with_all_entries_protected_has_no_eligible_candidates():
@@ -227,8 +228,8 @@ def test_candidates_leaving_budget_unmet_return_explicit_infeasible_status_not_a
     plan = _plan(length=10, budget=5, candidates=[0, 1])
     assert plan.status == STATUS_INFEASIBLE
     assert plan.infeasible_reason == "budget_unmet_after_eligible_eviction"
-    assert plan.evicted == (0, 1)
-    assert plan.retained == tuple(range(2, 10))
+    assert plan.evicted == ()  # ITER2 D4 S-3: an INFEASIBLE step evicts nothing (was (0, 1))
+    assert plan.retained == tuple(range(10))
 
 
 def test_no_candidates_with_budget_unmet_is_infeasible_and_retains_everything():
