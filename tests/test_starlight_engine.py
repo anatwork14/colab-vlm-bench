@@ -26,7 +26,9 @@ from vlmbench.infrastructure.starlight import (
 )
 
 SEVEN_ARMS = frozenset(("base", "h2o_base", "da_base", "ecrd_base", "mtp", "h2o_mtp", "da_mtp"))
-STARLIGHT_ARMS = frozenset(("starlight_s1", "starlight_s1_no_da", "starlight_s1_no_grounding"))
+STARLIGHT_ARMS = frozenset((
+    "starlight_s1", "starlight_s1_no_da", "starlight_s1_no_grounding", "starlight_s1_mtp",
+))  # Stage 2(b): + starlight_s1_mtp
 SHA = hashlib.sha256(b"no-image").hexdigest()
 
 
@@ -84,7 +86,7 @@ def _step(engine, tracker, length, budget, da_spans=(), grounding=None, enabled=
 
 # --- arm registry -------------------------------------------------------------------------
 
-def test_supported_arms_adds_three_starlight_arms_and_keeps_the_seven():
+def test_supported_arms_adds_four_starlight_arms_and_keeps_the_seven():
     assert RealSevenArmEngine.SUPPORTED_ARMS == SEVEN_ARMS | STARLIGHT_ARMS
 
 
@@ -123,14 +125,20 @@ def test_grounding_h2o_conflict_is_vetoed_not_evicted():
     assert plan.retained == (0, 1, 2, 3, 5, 9)
 
 
-def test_protection_exceeding_budget_is_infeasible_and_protected_stay():
+def test_protection_exceeding_budget_is_infeasible_and_nothing_is_evicted():
+    # ITER2 D4 S-3 (auditor HIGH, lead ruling): when INFEASIBLE, evict NOTHING in that step.
     engine = _engine("starlight_s1")
     tracker = _scored_tracker([1] * 10)
     _, _, plans = _step(engine, tracker, length=10, budget=6, da_spans=[("sink_global", 0, 7)])
     plan = plans[0]
     assert plan.status == STATUS_INFEASIBLE
-    assert plan.retained == tuple(range(7))          # protected 7 > budget 6: reported, not hidden
-    assert plan.evicted == (7, 8, 9)                 # only unprotected candidates are evicted
+    assert plan.infeasible_reason == "protected_exceeds_budget"
+    assert plan.evicted == ()                        # was (7, 8, 9) before S-3: now nothing evicted
+    assert plan.retained == tuple(range(10))         # all protected and all other entries retained
+    assert plan.kv_budget_violated is True           # 10 retained > budget 6, reported explicitly
+    unprotected_candidates = [d for d in plan.decisions if d.h2o_candidate and not d.internally_protected]
+    assert unprotected_candidates, "fixture must contain H2O candidates that would have been evicted"
+    assert all(d.reason_code == "INFEASIBLE_NO_EVICTION" for d in unprotected_candidates)
 
 
 def test_within_budget_has_no_candidates_and_no_eviction():
@@ -260,7 +268,7 @@ def test_ablation_no_da_removes_only_the_da_signal_and_does_not_enable_da_maskin
     no_da = _engine("starlight_s1_no_da", tokenizer=tok, stop_at_eos=False, h2o_min_budget=16,
                     h2o_budget_ratio=0.2).execute_request(
         request_id="abl", prompt_token_ids=prompt, image_present=False, max_new_tokens=4, evidence_pool=pool)
-    assert no_da.telemetry["starlight"]["signals_enabled"] == ["grounding"]
+    assert no_da.telemetry["starlight"]["signals_enabled"] == ["grounding", "structural"]
     assert no_da.telemetry["starlight"]["protected_count_by_source"]["da"] == 0
     assert no_da.telemetry["starlight"]["conflicts_by_source"]["da"] == 0
     assert full.telemetry["starlight"]["protected_count_by_source"]["da"] > 0
@@ -273,7 +281,7 @@ def test_starlight_arms_report_cpu_reference_labels_and_recurrent_exemption():
         request_id="labels", prompt_token_ids=list(range(100, 120)), image_present=False, max_new_tokens=2)
     s = result.telemetry["starlight"]
     assert s["measurement_label"] == "cpu_pytorch_reference_not_vllm"
-    assert s["method_variant"] == "starlight_stage1::da+grounding"
+    assert s["method_variant"] == "starlight_stage1::da+grounding+structural"
     assert s["method_variant_is_upstream_h2o"] is False
     assert s["recurrent_layers_exempt"] == [0, 1, 2, 4, 5, 6]
     assert s["recurrent_exemption_label"] == "RECURRENT_STATE_NOT_TOKEN_ADDRESSABLE_KV"
@@ -293,3 +301,63 @@ def test_combine_summaries_adds_steps_and_keeps_invariant_counts():
     assert total["evicted_total"] == 2 * one["evicted_total"]
     assert total["protected_evicted"] == 0 and total["evicted_not_candidate"] == 0
     assert total["status_counts"] == {STATUS_OK: 4}  # 2 steps x 2 full-attention layers
+
+
+# --- ITER2 D4 S-1 (auditor HIGH): candidate set is ablation-independent --------------------
+
+_S1_SCORES = [0, 0, 5, 4, 3, 2, 1, 1, 1, 1]
+_S1_ARMS = {
+    "starlight_s1": ("da", "grounding", "structural"),
+    "starlight_s1_no_da": ("grounding", "structural"),
+    "starlight_s1_no_grounding": ("da", "structural"),
+}
+
+
+def test_s1_candidate_set_is_ablation_independent_and_only_the_veto_differs():
+    plans_by_arm = {}
+    for arm, enabled in _S1_ARMS.items():
+        engine = _engine(arm)
+        tracker = _scored_tracker(_S1_SCORES)
+        _, _, plans = _step(engine, tracker, length=10, budget=6,
+                            da_spans=[("sink_global", 0, 2)], enabled=enabled)
+        plans_by_arm[arm] = plans[0]
+
+    def candidates(plan):
+        return frozenset(d.entry_id for d in plan.decisions if d.h2o_candidate)
+
+    full = plans_by_arm["starlight_s1"]
+    # The candidate set is computed once from the FULL arm's protected count, never per ablation.
+    assert candidates(full) == frozenset({0, 1, 5, 6, 7, 8})
+    for arm, plan in plans_by_arm.items():
+        assert candidates(plan) == candidates(full), arm
+        assert len(plan.retained) <= 6, f"{arm}: retained {len(plan.retained)} exceeds budget"
+
+    # Only the DA veto is removed in the no-DA arm: the released entries are exactly the
+    # DA-protected candidates {0, 1}; nothing else changes.
+    no_da = plans_by_arm["starlight_s1_no_da"]
+    assert set(no_da.evicted) - set(full.evicted) == {0, 1}
+    assert set(full.evicted) - set(no_da.evicted) == set()
+
+    # Ablating grounding (no grounding labels supplied) changes nothing here.
+    no_ground = plans_by_arm["starlight_s1_no_grounding"]
+    assert no_ground.evicted == full.evicted
+    assert no_ground.retained == full.retained
+
+
+# --- ITER2 D4 S-4 (auditor): the H-6 cache-length check must be testable -------------------
+
+def test_s4_cache_length_check_detects_an_injected_mismatch():
+    engine = _engine("starlight_s1")
+    prompt = list(range(100, 140))
+    clean = engine.execute_request("s4_clean", prompt_token_ids=prompt, image_present=False,
+                                   max_new_tokens=6).telemetry["starlight"]
+    assert clean["cache_length_mismatch_steps"] == 0
+
+    # Inject an off-by-one physical length into every decode step. The H-6 check must count it.
+    engine._test_cache_len_offset = 1
+    try:
+        broken = engine.execute_request("s4_injected", prompt_token_ids=prompt, image_present=False,
+                                        max_new_tokens=6).telemetry["starlight"]
+    finally:
+        engine._test_cache_len_offset = 0
+    assert broken["cache_length_mismatch_steps"] > 0, "mutating the H-6 check must fail this test"

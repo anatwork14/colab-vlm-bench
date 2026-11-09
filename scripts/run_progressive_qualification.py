@@ -34,6 +34,7 @@ from transformers.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from vlmbench.infrastructure.parity import logits_parity_passes  # noqa: E402 - sys.path must be extended first
 from vlmbench.infrastructure import (  # noqa: E402 - sys.path must be extended first
     Qwen35ModelConfig,
     RealSevenArmEngine,
@@ -113,7 +114,7 @@ def run_test_a_architecture(model_dir: Path, device: str = "cpu") -> dict[str, A
     assert inv["tensor_coverage_ratio"] == 1.0
     assert inv["parameter_coverage_ratio"] == 1.0
     assert inv["logits_parity"]["verified"] is True
-    assert inv["logits_parity"]["max_abs_logits_diff"] <= 1e-5
+    assert logits_parity_passes(inv["logits_parity"]["max_abs_logits_diff"]), "logits parity exceeds LOGITS_PARITY_TOLERANCE"
     assert inv["logits_parity"]["top1_match"] is True
     engine.close()
 
@@ -527,9 +528,51 @@ def run_test_f_fixed_output_serving(model_dir: Path, device: str = "cpu", target
     return result
 
 
+def token_isolation_check(solo: dict[str, list[int]], concurrent: dict[str, list[int]]) -> dict[str, Any]:
+    """Each concurrent request's greedy tokens must equal the same request's solo tokens.
+
+    Empty solo output is a failure, so the check cannot pass vacuously.
+    """
+    mismatches: list[str] = []
+    if not solo:
+        mismatches.append("no solo outputs")
+    for req_id, solo_tokens in solo.items():
+        if not solo_tokens:
+            mismatches.append(f"{req_id}: empty solo output")
+        if req_id not in concurrent:
+            mismatches.append(f"{req_id}: missing concurrent output")
+        elif list(concurrent[req_id]) != list(solo_tokens):
+            mismatches.append(f"{req_id}: tokens differ")
+    for req_id in concurrent:
+        if req_id not in solo:
+            mismatches.append(f"{req_id}: unexpected concurrent output")
+    return {"pass": not mismatches, "compared": len(solo), "mismatches": mismatches}
+
+
+def citation_leak_violations(
+    citations_by_request: dict[str, list[dict[str, Any]]], expected_evidence: dict[str, set[str]]
+) -> list[str]:
+    """A request must cite something, and may cite only evidence ids it was given."""
+    violations: list[str] = []
+    for req_id, citations in citations_by_request.items():
+        if not citations:
+            violations.append(f"{req_id}: no grounded citations")
+        for citation in citations:
+            for ev_id in citation["evidence_ids"]:
+                if ev_id not in expected_evidence[req_id]:
+                    violations.append(f"{req_id} cited {ev_id}")
+    return violations
+
+
 def run_test_g_ccu_concurrency(model_dir: Path, device: str = "cpu") -> dict[str, Any]:
-    """Test G: Concurrency Isolation Regression (CCU 1, CCU 2, CCU 4)."""
-    print(f"=== [Test G] Concurrency Isolation Regression (CCU 1, 2, 4 on {device}) ===")
+    """Test G: PyTorch-thread citation leak check at CCU 1, 2, 4 (not vLLM serving isolation).
+
+    Per CCU level: each request first runs alone (solo), then all run on threads. Greedy tokens of
+    every concurrent request must equal its solo tokens, and no request may cite another request's
+    evidence. CCU_ISOLATION_PASS stays GATED in every engine result: one request cannot establish
+    multi-request isolation, so this test does not change that gate.
+    """
+    print(f"=== [Test G] PyTorch-thread citation leak check (CCU 1, 2, 4 on {device}) ===")
     t0 = time.perf_counter()
 
     ccu_results: dict[str, Any] = {}
@@ -541,41 +584,55 @@ def run_test_g_ccu_concurrency(model_dir: Path, device: str = "cpu") -> dict[str
         assert engine.is_official_hf_hooked is True
 
         requests = []
+        expected_evidence: dict[str, set[str]] = {}
         for i in range(ccu):
-            pool = EvidencePool(f"req_{ccu}_{i}")
+            req_id = f"req_{ccu}_{i}"
+            pool = EvidencePool(req_id)
             pool.add_evidence(
                 EvidenceItem(f"ev_{i}", "text", f"fact for entity {i}", hashlib.sha256(f"entity_{i}".encode()).hexdigest()),
                 keywords=["target", "region", "apple", "object"],
             )
-            requests.append((f"req_{ccu}_{i}", [100, 101], 4, pool))
+            expected_evidence[req_id] = {f"ev_{i}"}
+            requests.append((req_id, [100, 101], 4, pool))
+
+        solo_outputs = {}
+        for req_id, p_tokens, max_toks, pool in requests:
+            solo_outputs[req_id] = engine.execute_request(req_id, p_tokens, max_toks, pool, False)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=ccu) as executor:
-            futures = [
-                executor.submit(engine.execute_request, req_id, p_tokens, max_toks, pool, False)
+            futures = {
+                req_id: executor.submit(engine.execute_request, req_id, p_tokens, max_toks, pool, False)
                 for req_id, p_tokens, max_toks, pool in requests
-            ]
-            outputs = [f.result() for f in futures]
+            }
+            outputs = {req_id: f.result() for req_id, f in futures.items()}
 
         assert len(outputs) == ccu
-        for idx, out in enumerate(outputs):
+        for req_id, out in outputs.items():
             assert len(out.tokens_generated) == 4
             assert out.gates["REAL_MODEL_FORWARD_PASS"] == "PASS"
             assert out.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS"
             assert out.gates["CCU_ISOLATION_PASS"] == "GATED_MULTIREQUEST_ISOLATION_TEST_REQUIRED"
-            assert len(out.grounded_citations) > 0, f"Request {idx} in CCU {ccu} must produce citations"
-            for cit in out.grounded_citations:
-                for ev_id in cit["evidence_ids"]:
-                    assert ev_id == f"ev_{idx}", f"Isolation breach: {ev_id} appeared in request {idx}"
+
+        token_check = token_isolation_check(
+            {rid: list(o.tokens_generated) for rid, o in solo_outputs.items()},
+            {rid: list(o.tokens_generated) for rid, o in outputs.items()},
+        )
+        leaks = citation_leak_violations(
+            {rid: o.grounded_citations for rid, o in outputs.items()}, expected_evidence
+        )
+        assert token_check["pass"], f"CCU {ccu} concurrent tokens differ from solo: {token_check['mismatches']}"
+        assert not leaks, f"CCU {ccu} citation leak: {leaks}"
 
         engine.close()
         ccu_dt = time.perf_counter() - ccu_t0
         ccu_results[f"CCU_{ccu}"] = {
             "concurrency": ccu,
             "duration_s": round(ccu_dt, 3),
-            "isolation_pass": True,
-            "citations_per_request": [len(o.grounded_citations) for o in outputs],
+            "token_match_vs_solo": token_check["pass"],
+            "citation_leak_check_pass": not leaks,
+            "citations_per_request": [len(outputs[rid].grounded_citations) for rid, _, _, _ in requests],
         }
-        print(f"  CCU {ccu}: Verified zero cross-request contamination in {ccu_dt:.2f}s (Citations: {[len(o.grounded_citations) for o in outputs]})")
+        print(f"  CCU {ccu}: tokens equal solo runs; no cross-request citation ({ccu_dt:.2f}s)")
 
     dt = time.perf_counter() - t0
     result = {
@@ -583,9 +640,8 @@ def run_test_g_ccu_concurrency(model_dir: Path, device: str = "cpu") -> dict[str
         "duration_s": round(dt, 3),
         "levels": ccu_results,
     }
-    print(f"Test G PASSED in {dt:.2f}s (Strict Isolation across CCU 1, 2, 4)")
+    print(f"Test G PASSED in {dt:.2f}s (PyTorch-thread citation leak check at CCU 1, 2, 4)")
     return result
-
 
 EXPECTED_TESTS = (
     "test_a_architecture",
@@ -631,15 +687,30 @@ def _combine(*statuses: str) -> str:
     return "NOT_TESTED"
 
 
-def _engine_gate(test_d: dict[str, Any] | None, name: str) -> str:
-    """The value the engine itself reported, used only if every arm reporting it agrees."""
+MTP_ARMS = ("mtp", "h2o_mtp", "da_mtp")
+
+
+def _engine_gate(test_d: dict[str, Any] | None, name: str, arms: tuple[str, ...] | None = None) -> str:
+    """The value the engine itself reported, used only if every arm in scope reports it and they agree.
+
+    `arms` limits the gate to the arms it describes (None = all arms). A missing arm in scope, or a
+    `NOT_APPLICABLE` value, is NOT_TESTED: NOT_APPLICABLE is not a gate value.
+    """
     status = _test_status(test_d)
     if status != "PASS":
         return status
-    values = {arm["gates"][name] for arm in (test_d or {}).get("arms", {}).values() if name in arm.get("gates", {})}
-    if not values:
+    reported = (test_d or {}).get("arms", {})
+    scope = list(reported) if arms is None else list(arms)
+    if not scope or any(arm not in reported for arm in scope):
         return "NOT_TESTED"
-    return values.pop() if len(values) == 1 else "FAIL"
+    if any(name not in reported[arm].get("gates", {}) for arm in scope):
+        return "NOT_TESTED"
+    values = {reported[arm]["gates"][name] for arm in scope}
+    if "NOT_APPLICABLE" in values:
+        return "NOT_TESTED"
+    if len(values) != 1:
+        return "FAIL"
+    return values.pop()
 
 
 def compute_release_gates(tests: dict[str, dict[str, Any]], device_name: str) -> dict[str, str]:
@@ -650,10 +721,11 @@ def compute_release_gates(tests: dict[str, dict[str, Any]], device_name: str) ->
         "ACTUAL_BACKEND_HOOK_PASS": _engine_gate(d, "ACTUAL_BACKEND_HOOK_PASS"),
         "REAL_MODEL_FORWARD_PASS": _combine(_test_status(a), _test_status(b)),
         "REAL_MULTIMODAL_INFERENCE_PASS": _combine(_test_status(c), _test_status(d)),
-        "SEVEN_ARM_PRETRAINED_PASS": _test_status(d),
-        "MTP_CORRECTNESS_PASS": _engine_gate(d, "MTP_CORRECTNESS_PASS"),
+        # Hook attachment and tensor coverage over the seven arms. Not inference correctness.
+        "SEVEN_ARM_HOOK_COVERAGE_PASS": _test_status(d),
+        "MTP_CORRECTNESS_PASS": _engine_gate(d, "MTP_CORRECTNESS_PASS", arms=MTP_ARMS),
         "MTP_PROPOSAL_DIAGNOSTIC_PASS": _test_status(e),
-        "CCU_REQUEST_ISOLATION_TEST_PASS": _test_status(g),
+        "PYTORCH_THREAD_CITATION_LEAK_CHECK": _test_status(g),
         # This script runs no vLLM scheduler load test and no A100 run.
         "VLLM_SCHEDULER_CONCURRENCY_PASS": "NOT_TESTED",
         "A100_GPU_QUALIFIED": "NOT_TESTED" if "A100" in device_name else "BLOCKED_PENDING_OWNER_PAID_AUTH",

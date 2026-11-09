@@ -1,0 +1,93 @@
+{
+  "schema": "dataset_feasibility/1",
+  "resolved_on": "2026-11-10",
+  "owner_approved": false,
+  "note": "Read-only metadata via public HF API, datasets-server and raw GitHub. No dataset file was downloaded beyond 82 KB (MMLongBench-Doc QA parquet) and two small GitHub code files. Revisions below are resolved, NOT owner-approved, and remain UNPINNED in configs.",
+  "memlens": {
+    "hf_dataset": "xiyuRenBill/MEMLENS",
+    "hf_revision_sha": "afa101a1907cc37db40b50d649547964387b96b7",
+    "hf_last_modified": "2026-06-14T04:32:38Z",
+    "hf_license_card": "cc-by-4.0",
+    "hf_gated": false,
+    "total_repo_bytes": 3885310166,
+    "total_files": 4716,
+    "configs_rows": {"32k": 789, "64k": 789, "128k": 789, "256k": 789},
+    "config_bytes_parquet": {"32k": 52002124, "64k": 100887857, "128k": 195329639, "256k": 387430958},
+    "json_32k_bytes": 98085636,
+    "columns": ["question_id", "question_type", "question", "answer", "question_date", "haystack_dates", "haystack_session_ids", "haystack_sessions", "answer_session_ids"],
+    "row_size_note": "32k row 0 field haystack_sessions is about 132 KB of text; per-row token counts were not measured",
+    "readme_claim_vs_hf": "README:76 says dataset_32k.json is ~104 MB; HF reports 98,085,636 bytes",
+    "github_repo": "xrenaf/MEMLENS",
+    "github_commit": "77f3ab9a52fa2d6a17978e2dffe80438a4ecced2",
+    "github_commit_date": "2026-07-24T08:17:13Z",
+    "github_code_licence": "MIT",
+    "official_scoring": {
+      "stage_llm_answer_extraction": "answer_extraction.py (OpenAI-compatible client; cached extraction)",
+      "stage_llm_judge": "llm_judge.py with judge_prompts/*.py (OpenAI or vLLM judge)",
+      "deterministic_after_llm": "answer_extraction.match_extracted_answer, token F1 (_token_f1)",
+      "status": "BLOCKED_NO_JUDGE for official numbers; deterministic matcher is not an official score on its own"
+    },
+    "eligible_examples_by_protocol": {
+      "32k_items": 789,
+      "per_item_context_fit_verified": false,
+      "status": "candidate count from HF metadata; fit to 32K per item NOT verified offline"
+    },
+    "code_sha256": {
+      "eval.py": "96ff6fd92975d431477330730864a1f726f83a268aaa7745cfd908f2c4d8cb37",
+      "data.py": "a05967d62ed21e0a596c7d73021b0af1c5d056604886516f4fa8b0579bc08995",
+      "answer_extraction.py": "6beecf8ff98538d3d75ef228e22e48932cbcc2293bdf924f0261a48d80a0fe34",
+      "llm_judge.py": "c2f12050cbf2ae55a8a2c8db73fd932c32c20e9d74f552faa518e02e31b6c992",
+      "eval_api.py": "6370a33a4d0ec6f22acb2d93a6e2464a8146760e6650fe220b6f425f3bf3e31b",
+      "README.md": "7095917677f979b48f6238bf9beb9cedc8e616866d4427361e177f5db1c5c277"
+    }
+  },
+  "mmlongbench_doc": {
+    "hf_dataset": "yubo2333/MMLongBench-Doc",
+    "hf_revision_sha": "2ff6aa9237fc777b6627dc57a486e9225ac5fb86",
+    "hf_last_modified": "2025-11-06T05:23:19Z",
+    "hf_license_card": "not declared",
+    "hf_gated": false,
+    "total_repo_bytes": 662230109,
+    "total_files": 138,
+    "documents": {"count": 135, "format": "PDF", "largest_bytes": 45669728, "note": "not downloaded; page counts not verified"},
+    "qa_parquet": {"path": "data/train-00000-of-00001.parquet", "bytes": 82073, "sha256": "bcdac3c96669634c34184814cede4fe57cf7ac0f98dde0e85936394f6a56a02d", "rows": 1091, "columns": ["doc_id", "doc_type", "question", "answer", "evidence_pages", "evidence_sources", "answer_format"]},
+    "qa_counts": {
+      "answerable": 847,
+      "unanswerable_answer_Not_answerable": 244,
+      "unanswerable_share": 0.2237,
+      "unanswerable_share_readme": 0.225,
+      "answer_format_answerable": {"Int": 290, "Str": 250, "Float": 160, "List": 147},
+      "evidence_pages_len": {"0": 246, "1": 485, "gt1": 360},
+      "cross_page_share_of_all": 0.3300,
+      "cross_page_share_readme": 0.330,
+      "unanswerable_with_evidence_pages": 7,
+      "distinct_doc_id": 135
+    },
+    "github_repo": "mayubo2333/MMLongBench-Doc",
+    "github_commit": "d73f0dc0be7e0a2ff6a403d5fe65fcd96461f384",
+    "github_commit_date": "2025-09-28T08:12:21Z",
+    "github_licence": "Apache-2.0",
+    "licence_conflict": "repo README.md (ours, line 138) says noncommercial research use; upstream HF card declares no licence; upstream GitHub says Apache-2.0. Owner decision needed.",
+    "github_samples_json": {"path": "data/samples.json", "items": 1082, "sha256": "4ffadad60b18cd7ede864155f3e8a366fe4deec2189b3d0a25691b7df4b839e8"},
+    "hf_vs_github_question_sets": {"hf_rows": 1091, "github_items": 1082, "hf_only_pairs": 26, "github_only_pairs": 17, "note": "keys are (doc_id, question)"},
+    "official_scoring": {
+      "stage1": "model long-form response (not in this repo's scorer)",
+      "stage2_llm_extraction": "eval/extract_answer.py calling GPT-4o with eval/prompt_for_answer_extraction.md",
+      "stage3_deterministic": "eval/eval_score.py (ported in src/vlmbench/datasets/mmlong_official_scorer.py)",
+      "status": "stage 2 BLOCKED_NO_JUDGE; stage 3 ported and tested"
+    },
+    "eligible_examples_by_protocol": {
+      "candidate_items": 1091,
+      "per_document_page_count_fit_verified": false,
+      "status": "document page counts need the PDFs (662 MB); not verified offline"
+    },
+    "code_sha256": {
+      "eval/eval_score.py": "cafa268358b08521cfc9a805c67d86732d943677e4408c5751f336123d09631f",
+      "eval/extract_answer.py": "fa6a747bd6a8e96fb6884eb7201663268a5df700ad71d85db3bc5e04a157722f",
+      "eval/prompt_for_answer_extraction.md": "96a22c3003c22801f1f19717be45070b1d6b9ce76b42e171e044f63b641de659",
+      "README.md": "658c0c062c0a4bf10e8ff35e52b6446d981f827cd53d18a7670bffb3b28fa421",
+      "run.sh": "5e7b2c40a0eeba808c3680f63b0dc5d9bdee1c7a7029f56b21c7841573c5b3e2",
+      "requirements.txt": "98e959a4d04c8543b3be074237dcce99595a779c36cda092cbc3ab3cf0386d4e"
+    }
+  }
+}

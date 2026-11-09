@@ -60,7 +60,7 @@ def test_da_h2o_conflict_resolved_by_protection_and_audited():
     assert "vetoed" in d0.reason
     assert 0 in plan.retained
     assert plan.h2o_candidates_vetoed == 1
-    assert plan.conflicts_by_source == {"da": 1, "grounding": 0}
+    assert plan.conflicts_by_source == {"da": 1, "grounding": 0, "structural": 0}
 
 
 def test_grounding_h2o_conflict_resolved_by_protection_and_audited():
@@ -68,14 +68,14 @@ def test_grounding_h2o_conflict_resolved_by_protection_and_audited():
     d6 = plan.decisions[6]
     assert d6.decision == DECISION_RETAIN_PROTECTED_VETOED
     assert d6.signals_fired == ("grounding:ev_x",)
-    assert plan.conflicts_by_source == {"da": 0, "grounding": 1}
+    assert plan.conflicts_by_source == {"da": 0, "grounding": 1, "structural": 0}
     assert 6 in plan.retained
 
 
 def test_entry_protected_by_both_sources_is_one_vetoed_entry_two_conflict_events():
     plan = _plan(length=6, budget=5, candidates=[2, 3], da={2: ("focus",)}, grounding={2: ("ev",)})
     assert plan.h2o_candidates_vetoed == 1
-    assert plan.conflicts_by_source == {"da": 1, "grounding": 1}
+    assert plan.conflicts_by_source == {"da": 1, "grounding": 1, "structural": 0}
     assert plan.decisions[2].signals_fired == ("da:focus", "grounding:ev")
     assert plan.evicted == (3,)
 
@@ -86,9 +86,10 @@ def test_protection_exceeding_budget_is_infeasible_and_never_evicts_protected():
     assert plan.status == STATUS_INFEASIBLE
     assert set(protected) <= set(plan.retained)
     assert not (set(protected) & set(plan.evicted))
-    assert plan.retained == (0, 1, 2, 3, 4)
+    assert plan.retained == tuple(range(10))  # ITER2 D4 S-3: INFEASIBLE evicts nothing this step
     assert len(plan.retained) > plan.budget  # overflow is reported, not hidden
-    assert plan.evicted == (5, 6, 7, 8, 9)
+    assert plan.evicted == ()
+    assert plan.kv_budget_violated is True
 
 
 def test_infeasible_with_all_entries_protected_has_no_eligible_candidates():
@@ -117,10 +118,10 @@ def test_random_consistent_plans_never_evict_protected_and_respect_budget():
         assert set(plan.evicted) | set(plan.retained) == set(range(length))
 
 
-def test_candidate_set_that_would_overflow_budget_is_rejected():
-    # 10 entries, budget 5, only 2 candidates: retained would be 8 > 5 with no infeasibility.
-    with pytest.raises(ValueError, match="budget"):
-        _plan(length=10, budget=5, candidates=[0, 1])
+def test_candidate_set_that_would_overflow_budget_is_infeasible_not_silently_accepted():
+    # Replaced by an explicit status (lead decision Q3): see the D4 tests at the end of this file.
+    plan = _plan(length=10, budget=5, candidates=[0, 1])
+    assert plan.status == STATUS_INFEASIBLE
 
 
 def test_candidates_when_within_budget_are_rejected():
@@ -175,7 +176,77 @@ def test_summary_aggregates_auditable_counts():
     s = summarize_plans([p1, p2])
     assert s["h2o_candidates_vetoed"] == 2
     assert s["conflicts_resolved_by_protection"] == 2
-    assert s["protected_count_by_source"] == {"da": 1, "grounding": 1, "union": 2}
+    assert s["protected_count_by_source"] == {"da": 1, "grounding": 1, "structural": 0, "union": 2}
     assert s["status_counts"] == {STATUS_OK: 2}
     assert s["evicted_total"] == len(p1.evicted) + len(p2.evicted)
     assert s["layers"] == [3, 7]
+
+
+# --- D4 (lead decisions Q2, Q3): structural source and explicit unmet-budget status ----------
+
+def test_structural_vision_token_is_protected_vetoed_and_coded():
+    plan = plan_starlight_layer(
+        layer=3, length=8, budget=6, h2o_candidates=[2, 3, 4],
+        signals={"da": {}, "grounding": {}, "structural": {2: ("vision_start",)}},
+        enabled_signals=("da", "grounding", "structural"),
+    )
+    d = plan.decisions[2]
+    assert d.decision == DECISION_RETAIN_PROTECTED_VETOED
+    assert d.signals_fired == ("structural:vision_start",)
+    assert d.reason_code == "H2O_CANDIDATE_VETOED_BY_STRUCTURAL"
+    assert plan.conflicts_by_source["structural"] == 1
+    assert plan.evicted == (3, 4)
+    assert plan.retained == (0, 1, 2, 5, 6, 7)
+
+
+def test_veto_reason_code_follows_source_precedence_da_then_grounding_then_structural():
+    kwargs = dict(layer=3, length=8, budget=5, h2o_candidates=[1, 2, 3, 4, 5, 6])
+    all_three = plan_starlight_layer(
+        **kwargs,
+        signals={"da": {1: ("s",)}, "grounding": {2: ("ev",)}, "structural": {3: ("vision_end",)}},
+        enabled_signals=("da", "grounding", "structural"),
+    )
+    assert all_three.decisions[1].reason_code == "H2O_CANDIDATE_VETOED_BY_DA"
+    assert all_three.decisions[2].reason_code == "H2O_CANDIDATE_VETOED_BY_GROUNDING"
+    assert all_three.decisions[3].reason_code == "H2O_CANDIDATE_VETOED_BY_STRUCTURAL"
+    assert all_three.decisions[4].reason_code == "H2O_CANDIDATE_UNPROTECTED"
+
+
+def test_structural_counts_appear_in_protection_summary_and_are_not_evicted():
+    plan = plan_starlight_layer(
+        layer=3, length=8, budget=6, h2o_candidates=[2, 3, 4],
+        signals={"structural": {2: ("vision_start",)}}, enabled_signals=("da", "grounding", "structural"),
+    )
+    s = summarize_plans([plan])
+    assert s["protected_count_by_source"] == {"da": 0, "grounding": 0, "structural": 1, "union": 1}
+    assert s["conflicts_by_source"]["structural"] == 1
+    assert s["protected_evicted"] == 0
+
+
+def test_candidates_leaving_budget_unmet_return_explicit_infeasible_status_not_an_error():
+    # 10 entries, budget 5, only 2 candidates: after eligible eviction 8 entries remain (> 5).
+    plan = _plan(length=10, budget=5, candidates=[0, 1])
+    assert plan.status == STATUS_INFEASIBLE
+    assert plan.infeasible_reason == "budget_unmet_after_eligible_eviction"
+    assert plan.evicted == ()  # ITER2 D4 S-3: an INFEASIBLE step evicts nothing (was (0, 1))
+    assert plan.retained == tuple(range(10))
+
+
+def test_no_candidates_with_budget_unmet_is_infeasible_and_retains_everything():
+    plan = _plan(length=10, budget=5, candidates=[])
+    assert plan.status == STATUS_INFEASIBLE
+    assert plan.infeasible_reason == "budget_unmet_after_eligible_eviction"
+    assert plan.evicted == ()
+    assert plan.retained == tuple(range(10))
+
+
+def test_protected_over_budget_reports_its_own_infeasible_reason():
+    plan = _plan(length=10, budget=3, candidates=list(range(10)), da={0: ("s",), 1: ("s",), 2: ("s",), 3: ("s",)})
+    assert plan.status == STATUS_INFEASIBLE
+    assert plan.infeasible_reason == "protected_exceeds_budget"
+
+
+def test_feasible_plan_has_empty_infeasible_reason():
+    plan = _plan(length=8, budget=6, candidates=[1, 2, 3])
+    assert plan.status == STATUS_OK
+    assert plan.infeasible_reason == ""

@@ -86,3 +86,27 @@ Full matrix in design doc section 12. Summary:
 - No push, no merge, no paid GPU, no vLLM. Nothing qualified as GPU or vLLM evidence.
 - No baseline comparison at 7d209f5 (see above).
 - Interleaved multi-request decoding (HC-9 strict form) and logit recomputation (HC-14) not implemented.
+
+## ITER2 D4 + Stage 2 update (wF:p7)
+
+**Status:** HEAD `c624774`; full suite at this HEAD: **620 passed, 10 skipped, 0 failed**
+(`nice -n 5`, `timeout 1500`, 534 s). The 10 skips are the pre-existing legacy-notebook tests.
+This docs commit changes no code.
+
+**Commits since the lead integration `5b9e023`** (red before green, one item each):
+- D4 Q2/Q3/Q4: `987188b`, `b612677` (red); `c8c31ad`, `c839270` (green).
+- Stage 2(a): `402cab1` (red); `b953061` (green).
+- Stage 1 auditor fixes: S-1 `c955da5`/`73a5a2c`; S-3 `b115a8c`/`133d5c5`; S-4 `322c970`/`b28b69e`;
+  S-5/S-6/S-7 `59c3c5a` (regression, mutation-checked); I-8 `71caa8e`; S-2 `cf908fb`/`86a989d`;
+  S-8 `4d71147`/`d0d2172`.
+- Stage 2(b): `eb27d2d` (red); `95d45ca` (green).
+- Stage 2(c): `75786c5` (red); `c624774` (green).
+
+**Limits, in short** (full text in `STARLIGHT_STAGE1_DESIGN.md` §13–16):
+- All CPU PyTorch reference, not vLLM. No speed or VRAM claim.
+- Stage 2(a) equality with greedy is verified on the tested prompts; it is not a bit-exact guarantee
+  for every argmax near-tie.
+- Stage 2(b) exactness is scoped as in §15b. Accepted-block score values are not asserted bit-identical.
+- Stage 2(b) covers text-only, no-evidence requests only. `da_mtp` is non-speculative.
+- Stage 2(c) is tracker-level only and not wired into the engine.
+- Q5 (auditor confirmation) is pending. The DA sink is not capped (Q6).
