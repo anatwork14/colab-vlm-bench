@@ -76,6 +76,7 @@ def score_proxy(predictions: list[dict], examples: list[dict]) -> dict:
 
     points = []
     missing_predictions = 0
+    invalid_predictions = 0
     for sid, reference in references.items():
         pred = by_id.get(sid)
         if pred is None:
@@ -83,6 +84,8 @@ def score_proxy(predictions: list[dict], examples: list[dict]) -> dict:
             ok, answer = False, ""
         else:
             ok = pred.get("status") == "SUCCESS"
+            if not ok:
+                invalid_predictions += 1
             answer = str(pred.get("prediction") or "") if ok else ""
         points.append({
             "id": sid, "valid_prediction": ok,
@@ -96,7 +99,10 @@ def score_proxy(predictions: list[dict], examples: list[dict]) -> dict:
         "status": "QUALITY_PROXY_ONLY", "count": len(points),
         "exact_match": sum(x["exact_match"] for x in points) / len(points),
         "token_f1": sum(x["token_f1"] for x in points) / len(points),
+        # Disjoint: a row that is present but not SUCCESS, and an example with no row.
+        # failures_counted_zero = invalid_predictions_counted_zero + missing_predictions.
         "failures_counted_zero": sum(not x["valid_prediction"] for x in points),
+        "invalid_predictions_counted_zero": invalid_predictions,
         "missing_predictions": missing_predictions,
         "unscored_without_reference": unscored_without_reference,
         "not_official": True, "per_sample": points,
