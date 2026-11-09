@@ -377,32 +377,61 @@ def qualify_memlens_assets(
     # Stream first sample_limit questions to verify structure
     sample_questions: list[dict[str, Any]] = []
     try:
-        import ijson
+        try:
+            import ijson
+            use_ijson = True
+        except ImportError:
+            use_ijson = False
 
-        with dataset_json.open("rb") as fp:
-            for item in ijson.items(fp, "item"):
-                if not isinstance(item, dict):
-                    raise TypeError("MemLens items must be dictionaries")
-                for req in (
-                    "question_id",
-                    "haystack_session_ids",
-                    "haystack_sessions",
-                    "haystack_dates",
-                    "question",
-                ):
-                    if req not in item:
-                        raise ValueError(f"MemLens item missing required key: {req}")
+        if use_ijson:
+            with dataset_json.open("rb") as fp:
+                for item in ijson.items(fp, "item"):
+                    if not isinstance(item, dict):
+                        raise TypeError("MemLens items must be dictionaries")
+                    for req in (
+                        "question_id",
+                        "haystack_session_ids",
+                        "haystack_sessions",
+                        "haystack_dates",
+                        "question",
+                    ):
+                        if req not in item:
+                            raise ValueError(f"MemLens item missing required key: {req}")
 
-                s_ids = item["haystack_session_ids"]
-                s_sess = item["haystack_sessions"]
-                s_dates = item["haystack_dates"]
-                if len(s_ids) != len(s_sess) or len(s_sess) != len(s_dates):
-                    raise ValueError(f"Inconsistent MemLens session lengths for {item['question_id']}")
+                    s_ids = item["haystack_session_ids"]
+                    s_sess = item["haystack_sessions"]
+                    s_dates = item["haystack_dates"]
+                    if len(s_ids) != len(s_sess) or len(s_sess) != len(s_dates):
+                        raise ValueError(f"Inconsistent MemLens session lengths for {item['question_id']}")
 
-                sample_questions.append(item)
-                if len(sample_questions) >= sample_limit:
-                    break
-    except (OSError, json.JSONDecodeError, ValueError, TypeError, ijson.common.JSONError) as exc:
+                    sample_questions.append(item)
+                    if len(sample_questions) >= sample_limit:
+                        break
+        else:
+            with dataset_json.open("r", encoding="utf8") as fp:
+                raw = json.load(fp)
+                raw_items = raw if isinstance(raw, list) else raw.get("data", [])
+                for item in raw_items[:sample_limit]:
+                    if not isinstance(item, dict):
+                        raise TypeError("MemLens items must be dictionaries")
+                    for req in (
+                        "question_id",
+                        "haystack_session_ids",
+                        "haystack_sessions",
+                        "haystack_dates",
+                        "question",
+                    ):
+                        if req not in item:
+                            raise ValueError(f"MemLens item missing required key: {req}")
+
+                    s_ids = item["haystack_session_ids"]
+                    s_sess = item["haystack_sessions"]
+                    s_dates = item["haystack_dates"]
+                    if len(s_ids) != len(s_sess) or len(s_sess) != len(s_dates):
+                        raise ValueError(f"Inconsistent MemLens session lengths for {item['question_id']}")
+
+                    sample_questions.append(item)
+    except (OSError, json.JSONDecodeError, ValueError, TypeError, Exception) as exc:
         return {
             "status": "UNQUALIFIED_MEMLENS_SOURCE",
             "dataset_path": str(dataset_json),

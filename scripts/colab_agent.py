@@ -148,7 +148,7 @@ def remote_job(args: argparse.Namespace) -> None:
         command(["colab", "upload", "-s", session, str(path),
                  "/content/vlmbench_agent_job.json"], dry_run=args.dry_run)
         try:
-            command(["colab", "exec", "-s", session, "-f",
+            command(["colab", "exec", "-s", session, "--timeout", "300", "-f",
                      "scripts/colab_agent_remote.py"], dry_run=args.dry_run)
         finally:
             target = REPO / "agent_artifacts" / session / job["invocation_id"]
