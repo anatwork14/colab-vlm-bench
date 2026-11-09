@@ -77,11 +77,18 @@ def test_h2o_calibrated_to_starlight_mean_retention_matches_it_within_one_entry(
 
 
 @pytest.mark.parametrize("arm", ["base", "h2o_base", "starlight_s1"])
-def test_memory_fields_state_the_scope_per_decode_step_prefill_unbounded(arm):
+def test_memory_block_states_no_single_scope_because_it_mixes_per_step_and_final_state(arm):
     # ITER2 D4 S-8 (lead ruling): any memory field must say what it covers.
+    # ITER3 R2 C-10 (RE-DERIVED): the block holds per-step sums AND a final-state snapshot
+    # (final_retained_kv_payload_bytes), so one block-level scope ("per decode step, prefill cache unbounded")
+    # is false for part of the block. The block now declares no single scope; each field's coverage is in
+    # memory_field_scopes (the glossary), and the block carries an explicit note.
     res = _run(arm)
     acct = res.telemetry["kv_memory_accounting"]
-    assert acct["scope"] == "per decode step, prefill cache unbounded", acct
+    assert acct["scope"] == "MIXED_PER_FIELD_SEE_memory_field_scopes", acct
+    assert "per decode step, prefill cache unbounded" not in str(acct), acct
+    assert "final-state" in acct["scope_note"] and "per-step" in acct["scope_note"], acct
+    assert res.telemetry["memory_field_scopes"]["final_retained_kv_payload_bytes"], "glossary entry required"
 
 
 # ITER2 D10 N-7 (review): every memory/KV-byte field must declare its own scope. The block-level
