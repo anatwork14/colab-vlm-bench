@@ -46,7 +46,29 @@ If vLLM starts normally and reports `GET /v1/models 200 OK` but the first smoke 
 
 The new Step 6 uses `prepare_serving_candidates` and `validate_serving_candidates`: it streams **every JSONL line on CPU**, checks unique sample IDs, text bins and image/text content structure. If the candidate is invalid and no annotation/state exists, it rebuilds from the existing normalized dataset **on local SSD first**, validates, copies the original damaged file to a SHA-tagged `.corrupt-<sha>.jsonl` backup on Drive, verifies the new Drive copy's SHA, and prints a receipt. If annotation/state already exists, it **refuses** automatic regeneration to preserve scientific provenance. The paid Step 8 repeats this validation **before** calling `start_server`.
 
-To use this repair in an existing Colab runtime, first run Step 3 so `/content/colab-vlm-bench` checks out the latest fix-branch SHA, then rerun Step 6. Do not rerun costly model-weight staging or normalization if their outputs are intact. Confirm `REBUILT_CORRUPT_CANDIDATES` or `REUSED_VALIDATED_CANDIDATES` for each active dataset, followed by `PRE_GPU_CANDIDATE_PASS` at Step 8. The next failure, if any, will be a real VLM image-request/server issue. Actual A100 image-request success remains unproven until that run.
+To use the repair, **open a fresh copy of the updated notebook**: fetching the Git branch does not replace code inside an already-open Colab notebook cell. Do not repeat costly model-weight staging or normalization if existing files are intact. Alternatively, in an already-open session with the Step 6 variables defined, run this standalone **CPU-only recovery cell** to update the repository and safely repair each candidate JSONL without starting vLLM:
+
+```python
+import subprocess
+import importlib
+
+subprocess.run(["git", "-C", str(REPO), "fetch", "origin", BENCH_SOURCE_REF], check=True)
+subprocess.run(["git", "-C", str(REPO), "checkout", "--detach", "FETCH_HEAD"], check=True)
+import vlmbench.notebook_bridge as repaired_bridge
+importlib.reload(repaired_bridge)
+
+for ds in ACTIVE_DATASETS:
+    receipt = repaired_bridge.prepare_serving_candidates(
+        NATIVE[ds], CANDIDATES[ds], annotated_path=ANNOTATED[ds],
+        dataset=ds, model_id=MODEL_ID, model_directory=STAGED_MODEL,
+        input_lengths=TEXT_BINS, max_per_bin=MAX_ROWS_PER_BIN,
+        local_scratch_dir="/content/vlmbench/prepared_candidates",
+        pdf_root=MMLONG_PDF_ROOT if ds == "mmlongbench_doc" else None)
+    print(ds, receipt["status"], receipt["records"],
+          receipt["per_text_bin"], receipt["preserved_corrupt_backup"])
+```
+
+Only after all active datasets print `REBUILT_CORRUPT_CANDIDATES` or `REUSED_VALIDATED_CANDIDATES` should the previously failed Step 8 be retried. On an updated notebook, Step 8 additionally prints `PRE_GPU_CANDIDATE_PASS`. The next failure, if any, can then be investigated as an actual VLM image-request/server issue. Actual A100 image-request success remains unproven until that run.
 
 ## Qwen3.5-0.8B bounded A100 Base pilot (branch fix)
 
