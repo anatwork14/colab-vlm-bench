@@ -32,6 +32,7 @@ def _cfg(tmp_path):
     ds["native_path"] = str(tmp_path / "native.jsonl")
     ds["derived_path"] = str(tmp_path / "annotated.jsonl")
     Path(ds["derived_path"]).write_text('{"id":"row"}\n', encoding="utf8")
+    Path(ds["native_path"]).write_text("", encoding="utf8")  # presence only; loader is faked
     return cfg
 
 
@@ -310,3 +311,160 @@ def test_completed_cells_are_skipped_without_gpu_or_rewrite(monkeypatch, tmp_pat
     for cell in cells:
         path = root / "cells" / f"{cell_id(cell)}.json"
         assert path.read_bytes() == bytes_by_cell[cell_id(cell)]
+
+
+# ---------- F-06: exit status must reflect cell outcomes ----------
+
+def _non_pilot(cfg):
+    cfg["execution_scope"] = {**(cfg.get("execution_scope") or {}), "kind": "full_study"}
+    return cfg
+
+
+def _status(tmp_path_cfg):
+    return json.loads((_root(tmp_path_cfg) / "run_status.json").read_text())
+
+
+def test_every_attempted_cell_failing_exits_nonzero_with_all_failed_status(monkeypatch, tmp_path):
+    cfg = _non_pilot(_cfg(tmp_path))
+    calls: list[str] = []
+    _fake_gpu(monkeypatch, tmp_path, cfg, calls, lambda cell: "ERROR")
+
+    rc = cli.run_job(_args())
+
+    assert rc == 5
+    run = _status(cfg)
+    assert run["status"] == "ALL_ATTEMPTED_FAILED"
+    assert run["counts"]["attempted"] == len(calls) == 6
+    assert run["counts"]["completed"] == 0
+
+
+def test_mixed_outcomes_exit_nonzero_with_partial_failure_status(monkeypatch, tmp_path):
+    cfg = _non_pilot(_cfg(tmp_path))
+    cells = _scoped(cfg)
+    fail_ids = {cell_id(c) for c in cells[1::2]}
+    calls: list[str] = []
+    _fake_gpu(monkeypatch, tmp_path, cfg, calls,
+              lambda cell: "ERROR" if cell_id(cell) in fail_ids else "PASS")
+
+    rc = cli.run_job(_args())
+
+    assert rc == 6
+    run = _status(cfg)
+    assert run["status"] == "PARTIAL_FAILURE"
+    assert run["counts"] == {"planned": 6, "attempted": 6, "completed": 3, "non_completed": 3}
+
+
+def test_all_cells_completed_exits_zero_with_complete_status(monkeypatch, tmp_path):
+    cfg = _non_pilot(_cfg(tmp_path))
+    calls: list[str] = []
+    _fake_gpu(monkeypatch, tmp_path, cfg, calls, lambda cell: "PASS")
+
+    assert cli.run_job(_args()) == 0
+    run = _status(cfg)
+    assert run["status"] == "COMPLETE"
+    assert run["counts"]["completed"] == 6
+
+
+def test_cell_cap_reached_before_finish_exits_zero_in_progress(monkeypatch, tmp_path):
+    cfg = _non_pilot(_cfg(tmp_path))
+    calls: list[str] = []
+    _fake_gpu(monkeypatch, tmp_path, cfg, calls, lambda cell: "PASS")
+
+    assert cli.run_job(_args(max_cells=2)) == 0
+    run = _status(cfg)
+    assert run["status"] == "IN_PROGRESS"
+    assert run["counts"]["completed"] == 2 and run["counts"]["non_completed"] == 0
+
+
+def test_pilot_circuit_breaker_has_its_own_nonzero_status(monkeypatch, tmp_path):
+    cfg = _cfg(tmp_path)  # engineering pilot scope
+    assert cfg["execution_scope"]["kind"] == "engineering_pilot"
+    calls: list[str] = []
+    _fake_gpu(monkeypatch, tmp_path, cfg, calls, lambda cell: "ERROR")
+
+    assert cli.run_job(_args()) == 4
+    assert _status(cfg)["status"] == "PILOT_STOPPED_ON_FAILURE"
+    assert len(calls) == 1
+
+
+def _quality_args():
+    return _args(quality=True)
+
+
+def _fake_quality(monkeypatch, receipt):
+    async def fake(*_a, **_kw):
+        return receipt
+    monkeypatch.setattr(cli, "run_quality_predictions", fake)
+
+
+def test_quality_all_predictions_failed_exits_nonzero(monkeypatch, tmp_path):
+    cfg = _non_pilot(_cfg(tmp_path))
+    _fake_gpu(monkeypatch, tmp_path, cfg, [], lambda cell: "PASS")
+    _fake_quality(monkeypatch, {"status": "QUALITY_PREDICTIONS_UNSCORED",
+                                "count": 2, "expected_count": 2, "failures": 2})
+    assert cli.run_job(_quality_args()) == 5
+    assert _status(cfg)["status"] == "QUALITY_ALL_FAILED"
+
+
+def test_quality_circuit_breaker_exits_nonzero(monkeypatch, tmp_path):
+    cfg = _non_pilot(_cfg(tmp_path))
+    _fake_gpu(monkeypatch, tmp_path, cfg, [], lambda cell: "PASS")
+    _fake_quality(monkeypatch, {"status": "QUALITY_STOPPED_AFTER_REPEATED_FAILURES",
+                                "count": 2, "expected_count": 9, "failures": 2})
+    assert cli.run_job(_quality_args()) == 4
+    assert _status(cfg)["status"] == "QUALITY_STOPPED_AFTER_REPEATED_FAILURES"
+
+
+def test_quality_partial_failures_exit_nonzero(monkeypatch, tmp_path):
+    cfg = _non_pilot(_cfg(tmp_path))
+    _fake_gpu(monkeypatch, tmp_path, cfg, [], lambda cell: "PASS")
+    _fake_quality(monkeypatch, {"status": "QUALITY_PREDICTIONS_UNSCORED",
+                                "count": 4, "expected_count": 4, "failures": 1})
+    assert cli.run_job(_quality_args()) == 6
+    assert _status(cfg)["status"] == "QUALITY_PARTIAL_FAILURE"
+
+
+def test_quality_success_exits_zero(monkeypatch, tmp_path):
+    cfg = _non_pilot(_cfg(tmp_path))
+    _fake_gpu(monkeypatch, tmp_path, cfg, [], lambda cell: "PASS")
+    _fake_quality(monkeypatch, {"status": "QUALITY_PREDICTIONS_UNSCORED",
+                                "count": 4, "expected_count": 4, "failures": 0})
+    assert cli.run_job(_quality_args()) == 0
+    assert _status(cfg)["status"] == "QUALITY_PREDICTIONS_UNSCORED"
+
+
+def test_remote_benchmark_wrapper_fails_and_names_the_status(monkeypatch, tmp_path):
+    # The remote wrapper treats a raised RuntimeError as ACTION_FAILED; the message must
+    # name the run status instead of reporting GPU_JOB_FINISHED after an all-failed run.
+    from vlmbench import agent_pipeline as ap
+
+    cfg = _non_pilot(_cfg(tmp_path))
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text("{}", encoding="utf8")
+    annotated = tmp_path / "annotated.jsonl"
+    annotated.write_text("", encoding="utf8")
+    root = _root(cfg)
+    root.mkdir(parents=True, exist_ok=True)
+    atomic_json(root / "run_status.json", {"status": "ALL_ATTEMPTED_FAILED", "exit_code": 5})
+    seen = {}
+
+    def fake_run_job(args):
+        seen["requeue"] = args.requeue_nonpass
+        return 5
+
+    monkeypatch.setattr(ap, "require_compute_approval", lambda *_a, **_kw: None)
+    monkeypatch.setattr(ap, "paths_for", lambda job: {"annotated": annotated})
+    monkeypatch.setattr(ap, "require_prepared", lambda *_a, **_kw: None)
+    monkeypatch.setattr(ap, "campaign", lambda job, paths: (cfg, cfg_path))
+    import vlmbench.cli as cli_mod
+    monkeypatch.setattr(cli_mod, "run_job", fake_run_job)
+    job = {"model": "qwen35_08b", "mode": "base", "dataset": "memlens", "phase": "pilot",
+           "quality": False, "max_cells": 1, "requeue_nonpass": True,
+           "owner_approved_compute": True}
+
+    with pytest.raises(RuntimeError, match="ALL_ATTEMPTED_FAILED"):
+        ap.benchmark(job)
+    assert seen["requeue"] is True
+
+    with pytest.raises(ValueError, match="requeue_nonpass must be a boolean"):
+        ap.benchmark({**job, "requeue_nonpass": "yes"})

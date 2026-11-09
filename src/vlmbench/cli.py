@@ -83,6 +83,49 @@ def _classify_serving_cells(cfg, cells, root, derived_path, dataset_id, track, m
     return result
 
 
+# Exit codes for run-job (F-06). 0 = nothing failed; every non-zero code names its cause.
+EXIT_OK = 0            # COMPLETE, IN_PROGRESS (cell cap reached, nothing failed), predictions recorded
+EXIT_BLOCKED = 2       # refused before GPU start (preflight, readiness, stale receipts)
+EXIT_PILOT_STOP = 4    # engineering circuit breaker fired on the first runtime failure
+EXIT_ALL_FAILED = 5    # every attempted unit failed
+EXIT_PARTIAL = 6       # some units passed, some failed or remain non-PASS
+
+
+def _serving_outcome(scoped_cells, pre_states, attempted, pilot_failure):
+    """attempted: {cell_id: receipt status} for cells run in this invocation."""
+    planned = len(scoped_cells)
+    pre_completed = sum(1 for st, _ in pre_states.values() if st == COMPLETED)
+    # Non-completed receipts that this invocation did not touch (e.g. beyond the cell cap).
+    carried_nonpass = sum(1 for cid, (st, _) in pre_states.items()
+                          if st in NON_COMPLETE and cid not in attempted)
+    attempted_pass = sum(1 for st in attempted.values() if st == "PASS_MEASURED")
+    completed = pre_completed + attempted_pass
+    non_completed = (len(attempted) - attempted_pass) + carried_nonpass
+    counts = {"planned": planned, "attempted": len(attempted),
+              "completed": completed, "non_completed": non_completed}
+    if pilot_failure:
+        return "PILOT_STOPPED_ON_FAILURE", EXIT_PILOT_STOP, counts
+    if completed == planned:
+        return "COMPLETE", EXIT_OK, counts
+    if attempted and attempted_pass == 0:
+        return "ALL_ATTEMPTED_FAILED", EXIT_ALL_FAILED, counts
+    if non_completed:
+        return "PARTIAL_FAILURE", EXIT_PARTIAL, counts
+    return "IN_PROGRESS", EXIT_OK, counts
+
+
+def _quality_outcome(result):
+    status = result.get("status")
+    count, failures = result.get("count", 0), result.get("failures", 0)
+    if status == "QUALITY_STOPPED_AFTER_REPEATED_FAILURES":
+        return status, EXIT_PILOT_STOP
+    if count and failures >= count:
+        return "QUALITY_ALL_FAILED", EXIT_ALL_FAILED
+    if failures:
+        return "QUALITY_PARTIAL_FAILURE", EXIT_PARTIAL
+    return status, EXIT_OK
+
+
 def run_job(args) -> int:
     require_compute_approval(getattr(args, "owner_approved_compute", None))
     cfg = load_config(args.config, execution=True)
@@ -323,6 +366,7 @@ def run_job(args) -> int:
         done = 0
         pilot_failure = None
         requeued: list[dict] = []
+        attempted_status: dict[str, str] = {}
         limit = args.max_cells if args.max_cells > 0 else int(cfg["performance"]["max_cells_per_session"])
         if args.quality:
             cells = []
@@ -342,6 +386,7 @@ def run_job(args) -> int:
             result = asyncio.run(run_performance_cell(
                 cfg, cell, rows, root, drive_root, args.model, derived_hash))
             done += 1
+            attempted_status[cid] = result["status"]
             print(json.dumps({"cell": cell_id(cell), "status": result["status"]}), flush=True)
             if (selected_scope(cfg)["kind"] == "engineering_pilot" and
                     result["status"] in {"ERROR", "TIMEOUT", "PARTIAL_FAILURE"}):
@@ -350,15 +395,24 @@ def run_job(args) -> int:
                       "runtime failure. Inspect Drive receipt before continuing.",
                       flush=True)
                 break
+        quality_result = None
         if args.quality:
             quality_rows = quality_probe
-            result = asyncio.run(run_quality_predictions(
+            quality_result = asyncio.run(run_quality_predictions(
                 cfg, args.model, args.mode, ds["id"], quality_rows, root, drive_root))
-            print("Quality predictions:", result["status"])
+            print("Quality predictions:", quality_result["status"])
+            status, exit_code = _quality_outcome(quality_result)
+            counts = None
+        else:
+            status, exit_code, counts = _serving_outcome(
+                scoped_cells, cell_states, attempted_status, pilot_failure)
         write_report(root, cfg)
         sync_files(root, drive_root)
         atomic_json(root / "run_status.json", {
-            "status": "JOB_PILOT_STOPPED_ON_FAILURE" if pilot_failure else "JOB_PARTIAL_OR_COMPLETE",
+            "status": status, "exit_code": exit_code, "counts": counts,
+            "quality_result": ({k: quality_result.get(k) for k in
+                                ("status", "count", "expected_count", "failures")}
+                               if quality_result else None),
             "pilot_failure": pilot_failure,
             "requeued_nonpass": requeued,
             "model": args.model, "mode": args.mode, "dataset": ds["id"],
@@ -366,7 +420,8 @@ def run_job(args) -> int:
             "gpu": inventory, "note": "GPU model execution does not certify native MTP correctness",
         })
         sync_files(root, drive_root)
-        return 0
+        print(json.dumps({"status": status, "exit_code": exit_code, "counts": counts}), flush=True)
+        return exit_code
     except BaseException as exc:
         _persist_error(root, drive_root, "FAILED_RUNTIME", f"{type(exc).__name__}: {exc}")
         raise

@@ -134,6 +134,7 @@ def remote_job(args: argparse.Namespace) -> None:
             "qa_limit": args.qa_limit, "max_per_bin": args.max_per_bin,
             "max_requests": args.max_requests, "max_cells": args.max_cells,
             "mode": args.mode, "quality": args.quality,
+            "requeue_nonpass": bool(args.requeue_nonpass),
             "model_revision": args.model_revision,
             "dataset_revision": args.dataset_revision,
             "source_mode": args.source_mode, "source_map": args.source_map,
@@ -218,6 +219,8 @@ def main(argv=None) -> int:
         sp.add_argument("--max-cells", type=int, default=1)
         sp.add_argument("--mode", choices=["base", "mtp"], default="base")
         sp.add_argument("--quality", action="store_true")
+        sp.add_argument("--requeue-nonpass", action="store_true",
+                        help="benchmark: quarantine FAILED/STALE receipts and re-run those cells")
         sp.add_argument("--approve-paid", action="store_true")
         sp.add_argument("--dry-run", action="store_true")
 
