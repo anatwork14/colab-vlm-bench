@@ -34,6 +34,22 @@ def test_missing_prediction_is_counted_as_zero_not_dropped():
     assert out["missing_predictions"] == 1
 
 
+def test_zero_scored_counts_are_disjoint_and_sum_to_failures():
+    # R3-D (review F-01 nit): a present-but-invalid row and a missing row are different
+    # failures. Emit them as disjoint counts; failures_counted_zero is their sum.
+    out = score_proxy(
+        [{"id": "a", "status": "SUCCESS", "prediction": "June"},
+         {"id": "b", "status": "FAILED", "prediction": None}],
+        [{"id": "a", "reference": "June"}, {"id": "b", "reference": "May"},
+         {"id": "c", "reference": "Oct"}],
+    )
+    assert out["invalid_predictions_counted_zero"] == 1
+    assert out["missing_predictions"] == 1
+    assert out["failures_counted_zero"] == 2
+    assert out["failures_counted_zero"] == (
+        out["invalid_predictions_counted_zero"] + out["missing_predictions"])
+
+
 def test_duplicate_prediction_id_is_rejected():
     with pytest.raises(ValueError, match="[Dd]uplicate"):
         score_proxy(
@@ -64,12 +80,12 @@ def test_example_without_reference_is_reported_not_silently_dropped():
 # ---------------------------------------------------------------- GPU telemetry parse (C2 peak GPU memory)
 
 def test_single_gpu_csv_parses():
-    used, util, gpus = parse_nvidia_smi_csv("12000, 55\n")
+    used, util, gpus = parse_nvidia_smi_csv("0, GPU-aaaa, 12000, 55\n")
     assert (used, util, gpus) == (12000, 55, 1)
 
 
 def test_multi_gpu_csv_sums_devices_instead_of_dropping_sample():
-    used, util, gpus = parse_nvidia_smi_csv("1234, 0\n5678, 3\n")
+    used, util, gpus = parse_nvidia_smi_csv("0, GPU-aaaa, 1234, 0\n1, GPU-bbbb, 5678, 3\n")
     assert used == 1234 + 5678
     assert util == 3
     assert gpus == 2

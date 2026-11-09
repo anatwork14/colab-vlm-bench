@@ -92,16 +92,24 @@ EXIT_ALL_FAILED = 5    # every attempted unit failed
 EXIT_PARTIAL = 6       # some units passed, some failed or remain non-PASS
 
 
-def _serving_outcome(scoped_cells, pre_states, attempted, pilot_failure):
-    """attempted: {cell_id: receipt status} for cells run in this invocation."""
+def _serving_outcome(scoped_cells, pre_states, attempted, pilot_failure, cap_reached=False):
+    """attempted: {cell_id: receipt status} for cells run in this invocation.
+
+    cap_reached: the --max-cells / config cap stopped this invocation. Only then may
+    cells that have no receipt yet count as "IN_PROGRESS". Otherwise they are
+    non-completed (R3-B), because nothing scheduled them.
+    """
     planned = len(scoped_cells)
     pre_completed = sum(1 for st, _ in pre_states.values() if st == COMPLETED)
     # Non-completed receipts that this invocation did not touch (e.g. beyond the cell cap).
     carried_nonpass = sum(1 for cid, (st, _) in pre_states.items()
                           if st in NON_COMPLETE and cid not in attempted)
+    not_attempted_missing = sum(1 for cid, (st, _) in pre_states.items()
+                                if st == MISSING and cid not in attempted)
+    uncapped_missing = 0 if cap_reached else not_attempted_missing
     attempted_pass = sum(1 for st in attempted.values() if st == "PASS_MEASURED")
     completed = pre_completed + attempted_pass
-    non_completed = (len(attempted) - attempted_pass) + carried_nonpass
+    non_completed = (len(attempted) - attempted_pass) + carried_nonpass + uncapped_missing
     counts = {"planned": planned, "attempted": len(attempted),
               "completed": completed, "non_completed": non_completed}
     if pilot_failure:
@@ -110,6 +118,8 @@ def _serving_outcome(scoped_cells, pre_states, attempted, pilot_failure):
         return "COMPLETE", EXIT_OK, counts
     if attempted and attempted_pass == 0:
         return "ALL_ATTEMPTED_FAILED", EXIT_ALL_FAILED, counts
+    if non_completed and not attempted:
+        return "INCOMPLETE_NOT_ATTEMPTED", EXIT_PARTIAL, counts
     if non_completed:
         return "PARTIAL_FAILURE", EXIT_PARTIAL, counts
     return "IN_PROGRESS", EXIT_OK, counts
@@ -424,7 +434,8 @@ def run_job(args) -> int:
             counts = None
         else:
             status, exit_code, counts = _serving_outcome(
-                scoped_cells, cell_states, attempted_status, pilot_failure)
+                scoped_cells, cell_states, attempted_status, pilot_failure,
+                cap_reached=bool(limit) and done >= limit)
         write_report(root, cfg)
         sync_files(root, drive_root)
         atomic_json(root / "run_status.json", {
