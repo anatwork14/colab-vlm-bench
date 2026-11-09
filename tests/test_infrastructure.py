@@ -140,6 +140,40 @@ def test_h2o_mtp_transaction_lifecycle_and_residual_state():
     assert tracker.seq_len == 5
 
 
+def test_h2o_per_layer_visual_mask_survives_different_compaction_indices():
+    config = H2OConfig(
+        budget_ratio=0.25, recent_ratio=0.2,
+        min_budget=1, protect_system_tokens=1, protect_visual_tokens=True,
+    )
+    tracker = H2OCacheTracker(config=config, num_layers=2, num_kv_heads=1)
+    original_visual = np.array([False, True, True, False, False, False, False, False])
+    tracker.set_visual_tokens(original_visual)
+
+    # Attention layers retain different index maps; image positions move to
+    # different physical indices. Global original mask must never be rewritten.
+    tracker.compact_layer_state(0, np.array([0, 1, 3, 5, 7]))
+    tracker.compact_layer_state(1, np.array([0, 2, 4, 6, 7]))
+    np.testing.assert_array_equal(tracker.visual_token_mask, original_visual)
+    assert tracker.layers[0].visual_token_mask.tolist() == [False, True, False, False, False]
+    assert tracker.layers[1].visual_token_mask.tolist() == [False, True, False, False, False]
+
+    # Next decode appends one nonvisual token per layer, then plans eviction.
+    for layer_idx in (0, 1):
+        retained, _ = tracker.compute_eviction_plan(layer_idx, current_length=6)
+        assert retained[1], f"Layer {layer_idx} lost protected visual evidence after compaction"
+        assert tracker.layers[layer_idx].visual_token_mask[-1] == False
+
+    # Speculative rollback restores each layer's coordinates independently.
+    tx = H2OMTPTransaction(tracker)
+    tx.begin()
+    tracker.compact_layer_state(0, np.array([0, 2, 4]))
+    tracker.compact_layer_state(1, np.array([0, 1, 3, 5]))
+    tx.rollback()
+    for layer_idx in (0, 1):
+        assert tracker.layers[layer_idx].visual_token_mask[1]
+        assert len(tracker.layers[layer_idx].visual_token_mask) == 6
+
+
 # --- 2. Declarative Attention (DA) Tests ---
 
 def test_da_fsm_tag_parsing():

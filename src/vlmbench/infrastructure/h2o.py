@@ -39,6 +39,8 @@ class H2OLayerState:
     # scores shape: [num_kv_heads, seq_len]
     evicted_mask: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=bool))
     # evicted_mask[i] == True if token i is physically evicted from KV cache
+    visual_token_mask: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=bool))
+    # Per-layer physical-token coordinates; MUST NOT be shared between layers.
 
     def __post_init__(self) -> None:
         if self.scores.shape[0] != self.num_kv_heads:
@@ -67,6 +69,8 @@ class H2OCacheTracker:
     def set_visual_tokens(self, mask: Sequence[bool]) -> None:
         """Register boolean mask of visual token positions to preserve evidence."""
         self.visual_token_mask = np.array(mask, dtype=bool)
+        for layer in self.layers:
+            layer.visual_token_mask = self.visual_token_mask.copy()
 
     def update_attention_scores(self, layer_idx: int, attention_weights: np.ndarray) -> None:
         """Accumulate attention scores for an attention layer.
@@ -120,6 +124,28 @@ class H2OCacheTracker:
                 "kv_bytes_freed": "NOT_MEASURED_LOGICAL_MASK_ONLY",
             }
 
+        # Per-layer cache shapes diverge after KV compaction. Keep visual-token
+        # coordinates separate for each full-attention layer; append false for
+        # newly generated text tokens. NEVER mutate the original global mask.
+        if len(layer.visual_token_mask) < current_length:
+            layer.visual_token_mask = np.pad(
+                layer.visual_token_mask,
+                (0, current_length - len(layer.visual_token_mask)),
+                constant_values=False,
+            )
+        if layer.evicted_mask.shape[0] < current_length:
+            layer.evicted_mask = np.pad(
+                layer.evicted_mask,
+                (0, current_length - layer.evicted_mask.shape[0]),
+                constant_values=False,
+            )
+        if layer.scores.shape[1] < current_length:
+            layer.scores = np.pad(
+                layer.scores,
+                ((0, 0), (0, current_length - layer.scores.shape[1])),
+                constant_values=0.0,
+            )
+
         target_budget = max(self.config.min_budget, int(current_length * self.config.budget_ratio))
         recent_size = max(1, int(target_budget * self.config.recent_ratio))
 
@@ -130,9 +156,9 @@ class H2OCacheTracker:
         retained[:sys_protected] = True
 
         # 2. Protect visual tokens if configured (before computing recent window budget)
-        if self.config.protect_visual_tokens and len(self.visual_token_mask) > 0:
-            active_len = min(current_length, len(self.visual_token_mask))
-            retained[:active_len] |= self.visual_token_mask[:active_len]
+        if self.config.protect_visual_tokens and len(layer.visual_token_mask) > 0:
+            active_len = min(current_length, len(layer.visual_token_mask))
+            retained[:active_len] |= layer.visual_token_mask[:active_len]
 
         protected_count = int(np.sum(retained))
         unprotected_count = current_length - protected_count
@@ -200,14 +226,29 @@ class H2OCacheTracker:
         if layer.is_recurrent or len(retained_indices) == 0:
             return
 
-        max_idx = int(np.max(retained_indices))
-        if layer.scores.shape[1] > max_idx:
-            layer.scores = layer.scores[:, retained_indices]
-            layer.evicted_mask = np.zeros(len(retained_indices), dtype=bool)
-
-        if len(self.visual_token_mask) > max_idx:
-            self.visual_token_mask = self.visual_token_mask[retained_indices]
-        self.seq_len = len(retained_indices)
+        indices = np.asarray(retained_indices, dtype=np.int64)
+        if np.any(indices < 0) or np.any(np.diff(indices) <= 0):
+            raise ValueError("Compaction indices must be nonnegative, sorted and unique")
+        required = int(indices[-1]) + 1
+        if layer.scores.shape[1] < required:
+            layer.scores = np.pad(
+                layer.scores,
+                ((0, 0), (0, required - layer.scores.shape[1])),
+                constant_values=0.0,
+            )
+        if layer.visual_token_mask.shape[0] < required:
+            layer.visual_token_mask = np.pad(
+                layer.visual_token_mask,
+                (0, required - layer.visual_token_mask.shape[0]),
+                constant_values=False,
+            )
+        # Eviction masks are indexed by physical positions, not original IDs.
+        layer.scores = layer.scores[:, indices]
+        layer.evicted_mask = np.zeros(len(indices), dtype=bool)
+        layer.visual_token_mask = layer.visual_token_mask[indices]
+        # self.visual_token_mask preserves ORIGINAL positions as an immutable
+        # cross-layer source. Each layer owns its physical-position mask.
+        self.seq_len = len(indices)
 
 
 class H2OEvictionPolicy:
@@ -241,6 +282,7 @@ class H2OMTPTransaction:
                 {
                     "scores": np.copy(layer.scores),
                     "evicted_mask": np.copy(layer.evicted_mask),
+                    "visual_token_mask": np.copy(layer.visual_token_mask),
                 }
                 for layer in self.tracker.layers
             ],
@@ -269,6 +311,8 @@ class H2OMTPTransaction:
                 layer.scores[:, new_seq_len:] = 0.0
             if len(layer.evicted_mask) > new_seq_len:
                 layer.evicted_mask[new_seq_len:] = False
+            if len(layer.visual_token_mask) > new_seq_len:
+                layer.visual_token_mask[new_seq_len:] = False
 
         self._snapshot = None
         self.in_transaction = False
@@ -283,6 +327,7 @@ class H2OMTPTransaction:
         for layer, snap in zip(self.tracker.layers, self._snapshot["layers"]):
             layer.scores = snap["scores"]
             layer.evicted_mask = snap["evicted_mask"]
+            layer.visual_token_mask = snap["visual_token_mask"]
 
         self._snapshot = None
         self.in_transaction = False
