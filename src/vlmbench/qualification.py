@@ -49,6 +49,9 @@ class QualificationError(Exception):
 class DeterministicSimpleTokenizer:
     """Deterministic character-level tokenizer for CPU qualification without transformers."""
 
+    is_synthetic: bool = True
+    tokenizer_type: str = "synthetic_character_fallback"
+
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
         return [ord(c) for c in text]
 
@@ -56,20 +59,47 @@ class DeterministicSimpleTokenizer:
         return "".join(chr(t) for t in token_ids)
 
 
-def get_qualification_tokenizer(model_dir: Path | str | None = None) -> Any:
-    """Return a model tokenizer if available, otherwise return DeterministicSimpleTokenizer."""
+def get_qualification_tokenizer(
+    model_dir: Path | str | None = None,
+    *,
+    require_real: bool = False,
+) -> Any:
+    """Return a model tokenizer if available; if not and require_real=True, fail.
+
+    When require_real=False and a model tokenizer is unavailable, returns
+    DeterministicSimpleTokenizer labeled explicitly as synthetic.
+    """
     if model_dir is not None:
         p = Path(model_dir)
         if p.is_dir() and any((p / n).is_file() for n in ("tokenizer.json", "tokenizer_config.json")):
             try:
                 from transformers import AutoTokenizer
 
-                return AutoTokenizer.from_pretrained(
+                tok = AutoTokenizer.from_pretrained(
                     str(p), local_files_only=True, trust_remote_code=False
                 )
+                tok.is_synthetic = False
+                tok.tokenizer_type = "pretrained_model"
+                return tok
             except (ImportError, OSError, ValueError, RuntimeError) as exc:
+                if require_real:
+                    raise QualificationError(
+                        f"Failed loading model tokenizer from {p}: {exc}"
+                    ) from exc
                 logger.debug("Failed loading AutoTokenizer from %s: %s", p, exc)
-    return DeterministicSimpleTokenizer()
+        elif require_real:
+            raise QualificationError(
+                f"Model directory {p} does not contain required tokenizer artifacts"
+            )
+    elif require_real:
+        raise QualificationError(
+            "require_real=True specified but no model_dir provided to load tokenizer"
+        )
+
+    tok = DeterministicSimpleTokenizer()
+    tok.is_synthetic = True
+    tok.tokenizer_type = "synthetic_character_fallback"
+    return tok
 
 
 def snapshot_directory_state(path: Path, subdirs: list[Path] | None = None) -> dict[str, tuple[int, int]]:
@@ -96,6 +126,60 @@ def _find_zip_member(namelist: list[str], filename_suffix: str) -> str | None:
         if name == filename_suffix or name.endswith("/" + filename_suffix):
             return name
     return None
+
+
+def _resolve_amber_zip_image(
+    namelist: list[str],
+    image_member_set: set[str],
+    img_name: str,
+    item_id: Any,
+) -> str:
+    """Strictly resolve an image reference from AMBER.zip, rejecting path traversal and ambiguous matches."""
+    if not isinstance(img_name, str) or not img_name.strip():
+        raise AmberError(f"Query item {item_id} has invalid or empty 'image' reference")
+    img_clean = img_name.strip()
+    p = Path(img_clean)
+
+    # Reject absolute paths, Windows separators, or traversal parts ("..")
+    if (
+        "\\" in img_clean
+        or p.is_absolute()
+        or img_clean.startswith("/")
+        or any(part in ("..", "") for part in p.parts)
+        or ".." in p.parts
+    ):
+        raise AmberError(f"Path traversal or absolute path detected in AMBER image reference: {img_clean!r}")
+
+    # Exact match in zip
+    if img_clean in image_member_set:
+        target = img_clean
+    else:
+        # Check exact relative path match (e.g. data/image/AMBER_1.jpg matching AMBER_1.jpg)
+        exact_matches = [n for n in namelist if n == img_clean or n.endswith("/" + img_clean)]
+        if len(exact_matches) == 1:
+            target = exact_matches[0]
+        elif len(exact_matches) > 1:
+            raise AmberError(
+                f"Ambiguous image path match in AMBER.zip for {img_clean!r}: multiple matches {exact_matches}"
+            )
+        elif len(p.parts) == 1:
+            # Basename search only if no subdirectories specified
+            base_matches = [n for n in namelist if Path(n).name == p.name and not n.endswith("/")]
+            if len(base_matches) == 1:
+                target = base_matches[0]
+            elif len(base_matches) > 1:
+                raise AmberError(
+                    f"Ambiguous image basename match in AMBER.zip for {img_clean!r}: multiple matches {base_matches}"
+                )
+            else:
+                raise AmberError(f"Referenced image {img_clean!r} for item {item_id} not found in AMBER.zip")
+        else:
+            raise AmberError(f"Referenced image {img_clean!r} for item {item_id} not found in AMBER.zip")
+
+    tm_path = Path(target)
+    if tm_path.is_absolute() or any(part in ("..", "") for part in tm_path.parts):
+        raise AmberError(f"Zip member contains path traversal: {target!r}")
+    return target
 
 
 def qualify_amber_assets(
@@ -263,18 +347,18 @@ def qualify_amber_assets(
                                 item["label"] = truth_val.strip().capitalize()
 
                     img_name = item["image"]
-                    # Locate image member in zip
-                    target_member = None
-                    if img_name in image_member_set:
-                        target_member = img_name
-                    else:
-                        target_member = _find_zip_member(namelist, Path(img_name).name)
+                    target_member = _resolve_amber_zip_image(
+                        namelist, image_member_set, img_name, item.get("id")
+                    )
 
-                    if target_member is not None:
-                        dest_img = tmp_images / img_name
-                        dest_img.parent.mkdir(parents=True, exist_ok=True)
-                        with zf.open(target_member) as src_fp, dest_img.open("wb") as dst_fp:
-                            shutil.copyfileobj(src_fp, dst_fp)
+                    dest_img = (tmp_images / img_name).resolve()
+                    if not dest_img.is_relative_to(tmp_images.resolve()):
+                        raise AmberError(
+                            f"Destination path escapes temporary directory: {dest_img}"
+                        )
+                    dest_img.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(target_member) as src_fp, dest_img.open("wb") as dst_fp:
+                        shutil.copyfileobj(src_fp, dst_fp)
 
                     extracted_sample_queries.append(item)
 
@@ -337,6 +421,7 @@ def qualify_memlens_assets(
     sample_limit: int = 5,
     tolerance: float = 0.05,
     tokenizer: Any = None,
+    require_real_tokenizer: bool = False,
 ) -> dict[str, Any]:
     """Inspect and qualify MemLens dataset files on mounted Google Drive.
 
@@ -440,7 +525,7 @@ def qualify_memlens_assets(
                         raise ValueError(f"Inconsistent MemLens session lengths for {item['question_id']}")
 
                     sample_questions.append(item)
-    except (OSError, json.JSONDecodeError, ValueError, TypeError, Exception) as exc:
+    except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
         return {
             "status": "UNQUALIFIED_MEMLENS_SOURCE",
             "dataset_path": str(dataset_json),
@@ -448,6 +533,16 @@ def qualify_memlens_assets(
             "dataset_sha256": dataset_sha,
             "error": f"Failed to parse MemLens streaming items: {exc}",
         }
+    except Exception as exc:
+        if "ijson" in type(exc).__module__:
+            return {
+                "status": "UNQUALIFIED_MEMLENS_SOURCE",
+                "dataset_path": str(dataset_json),
+                "dataset_size_bytes": size_bytes,
+                "dataset_sha256": dataset_sha,
+                "error": f"Failed to parse MemLens streaming items: {exc}",
+            }
+        raise
 
     if not sample_questions:
         return {
@@ -459,27 +554,84 @@ def qualify_memlens_assets(
         }
 
     # Test candidate bin generation in a temporary directory
-    tok = tokenizer if tokenizer is not None else get_qualification_tokenizer()
+    model_dir = (
+        root / LEGACY_MODEL_REL / ACTIVE_MODELS[0]
+        if (root / LEGACY_MODEL_REL / ACTIVE_MODELS[0]).is_dir()
+        else None
+    )
+    try:
+        tok = (
+            tokenizer
+            if tokenizer is not None
+            else get_qualification_tokenizer(
+                model_dir=model_dir, require_real=require_real_tokenizer
+            )
+        )
+    except QualificationError as exc:
+        return {
+            "status": "UNQUALIFIED_MEMLENS_SOURCE",
+            "dataset_path": str(dataset_json),
+            "dataset_size_bytes": size_bytes,
+            "dataset_sha256": dataset_sha,
+            "error": f"Tokenizer qualification failed: {exc}",
+        }
+
     with tempfile.TemporaryDirectory() as tmp_dir_str:
         tmp_dir = Path(tmp_dir_str)
         tmp_raw = tmp_dir / "sample_memlens_raw.json"
         tmp_raw.write_text(json.dumps([sample_questions[0]]), encoding="utf8")
 
-        # Mock images directory structure if needed
+        # Copy referenced images strictly with containment check (no b"mock_img" fabrication)
         tmp_images_root = tmp_dir / "images_root"
         tmp_images_root.mkdir(parents=True, exist_ok=True)
         sample_turn_images = []
         for session in sample_questions[0]["haystack_sessions"]:
             for turn in session:
                 for img_ref in turn.get("images", []):
-                    rel = Path(img_ref["file"])
-                    src_real = dataset_dir / "release_images" / rel
-                    dst_tmp = tmp_images_root / "release_images" / rel
+                    img_file = img_ref.get("file")
+                    if not isinstance(img_file, str) or not img_file.strip():
+                        return {
+                            "status": "UNQUALIFIED_MEMLENS_SOURCE",
+                            "dataset_path": str(dataset_json),
+                            "dataset_size_bytes": size_bytes,
+                            "dataset_sha256": dataset_sha,
+                            "error": f"Invalid or missing image file reference: {img_ref}",
+                        }
+                    rel = Path(img_file.strip())
+                    if (
+                        "\\" in img_file
+                        or rel.is_absolute()
+                        or img_file.startswith("/")
+                        or any(part in ("..", "") for part in rel.parts)
+                        or ".." in rel.parts
+                    ):
+                        return {
+                            "status": "UNQUALIFIED_MEMLENS_SOURCE",
+                            "dataset_path": str(dataset_json),
+                            "dataset_size_bytes": size_bytes,
+                            "dataset_sha256": dataset_sha,
+                            "error": f"Path traversal in MemLens image reference: {img_file!r}",
+                        }
+                    src_real = (dataset_dir / "release_images" / rel).resolve()
+                    if not src_real.is_relative_to(dataset_dir.resolve()) or not src_real.is_file():
+                        return {
+                            "status": "UNQUALIFIED_MEMLENS_SOURCE",
+                            "dataset_path": str(dataset_json),
+                            "dataset_size_bytes": size_bytes,
+                            "dataset_sha256": dataset_sha,
+                            "error": f"Referenced MemLens source image missing on Drive: {src_real}",
+                        }
+                    dst_tmp = (tmp_images_root / "release_images" / rel).resolve()
+                    if not dst_tmp.is_relative_to(tmp_images_root.resolve()):
+                        return {
+                            "status": "UNQUALIFIED_MEMLENS_SOURCE",
+                            "dataset_path": str(dataset_json),
+                            "dataset_size_bytes": size_bytes,
+                            "dataset_sha256": dataset_sha,
+                            "error": f"Destination path escapes temporary directory: {dst_tmp}",
+                        }
                     dst_tmp.parent.mkdir(parents=True, exist_ok=True)
-                    if src_real.is_file():
-                        shutil.copy2(src_real, dst_tmp)
-                    else:
-                        dst_tmp.write_bytes(b"mock_img")
+                    shutil.copy2(src_real, dst_tmp)
                     sample_turn_images.append(rel)
 
         tmp_native = tmp_dir / "native.jsonl"
@@ -499,6 +651,19 @@ def qualify_memlens_assets(
             tolerance=tolerance,
         )
 
+    emitted_bins = bin_summary.get("lengths_emitted")
+    if emitted_bins is None:
+        emitted_bins = [
+            int(k)
+            for k, count in bin_summary.get("counts_per_bin", {}).items()
+            if count > 0
+        ]
+    is_synth = getattr(tok, "is_synthetic", tokenizer is None)
+    tok_type = getattr(
+        tok, "tokenizer_type", "custom" if tokenizer is not None else "synthetic_character_fallback"
+    )
+    tok_label = "SYNTHETIC_PROXY" if is_synth else "OFFICIAL_MODEL_TOKENIZER"
+
     return {
         "status": "QUALIFIED_MEMLENS_SOURCE",
         "dataset_path": str(dataset_json),
@@ -516,9 +681,12 @@ def qualify_memlens_assets(
             "context_bin_generation_verified": True,
             "tested_tolerance": tolerance,
             "tolerance_bounded_lte_0_05": tolerance <= 0.05,
+            "tokenizer_label": tok_label,
+            "tokenizer_type": tok_type,
+            "tokenizer_is_synthetic": is_synth,
             "normalized_records": norm_summary.get("count", 0),
             "derived_records_emitted": bin_summary.get("derived_records", 0),
-            "derived_bins_emitted": bin_summary.get("lengths_emitted", []),
+            "derived_bins_emitted": emitted_bins,
             "skip_reasons": bin_summary.get("skip_reasons", {}),
         },
     }
@@ -663,6 +831,7 @@ def qualify_all_drive_assets(
     tolerance: float = 0.05,
     compute_shards_sha: bool = True,
     sample_limit: int = 5,
+    require_real_tokenizer: bool = False,
 ) -> dict[str, Any]:
     """Execute complete read-only dataset and model qualification against Google Drive.
 
@@ -700,7 +869,10 @@ def qualify_all_drive_assets(
         root, sample_limit=sample_limit
     )
     memlens_res = qualify_memlens_assets(
-        root, sample_limit=sample_limit, tolerance=tolerance
+        root,
+        sample_limit=sample_limit,
+        tolerance=tolerance,
+        require_real_tokenizer=require_real_tokenizer,
     )
 
     # Verify read-only guarantee

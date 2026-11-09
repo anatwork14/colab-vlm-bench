@@ -13,6 +13,8 @@ import pytest
 from vlmbench.datasets.amber import AMBER_UPSTREAM_MANIFEST
 from vlmbench.qualification import (
     DeterministicSimpleTokenizer,
+    QualificationError,
+    get_qualification_tokenizer,
     qualify_all_drive_assets,
     qualify_amber_assets,
     qualify_memlens_assets,
@@ -360,3 +362,237 @@ def test_deterministic_simple_tokenizer():
     assert len(ids) == len(text)
     decoded = tok.decode(ids)
     assert decoded == text
+    assert tok.is_synthetic is True
+    assert tok.tokenizer_type == "synthetic_character_fallback"
+
+
+# ---------------------------------------------------------------------------
+# RCS-01 Regression Tests: Path traversal & ambiguous basename matches
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "evil_img",
+    [
+        "../../../etc/passwd",
+        "/tmp/evil.jpg",
+        "/etc/shadow",
+        "..\\evil.jpg",
+        "nested/../../escaped.jpg",
+    ],
+)
+def test_qualify_amber_assets_path_traversal_rejected(tmp_path, evil_img):
+    zip_path = tmp_path / "Research/Topic/Speculative Decoding/STARLIGHT/amber/_archives/AMBER.zip"
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+    query_all = [
+        {
+            "id": 1,
+            "image": evil_img,
+            "query": "Is there a dog?",
+            "task": "discriminative",
+            "type": "existence",
+        }
+    ]
+    annotations = {
+        "annotations": [
+            {"id": 1, "task": "discriminative", "type": "existence", "label": "Yes"}
+        ]
+    }
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("data/query/query_all.json", json.dumps(query_all))
+        zf.writestr("data/query/query_generative.json", json.dumps([]))
+        zf.writestr("data/query/query_discriminative.json", json.dumps(query_all))
+        zf.writestr("data/annotation/annotations.json", json.dumps(annotations))
+        zf.writestr("image/dummy.jpg", b"mock")
+
+    res = qualify_amber_assets(tmp_path)
+    assert res["status"] == "UNQUALIFIED_AMBER_SOURCE"
+    assert "Path traversal" in res.get("error", "") or "traversal" in res.get("error", "").lower()
+
+
+def test_qualify_amber_assets_ambiguous_basename_rejected(tmp_path):
+    zip_path = tmp_path / "Research/Topic/Speculative Decoding/STARLIGHT/amber/_archives/AMBER.zip"
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+    query_all = [
+        {
+            "id": 1,
+            "image": "shared_name.jpg",
+            "query": "Is there a dog?",
+            "task": "discriminative",
+            "type": "existence",
+        }
+    ]
+    annotations = {
+        "annotations": [
+            {"id": 1, "task": "discriminative", "type": "existence", "label": "Yes"}
+        ]
+    }
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("data/query/query_all.json", json.dumps(query_all))
+        zf.writestr("data/query/query_generative.json", json.dumps([]))
+        zf.writestr("data/query/query_discriminative.json", json.dumps(query_all))
+        zf.writestr("data/annotation/annotations.json", json.dumps(annotations))
+        zf.writestr("folder_a/shared_name.jpg", b"bytes_a")
+        zf.writestr("folder_b/shared_name.jpg", b"bytes_b")
+
+    res = qualify_amber_assets(tmp_path)
+    assert res["status"] == "UNQUALIFIED_AMBER_SOURCE"
+    assert "Ambiguous image" in res.get("error", "")
+
+
+def test_qualify_amber_assets_missing_image_in_zip_fails(tmp_path):
+    zip_path = tmp_path / "Research/Topic/Speculative Decoding/STARLIGHT/amber/_archives/AMBER.zip"
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+    query_all = [
+        {
+            "id": 1,
+            "image": "missing.jpg",
+            "query": "Is there a dog?",
+            "task": "discriminative",
+            "type": "existence",
+        }
+    ]
+    annotations = {
+        "annotations": [
+            {"id": 1, "task": "discriminative", "type": "existence", "label": "Yes"}
+        ]
+    }
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("data/query/query_all.json", json.dumps(query_all))
+        zf.writestr("data/query/query_generative.json", json.dumps([]))
+        zf.writestr("data/query/query_discriminative.json", json.dumps(query_all))
+        zf.writestr("data/annotation/annotations.json", json.dumps(annotations))
+        zf.writestr("image/other.jpg", b"other")
+
+    res = qualify_amber_assets(tmp_path)
+    assert res["status"] == "UNQUALIFIED_AMBER_SOURCE"
+    assert "not found in AMBER.zip" in res.get("error", "")
+
+
+# ---------------------------------------------------------------------------
+# RCS-03 Regression Tests: Missing image fail (no mock bytes), tokenizer checks,
+# and derived_bins_emitted reporting
+# ---------------------------------------------------------------------------
+
+
+def test_qualify_memlens_assets_missing_image_fails_without_fabrication(tmp_path):
+    memlens_dir = tmp_path / "Research/Topic/Speculative Decoding/STARLIGHT/memlens"
+    memlens_dir.mkdir(parents=True, exist_ok=True)
+    needle_dir = memlens_dir / "release_images" / "needle_images"
+    haystack_dir = memlens_dir / "release_images" / "haystack_images"
+    needle_dir.mkdir(parents=True, exist_ok=True)
+    haystack_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_item = {
+        "question_id": "ml_missing_img_1",
+        "question_type": "single_needle",
+        "question": "What is the answer?",
+        "answer": "Answer",
+        "haystack_session_ids": ["s1"],
+        "haystack_dates": ["2026-01-01"],
+        "haystack_sessions": [
+            [
+                {
+                    "role": "user",
+                    "content": "Look at this.",
+                    "images": [{"file": "needle_images/strictly_missing.jpg"}],
+                },
+                {"role": "assistant", "content": "Done."},
+            ],
+        ],
+    }
+    (memlens_dir / "dataset_32k.json").write_text(json.dumps([raw_item]), encoding="utf8")
+
+    res = qualify_memlens_assets(tmp_path, tolerance=0.05)
+    assert res["status"] == "UNQUALIFIED_MEMLENS_SOURCE"
+    assert "Referenced MemLens source image missing on Drive" in res["error"]
+
+
+@pytest.mark.parametrize(
+    "evil_file",
+    [
+        "../../../etc/passwd",
+        "/etc/shadow",
+        "needle_images/../../evil.jpg",
+        "..\\evil.jpg",
+    ],
+)
+def test_qualify_memlens_assets_path_traversal_rejected(tmp_path, evil_file):
+    memlens_dir = tmp_path / "Research/Topic/Speculative Decoding/STARLIGHT/memlens"
+    memlens_dir.mkdir(parents=True, exist_ok=True)
+    needle_dir = memlens_dir / "release_images" / "needle_images"
+    haystack_dir = memlens_dir / "release_images" / "haystack_images"
+    needle_dir.mkdir(parents=True, exist_ok=True)
+    haystack_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_item = {
+        "question_id": "ml_evil_img_1",
+        "question_type": "single_needle",
+        "question": "What is the answer?",
+        "answer": "Answer",
+        "haystack_session_ids": ["s1"],
+        "haystack_dates": ["2026-01-01"],
+        "haystack_sessions": [
+            [
+                {
+                    "role": "user",
+                    "content": "Look at this.",
+                    "images": [{"file": evil_file}],
+                },
+                {"role": "assistant", "content": "Done."},
+            ],
+        ],
+    }
+    (memlens_dir / "dataset_32k.json").write_text(json.dumps([raw_item]), encoding="utf8")
+
+    res = qualify_memlens_assets(tmp_path, tolerance=0.05)
+    assert res["status"] == "UNQUALIFIED_MEMLENS_SOURCE"
+    assert "traversal" in res["error"].lower()
+
+
+def test_get_qualification_tokenizer_require_real_fails_when_missing(tmp_path):
+    empty_dir = tmp_path / "non_existent_model"
+
+    # require_real=True must raise QualificationError when real model tokenizer unavailable
+    with pytest.raises(QualificationError, match="Model directory .* does not contain required tokenizer"):
+        get_qualification_tokenizer(empty_dir, require_real=True)
+
+    with pytest.raises(QualificationError, match="no model_dir provided"):
+        get_qualification_tokenizer(None, require_real=True)
+
+    # require_real=False falls back to synthetic and labels it explicitly
+    tok = get_qualification_tokenizer(empty_dir, require_real=False)
+    assert tok.is_synthetic is True
+    assert tok.tokenizer_type == "synthetic_character_fallback"
+
+
+def test_qualify_memlens_require_real_tokenizer_fails_without_model(tmp_path):
+    memlens_dir = tmp_path / "Research/Topic/Speculative Decoding/STARLIGHT/memlens"
+    _create_mock_memlens_tree(memlens_dir)
+
+    res = qualify_memlens_assets(tmp_path, require_real_tokenizer=True)
+    assert res["status"] == "UNQUALIFIED_MEMLENS_SOURCE"
+    assert "Tokenizer qualification failed" in res["error"]
+
+
+def test_memlens_derived_bins_emitted_reporting(tmp_path):
+    memlens_dir = tmp_path / "Research/Topic/Speculative Decoding/STARLIGHT/memlens"
+    _create_mock_memlens_tree(memlens_dir)
+
+    res = qualify_memlens_assets(tmp_path, tolerance=0.05)
+    assert res["status"] == "QUALIFIED_MEMLENS_SOURCE"
+    schema = res["schema_compatibility"]
+
+    # Verify derived_bins_emitted reports the actual integer bins emitted (e.g. [128, 512])
+    assert isinstance(schema["derived_bins_emitted"], list)
+    assert len(schema["derived_bins_emitted"]) > 0
+    assert 128 in schema["derived_bins_emitted"]
+    assert schema["derived_records_emitted"] > 0
+
+    # Verify tokenizer labeling
+    assert schema["tokenizer_label"] == "SYNTHETIC_PROXY"
+    assert schema["tokenizer_is_synthetic"] is True
+    assert schema["tokenizer_type"] == "synthetic_character_fallback"
