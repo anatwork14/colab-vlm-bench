@@ -11,15 +11,16 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .artifacts import atomic_json, sha256, staged_copy, sync_files
+from .artifacts import atomic_json, code_identity, sha256, staged_copy, sync_files
 from .config import cell_id, fingerprint, load_config, plan_summary, planned_cells, selected_scope
 from .execution_safety import require_compute_approval
 from .datasets import normalize_memlens, normalize_mmlong
 from .engine import a100_inventory, server_argv, start_server, stop_server, wait_ready
 from .quality import import_official, score_proxy
 from .report import write_report
-from .workloads import load_jsonl
-from .bench import run_performance_cell, run_quality_predictions
+from .workloads import WorkloadError, load_jsonl, sample_digest
+from .bench import eligible_pool, run_performance_cell, run_quality_predictions, select_cell_samples
+from .resume import COMPLETED, NON_COMPLETE, MISSING, classify_cell_receipt, quarantine_cell_receipts
 from .methods import manifest_from_path, plan as methods_plan, native_mode_or_block, blocked_method_receipt, MethodUnqualified
 from .hallucination import read_annotations, score_evidence_annotations
 
@@ -39,6 +40,47 @@ def _persist_error(root: Path, drive_root: Path, tag: str, message: str) -> None
     atomic_json(root / "run_status.json", {"status": tag, "error": message,
                 "recorded_utc": datetime.now(timezone.utc).isoformat()})
     sync_files(root, drive_root)
+
+
+SERVING_CONTRACT = {
+    "execution_pass": "FIXED_OUTPUT_SERVING_256",
+    "output_contract": {"max_tokens": 256, "min_tokens": 256, "ignore_eos": True},
+}
+
+
+def _serving_identity(config_sha256: str, dataset_sha256: str) -> dict:
+    """What a serving receipt must match to be skipped on resume (see resume.py)."""
+    return {"config_sha256": config_sha256, "dataset_sha256": dataset_sha256,
+            "code_sha256": code_identity(), **SERVING_CONTRACT}
+
+
+def _expected_sample_sha(cfg: dict, cell: dict, rows: list[dict], model_id: str) -> str | None:
+    try:
+        _, measured = select_cell_samples(eligible_pool(cfg, cell, rows, model_id), cell)
+    except WorkloadError:
+        return None
+    return sample_digest(measured)
+
+
+def _classify_serving_cells(cfg, cells, root, derived_path, dataset_id, track, model_id, identity):
+    """Map cell_id -> (state, reason). Rows are loaded only if a receipt exists to verify."""
+    result, cache = {}, {}
+
+    def rows_once():
+        if "rows" not in cache:
+            cache["rows"] = load_jsonl(derived_path, dataset=dataset_id, track=track)
+        return cache["rows"]
+
+    for cell in cells:
+        cid = cell_id(cell)
+        path = root / "cells" / f"{cid}.json"
+        if not path.is_file():
+            result[cid] = (MISSING, "no receipt")
+            continue
+        result[cid] = classify_cell_receipt(
+            path, identity, cell,
+            lambda cell=cell: _expected_sample_sha(cfg, cell, rows_once(), model_id))
+    return result
 
 
 def run_job(args) -> int:
@@ -82,11 +124,13 @@ def run_job(args) -> int:
     proc = None
     try:
         native_path, derived_path = Path(ds["native_path"]), Path(ds["derived_path"])
+        derived_hash = sha256(derived_path) if derived_path.is_file() else "NOT_AVAILABLE"
         if args.quality and not native_path.is_file():
             raise FileNotFoundError("Quality needs complete native Drive JSONL")
         if not args.quality and not derived_path.is_file():
             raise FileNotFoundError("Serving needs derived, processor-annotated Drive JSONL")
 
+        cell_states: dict = {}
         # Run CPU-only readiness and SSD/RAM checks BEFORE staging weights and
         # launching vLLM. Avoid billable GPU time for deterministic missing-data
         # errors. These checks do not claim a GPU inference pass.
@@ -111,9 +155,32 @@ def run_job(args) -> int:
                 if x["model"] == args.model and x["dataset"] == args.dataset
                 and x["mode"] == args.mode
             ]
+            # F-05: only a COMPLETED receipt (same config, dataset, code, sample set) is skipped.
+            # Failed or stale receipts stop the job before any GPU work unless the operator
+            # explicitly requests a requeue, which quarantines them first.
+            identity = _serving_identity(fingerprint(cfg), derived_hash)
+            cell_states = _classify_serving_cells(
+                cfg, scoped_cells, root, derived_path, ds["id"],
+                "amber_serving" if ds["id"] == "amber" else "derived_serving",
+                args.model, identity)
+            non_complete = [
+                {"cell": cid, "state": state, "reason": reason}
+                for cid, (state, reason) in cell_states.items() if state in NON_COMPLETE
+            ]
+            if non_complete and not getattr(args, "requeue_nonpass", False):
+                atomic_json(root / "run_status.json", {
+                    "status": "BLOCKED_NONCOMPLETE_RECEIPTS", "job": job_key,
+                    "receipts": non_complete,
+                    "hint": "Inspect these receipts. Re-run with --requeue-nonpass to quarantine "
+                            "them (nothing is deleted) and re-measure those cells.",
+                })
+                sync_files(root, drive_root)
+                print(json.dumps({"status": "BLOCKED_NONCOMPLETE_RECEIPTS",
+                                  "count": len(non_complete)}), flush=True)
+                return 2
             pending_cells = [
                 cell for cell in scoped_cells
-                if not (root / "cells" / f"{cell_id(cell)}.json").is_file()
+                if cell_states[cell_id(cell)][0] != COMPLETED
             ]
             if not pending_cells:
                 write_report(root, cfg)
@@ -215,7 +282,6 @@ def run_job(args) -> int:
             "campaign_sha256": fp,
             "recorded_utc": datetime.now(timezone.utc).isoformat(),
         })
-        derived_hash = sha256(derived_path) if derived_path.is_file() else "NOT_AVAILABLE"
         native_hash = sha256(native_path) if native_path.is_file() else "NOT_AVAILABLE"
         job_manifest = {"dataset": ds["id"], "model": args.model, "mode": args.mode,
                         "execution_pass": ("NATURAL_EOS_QUALITY" if args.quality
@@ -256,23 +322,23 @@ def run_job(args) -> int:
                  if x["model"] == args.model and x["dataset"] == args.dataset and x["mode"] == args.mode]
         done = 0
         pilot_failure = None
+        requeued: list[dict] = []
         limit = args.max_cells if args.max_cells > 0 else int(cfg["performance"]["max_cells_per_session"])
         if args.quality:
             cells = []
         for cell in cells:
-            # Resume independently at cell level; a full successful cell does not consume job cap.
-            existing = root / "cells" / f"{cell_id(cell)}.json"
-            if existing.is_file():
-                old = json.loads(existing.read_text(encoding="utf8"))
-                if (old.get("status") == "PASS_MEASURED"
-                        and old.get("config_sha256") == fp
-                        and old.get("dataset_sha256") == derived_hash
-                        and old.get("cell") == cell):
-                    continue
-                # Prevent accidental overwrite of failures in the same campaign.
+            # Resume at cell level: only COMPLETED cells are skipped and do not consume the cap.
+            cid = cell_id(cell)
+            state, reason = cell_states.get(cid, (MISSING, "no receipt"))
+            if state == COMPLETED:
                 continue
             if limit and done >= limit:
                 break
+            if state in NON_COMPLETE:
+                # Requeue requested (the default path already refused). Quarantine, never delete.
+                moved = quarantine_cell_receipts(
+                    root, drive_root, [cid], datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
+                requeued.append({"cell": cid, "state": state, "reason": reason, "moved": moved})
             result = asyncio.run(run_performance_cell(
                 cfg, cell, rows, root, drive_root, args.model, derived_hash))
             done += 1
@@ -294,6 +360,7 @@ def run_job(args) -> int:
         atomic_json(root / "run_status.json", {
             "status": "JOB_PILOT_STOPPED_ON_FAILURE" if pilot_failure else "JOB_PARTIAL_OR_COMPLETE",
             "pilot_failure": pilot_failure,
+            "requeued_nonpass": requeued,
             "model": args.model, "mode": args.mode, "dataset": ds["id"],
             "cells_attempted_this_invocation": done,
             "gpu": inventory, "note": "GPU model execution does not certify native MTP correctness",
@@ -369,6 +436,8 @@ def main(argv=None):
     job.add_argument("--dataset", choices=["memlens", "mmlongbench_doc", "amber"], required=True)
     job.add_argument("--max-cells", type=int, default=0)
     job.add_argument("--quality", action="store_true")
+    job.add_argument("--requeue-nonpass", action="store_true",
+                     help="Quarantine (never delete) FAILED/STALE/INVALID cell receipts and re-run them.")
     job.add_argument("--approve-paid", dest="owner_approved_compute", action="store_true")
 
     report = sub.add_parser("report")

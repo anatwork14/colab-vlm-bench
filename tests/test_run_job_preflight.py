@@ -55,19 +55,25 @@ def test_zero_eligible_cells_returns_before_cuda_staging(monkeypatch, tmp_path):
     assert run["status"] == "BLOCKED_NO_ELIGIBLE_CELLS"
 
 
-def test_existing_all_cell_receipts_skip_gpu_even_if_ready(monkeypatch, tmp_path):
+def test_error_receipts_block_gpu_instead_of_being_skipped(monkeypatch, tmp_path):
+    # F-05/F-06: ERROR/unidentified receipts are not "recorded success". They must
+    # not be skipped into a success exit; without --requeue-nonpass the job stops
+    # before any GPU work and the receipts are left byte-identical.
     cfg, args = _prepare(monkeypatch, tmp_path)
     root = Path(cfg["storage"]["local_scratch_dir"]) / cfg["campaign_id"]
+    before = {}
     for cell in planned_cells(cfg):
         if (cell["dataset"], cell["model"], cell["mode"]) == ("memlens", "qwen35_08b", "base"):
-            atomic_json(root / "cells" / (cell_id(cell) + ".json"),
-                        {"cell": cell, "status": "ERROR", "metrics": {}})
+            path = root / "cells" / (cell_id(cell) + ".json")
+            atomic_json(path, {"cell": cell, "status": "ERROR", "metrics": {}})
+            before[path] = path.read_bytes()
     monkeypatch.setattr(cli, "serving_readiness",
                         lambda *a, **kw: (_ for _ in ()).throw(
-                            AssertionError("All cells recorded, readiness scan unnecessary")))
-    assert cli.run_job(args) == 0
+                            AssertionError("Blocked before readiness scan")))
+    assert cli.run_job(args) == 2
     run = json.loads((root / "run_status.json").read_text())
-    assert run["status"] == "NO_PENDING_CELLS_NO_GPU_START"
+    assert run["status"] == "BLOCKED_NONCOMPLETE_RECEIPTS"
+    assert all(path.read_bytes() == data for path, data in before.items())
 
 
 def test_quality_image_limit_fails_without_gpu(monkeypatch, tmp_path):
