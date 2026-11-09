@@ -74,3 +74,11 @@ def test_h2o_calibrated_to_starlight_mean_retention_matches_it_within_one_entry(
 
     cal = calibrate_h2o_ratio_to_retained(measure, star_mean, len(PROMPT), min_budget=1)
     assert abs(cal["measured_mean_retained"] - star_mean) <= 1.0, (star_mean, cal)
+
+
+@pytest.mark.parametrize("arm", ["base", "h2o_base", "starlight_s1"])
+def test_memory_fields_state_the_scope_per_decode_step_prefill_unbounded(arm):
+    # ITER2 D4 S-8 (lead ruling): any memory field must say what it covers.
+    res = _run(arm)
+    acct = res.telemetry["kv_memory_accounting"]
+    assert acct["scope"] == "per decode step, prefill cache unbounded", acct
