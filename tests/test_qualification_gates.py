@@ -134,3 +134,33 @@ def test_failed_gate_makes_verdict_name_the_failing_tests():
     tests["test_f_fixed_output_serving"] = {"status": "FAIL", "error": "256 tokens expected"}
     assert qual.verdict_for(tests) == "INCOMPLETE_OR_FAILED: test_f_fixed_output_serving"
     assert qual.verdict_for(_all_passing_tests()) == "PRETRAINED_FORWARD_AND_MTP_PROPOSAL_DIAGNOSTIC_ONLY"
+
+
+# ITER2 D2b G-03/G-05/G-06: reporting uses current telemetry names; "not verified" is null.
+
+def test_round_or_none_keeps_not_verified_as_null():
+    assert qual._round_or_none(None) is None
+    assert qual._round_or_none(0.123456) == 0.1235
+
+
+def test_script_no_longer_uses_removed_or_fabricated_fields():
+    src = SCRIPT.read_text(encoding="utf8")
+    assert "logical_selection_fraction" not in src, "removed field; use h2o_logical_selection_accounting"
+    assert "mtp_acceptance_rate == 0.0" not in src, "acceptance is not verified here: assert null, never zero"
+    assert '"mtp_acceptance_rate": 0.0' not in src
+    assert "res.mtp_acceptance_rate is None" in src
+
+
+def test_reported_result_fields_exist_on_current_execution_result():
+    from dataclasses import fields
+    from vlmbench.infrastructure.real_engine import RealExecutionResult
+
+    names = {f.name for f in fields(RealExecutionResult)}
+    for name in (
+        "per_step_evicted_slot_rate",
+        "attention_read_restriction_ratio",
+        "attention_mask_restriction_ratio",
+        "mtp_acceptance_rate",
+        "physical_kv_bytes_freed",
+    ):
+        assert name in names, f"{name} is not a field of RealExecutionResult"

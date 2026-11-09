@@ -311,7 +311,10 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
         # Verify arm-specific interventions & P1-03 cost accounting
         if "h2o" in arm:
             assert res.physical_kv_bytes_freed > 0, f"{arm}: expected nonzero per-step KV tensor footprint deltas"
-            assert res.logical_selection_fraction > 0.0, f"{arm} must report logical selection fraction > 0"
+            h2o_acc = res.telemetry["h2o_logical_selection_accounting"]
+            assert h2o_acc["final_retained_fraction"] is not None and h2o_acc["final_retained_fraction"] > 0.0, (
+                f"{arm} must retain a nonzero logical selection after decoding"
+            )
         if "da" in arm:
             assert res.attention_mask_restriction_ratio > 0.0
             assert res.physical_kv_bytes_freed == 0, f"{arm} (P1-03) must report physical_kv_bytes_freed == 0"
@@ -337,10 +340,11 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
             "physical_kv_bytes_freed": res.physical_kv_bytes_freed,
             "kv_memory_accounting": res.telemetry["kv_memory_accounting"],
             "mtp_candidate_diagnostic": res.telemetry["mtp_candidate_diagnostic"],
-            "logical_selection_fraction": round(res.logical_selection_fraction, 4),
-            "attention_mask_restriction_ratio": round(res.attention_mask_restriction_ratio, 4),
+            "per_step_evicted_slot_rate": _round_or_none(res.per_step_evicted_slot_rate),
+            "attention_read_restriction_ratio": _round_or_none(res.attention_read_restriction_ratio),
+            "attention_mask_restriction_ratio": _round_or_none(res.attention_mask_restriction_ratio),
             "grounded_citations_count": len(res.grounded_citations),
-            "mtp_acceptance_rate": round(res.mtp_acceptance_rate, 4),
+            "mtp_acceptance_rate": _round_or_none(res.mtp_acceptance_rate),  # null = not verified
             "architectural_status": res.telemetry["architectural_status"],
             "pretrained_tensors_loaded": res.telemetry["pretrained_weights"]["loaded_tensors_count"],
             "parameter_coverage_ratio": res.telemetry["pretrained_weights"]["parameter_coverage_ratio"],
@@ -446,9 +450,11 @@ def run_test_e_speculative_correctness(model_dir: Path, fixture_path: Path, devi
     assert res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS"
     assert res.gates["MTP_CORRECTNESS_PASS"] == "GATED_NATIVE_MTP_VERIFIER_REQUIRED"
     assert res.gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS"
-    assert res.mtp_acceptance_rate == 0.0
+    # Acceptance is NOT verified on this path (no native MTP verifier): it is null, never zero.
+    assert res.mtp_acceptance_rate is None, "unverified acceptance must be null, not a measured rate"
     assert res.physical_kv_bytes_freed > 0, "H2O diagnostic must show KV tensor footprint compaction"
-    assert 0.0 <= res.mtp_acceptance_rate <= 1.0
+    if res.mtp_acceptance_rate is not None:
+        assert 0.0 <= res.mtp_acceptance_rate <= 1.0
 
     engine.close()
     # Paired greedy-equivalence: the MTP diagnostic must NEVER change target
@@ -470,7 +476,7 @@ def run_test_e_speculative_correctness(model_dir: Path, fixture_path: Path, devi
     result = {
         "claim_scope": "DIAGNOSTIC_ONLY",
         "duration_s": round(dt, 3),
-        "mtp_acceptance_rate": 0.0,
+        "mtp_acceptance_rate": res.mtp_acceptance_rate,  # null = not verified
         "proposal_match_rate": mtp_diag["proposal_match_rate"],
         "greedy_target_equivalence": True,
         "legacy_physical_kv_freed_bytes": res.physical_kv_bytes_freed,
@@ -657,6 +663,11 @@ def compute_release_gates(tests: dict[str, dict[str, Any]], device_name: str) ->
 def verdict_for(tests: dict[str, dict[str, Any]]) -> str:
     failed = [name for name in EXPECTED_TESTS if _test_status(tests.get(name)) != "PASS"]
     return OK_VERDICT if not failed else "INCOMPLETE_OR_FAILED: " + ", ".join(failed)
+
+
+def _round_or_none(value: float | None, digits: int = 4) -> float | None:
+    """Null stays null: an unmeasured quantity must never be reported as zero."""
+    return None if value is None else round(float(value), digits)
 
 
 def gate_evidence(tests: dict[str, dict[str, Any]]) -> dict[str, Any]:
