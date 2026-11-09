@@ -60,7 +60,7 @@ def test_da_h2o_conflict_resolved_by_protection_and_audited():
     assert "vetoed" in d0.reason
     assert 0 in plan.retained
     assert plan.h2o_candidates_vetoed == 1
-    assert plan.conflicts_by_source == {"da": 1, "grounding": 0}
+    assert plan.conflicts_by_source == {"da": 1, "grounding": 0, "structural": 0}
 
 
 def test_grounding_h2o_conflict_resolved_by_protection_and_audited():
@@ -68,14 +68,14 @@ def test_grounding_h2o_conflict_resolved_by_protection_and_audited():
     d6 = plan.decisions[6]
     assert d6.decision == DECISION_RETAIN_PROTECTED_VETOED
     assert d6.signals_fired == ("grounding:ev_x",)
-    assert plan.conflicts_by_source == {"da": 0, "grounding": 1}
+    assert plan.conflicts_by_source == {"da": 0, "grounding": 1, "structural": 0}
     assert 6 in plan.retained
 
 
 def test_entry_protected_by_both_sources_is_one_vetoed_entry_two_conflict_events():
     plan = _plan(length=6, budget=5, candidates=[2, 3], da={2: ("focus",)}, grounding={2: ("ev",)})
     assert plan.h2o_candidates_vetoed == 1
-    assert plan.conflicts_by_source == {"da": 1, "grounding": 1}
+    assert plan.conflicts_by_source == {"da": 1, "grounding": 1, "structural": 0}
     assert plan.decisions[2].signals_fired == ("da:focus", "grounding:ev")
     assert plan.evicted == (3,)
 

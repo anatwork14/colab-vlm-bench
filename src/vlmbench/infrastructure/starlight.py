@@ -36,14 +36,22 @@ DECISION_RETAIN_PROTECTED_VETOED = "RETAIN_PROTECTED_VETOED_H2O_CANDIDATE"
 DECISION_RETAIN_PROTECTED = "RETAIN_PROTECTED"
 DECISION_RETAIN_H2O_KEPT = "RETAIN_H2O_KEPT"
 
-SIGNAL_SOURCES: tuple[str, ...] = ("da", "grounding")
+SIGNAL_SOURCES: tuple[str, ...] = ("da", "grounding", "structural")
 
 # Closed enum of per-entry reason codes (auditor oracle I-3). Every decision carries one.
 REASON_EVICT = "H2O_CANDIDATE_UNPROTECTED"
-REASON_VETOED = "H2O_CANDIDATE_VETOED_BY_PROTECTION"
+REASON_VETOED_DA = "H2O_CANDIDATE_VETOED_BY_DA"
+REASON_VETOED_GROUNDING = "H2O_CANDIDATE_VETOED_BY_GROUNDING"
+REASON_VETOED_STRUCTURAL = "H2O_CANDIDATE_VETOED_BY_STRUCTURAL"
 REASON_PROTECTED = "PROTECTED_NOT_H2O_CANDIDATE"
 REASON_KEPT = "H2O_KEPT"
-REASON_CODES: tuple[str, ...] = (REASON_EVICT, REASON_VETOED, REASON_PROTECTED, REASON_KEPT)
+REASON_CODES: tuple[str, ...] = (
+    REASON_EVICT, REASON_VETOED_DA, REASON_VETOED_GROUNDING, REASON_VETOED_STRUCTURAL,
+    REASON_PROTECTED, REASON_KEPT,
+)
+# Unmet-budget reasons (lead decision Q3): explicit, never an exception.
+INFEASIBLE_PROTECTED = "protected_exceeds_budget"
+INFEASIBLE_UNMET_AFTER_ELIGIBLE = "budget_unmet_after_eligible_eviction"
 
 
 @dataclass(frozen=True)
@@ -72,6 +80,7 @@ class StarlightLayerPlan:
     evicted: tuple[int, ...]
     decisions: tuple[EntryDecision, ...]
     h2o_candidates_vetoed: int
+    infeasible_reason: str = ""
     conflicts_by_source: dict[str, int] = field(default_factory=dict)
     protected_count_by_source: dict[str, int] = field(default_factory=dict)
     measurement_label: str = MEASUREMENT_LABEL
@@ -105,6 +114,15 @@ def _validate_labels(source: str, index: int, labels: Any) -> tuple[str, ...]:
             f"labels for protected index {index} from source '{source}' must be non-empty strings"
         )
     return tuple(labels)
+
+
+def _veto_code(fired: Sequence[str]) -> str:
+    """Reason code for a vetoed candidate: the highest-precedence source that fired (DA, grounding, structural)."""
+    if any(sig.startswith("da:") for sig in fired):
+        return REASON_VETOED_DA
+    if any(sig.startswith("grounding:") for sig in fired):
+        return REASON_VETOED_GROUNDING
+    return REASON_VETOED_STRUCTURAL
 
 
 def plan_starlight_layer(
@@ -172,11 +190,14 @@ def plan_starlight_layer(
             )
     protected = set(fired_by_index)
 
+    infeasible_reason = ""
     if len(protected) > budget:
         status = STATUS_INFEASIBLE
+        infeasible_reason = INFEASIBLE_PROTECTED
     else:
         status = STATUS_OK
         if length <= budget and candidates:
+            # Caller error: an eviction candidate was supplied although nothing needs to go.
             raise ValueError(
                 f"candidates supplied although length {length} <= budget {budget}: "
                 "no eviction is allowed within budget"
@@ -185,10 +206,9 @@ def plan_starlight_layer(
     eligible = candidates - protected
     retained_set = set(range(length)) - eligible
     if status == STATUS_OK and len(retained_set) > budget:
-        raise ValueError(
-            f"candidate set would retain {len(retained_set)} entries > budget {budget}: "
-            "candidate set is inconsistent with the budget"
-        )
+        # Budget unmet after evicting every eligible candidate (lead decision Q3): explicit status.
+        status = STATUS_INFEASIBLE
+        infeasible_reason = INFEASIBLE_UNMET_AFTER_ELIGIBLE
 
     vetoed = candidates & protected
     conflicts = {src: 0 for src in SIGNAL_SOURCES}
@@ -207,7 +227,7 @@ def plan_starlight_layer(
         elif is_cand and is_prot:
             decision = DECISION_RETAIN_PROTECTED_VETOED
             reason = f"h2o candidate vetoed: protected by {', '.join(fired)}"
-            code = REASON_VETOED
+            code = _veto_code(fired)
         elif is_prot:
             decision = DECISION_RETAIN_PROTECTED
             reason = f"protected by {', '.join(fired)}; not an h2o candidate"
@@ -238,6 +258,7 @@ def plan_starlight_layer(
         evicted=tuple(sorted(eligible)),
         decisions=tuple(decisions),
         h2o_candidates_vetoed=len(vetoed),
+        infeasible_reason=infeasible_reason,
         conflicts_by_source=conflicts,
         protected_count_by_source=protected_counts,
     )
@@ -276,6 +297,7 @@ def summarize_plans(plans: Sequence[StarlightLayerPlan]) -> dict[str, Any]:
         "protected_count_by_source": {
             "da": protected.get("da", 0),
             "grounding": protected.get("grounding", 0),
+            "structural": protected.get("structural", 0),
             "union": protected.get("union", 0),
         },
         "status_counts": dict(statuses),
@@ -295,7 +317,7 @@ def combine_summaries(summaries: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "h2o_candidates_vetoed": 0,
         "conflicts_resolved_by_protection": 0,
         "conflicts_by_source": {src: 0 for src in SIGNAL_SOURCES},
-        "protected_count_by_source": {"da": 0, "grounding": 0, "union": 0},
+        "protected_count_by_source": {"da": 0, "grounding": 0, "structural": 0, "union": 0},
         "status_counts": {},
         "evicted_total": 0,
         "retained_total": 0,
@@ -311,7 +333,7 @@ def combine_summaries(summaries: Sequence[dict[str, Any]]) -> dict[str, Any]:
         total["max_retained_per_layer"] = max(total["max_retained_per_layer"], int(s["max_retained_per_layer"]))
         for src in SIGNAL_SOURCES:
             total["conflicts_by_source"][src] += int(s["conflicts_by_source"].get(src, 0))
-        for key in ("da", "grounding", "union"):
+        for key in ("da", "grounding", "structural", "union"):
             total["protected_count_by_source"][key] += int(s["protected_count_by_source"].get(key, 0))
         for status, n in s["status_counts"].items():
             total["status_counts"][status] = total["status_counts"].get(status, 0) + int(n)
