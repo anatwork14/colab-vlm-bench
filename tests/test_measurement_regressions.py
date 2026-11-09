@@ -64,12 +64,12 @@ def test_example_without_reference_is_reported_not_silently_dropped():
 # ---------------------------------------------------------------- GPU telemetry parse (C2 peak GPU memory)
 
 def test_single_gpu_csv_parses():
-    used, util, gpus = parse_nvidia_smi_csv("12000, 55\n")
+    used, util, gpus = parse_nvidia_smi_csv("0, GPU-aaaa, 12000, 55\n")
     assert (used, util, gpus) == (12000, 55, 1)
 
 
 def test_multi_gpu_csv_sums_devices_instead_of_dropping_sample():
-    used, util, gpus = parse_nvidia_smi_csv("1234, 0\n5678, 3\n")
+    used, util, gpus = parse_nvidia_smi_csv("0, GPU-aaaa, 1234, 0\n1, GPU-bbbb, 5678, 3\n")
     assert used == 1234 + 5678
     assert util == 3
     assert gpus == 2
