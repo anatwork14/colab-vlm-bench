@@ -448,7 +448,8 @@ class H2OMTPTransaction:
 
 
 
-def calibrate_h2o_ratio_to_retained(measure, target_mean_retained: float, prompt_len: int, min_budget: int) -> dict:
+def calibrate_h2o_ratio_to_retained(measure, target_mean_retained: float, prompt_len: int, min_budget: int,
+                                    *, image_present: bool) -> dict:
     """Matched retention by MEASUREMENT: find the H2O budget whose measured mean retained count
     is closest to a target (ITER2 D4 S-2).
 
@@ -458,7 +459,22 @@ def calibrate_h2o_ratio_to_retained(measure, target_mean_retained: float, prompt
     b with int(prompt_len * ratio) == b, ratio = (b + 0.5) / prompt_len. Bisection assumes the
     measured mean is non-decreasing in b; the best of the bisection point and its neighbours is
     returned with its measured value, so the residual is reported, never hidden.
+
+    TEXT-ONLY PROMPTS ONLY (ITER2 D10 N-8). The engine budget is
+    max(min_budget, int(unprotected_length * ratio)), and unprotected_length excludes protected
+    tokens (sinks and, with protect_visual_tokens, image tokens). The mapping above equals the
+    engine's budget only when no token is protected outside the budget. An image prompt therefore
+    gets a budget off by its protected count, so `image_present=True` is refused.
+    `image_present` is required: the caller must state it.
     """
+    if type(image_present) is not bool:
+        raise TypeError("image_present must be an explicit bool")
+    if image_present:
+        raise ValueError(
+            "calibrate_h2o_ratio_to_retained is valid only for TEXT-ONLY prompts: image prompts add "
+            "protected visual entries outside the budget, so the budget-to-retained mapping is off by "
+            "the protected count. Calibrate on a text-only prompt or extend the helper first."
+        )
     if type(prompt_len) is not int or prompt_len < 1:
         raise ValueError("prompt_len must be a positive integer")
     lo = max(1, int(min_budget))
