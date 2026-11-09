@@ -568,3 +568,39 @@ def test_p7_da_question_tokens_stay_readable_at_every_decode_step():
     assert cost["result_label"] == "decode_only_scripted_da_diagnostic"
     assert "question_span_global" in cost["deviations_from_scripted_geometry"]
     engine.close()
+
+
+def test_p7_h2o_decode_mask_aligned_with_compacted_kv_official():
+    """Round 2 item 5: HF builds the decode attention mask from the PRE-compaction cache
+    length, while the hook compacts KV. On the compaction step the mask (306) was sliced
+    [..., :303] instead of being index-selected by the retained positions. Every full-attention
+    layer at every decode step must use a mask aligned with its compacted KV length."""
+    from pathlib import Path
+
+    ckpt = Path("/mnt/ssd/genos2/research_workspace/models/Qwen/Qwen3.5-0.8B")
+    if not ckpt.is_dir() or not (ckpt / "config.json").is_file():
+        pytest.skip(f"Official Qwen3.5-0.8B checkpoint not present at {ckpt}")
+
+    engine = RealSevenArmEngine(method_arm="h2o_base", device="cpu", checkpoint_dir=ckpt)
+    captured: list[list[dict]] = []
+    orig_forward = engine.model.forward
+
+    def _spy(*args, **kwargs):
+        out = orig_forward(*args, **kwargs)
+        captured.append(out["layer_telemetries"])
+        return out
+
+    engine.model.forward = _spy
+    res = engine.execute_request("p7_h2o_mask_align", max_new_tokens=5, image_present=True)
+    assert res.telemetry["h2o_logical_selection_accounting"]["evicted_token_slots"] > 0, (
+        "compaction must actually occur for this check to be meaningful")
+    decode_steps = captured[1:]
+    assert decode_steps
+    for step_telems in decode_steps:
+        for t in step_telems:
+            if t.get("type") == "recurrent_deltanet":
+                continue  # no attention mask or KV on DeltaNet layers
+            assert "attention_mask_len" in t, "full-attention layer must report its mask length"
+            assert t["attention_mask_len"] == t["kv_seq_len"], (
+                f"mask {t['attention_mask_len']} != compacted KV {t['kv_seq_len']}")
+    engine.close()
