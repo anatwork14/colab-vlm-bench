@@ -1,3 +1,8 @@
+> **NOT AN ACCURACY REPORT:** The original 4/4 image smoke task claims accepted shallow keyword substrings, including incorrect attribute colors. Do not report 4/4 as correctness or accuracy. Post-repair tasks are unscored and official AMBER is the scientific quality source.
+
+
+> **2026-11-09 ADDITIONAL NUMERIC AUDIT:** 638,976 and 811,008 bytes formerly called `physical_kv_bytes_freed` are SUMS of per-decode KV tensor footprint deltas, **not observed peak GPU VRAM reclamation**. The initial Base also paid the MTP-head computation cost, so historical Base/MTP speed and throughput comparisons are **INVALIDATED** pending a fresh measured run. The MTP candidate head previously reset RoPE positions to zero; its match rates are **not publishable** without native persistent MTP cache. DA density now uses decode last-row selection and image focus is protected, while vLLM real KV-read savings remain unverified. See [audit](../docs/MTP_DA_UPSTREAM_CONTRACT_AUDIT.md).
+
 > **SUPERSEDED FOR MTP/DA RESEARCH CLAIMS (2026-11-09).** The original acceptance percentages and 18.95% mask target in this historical report cannot be used as Qwen MTP or original DA observations. See [source-aligned MTP/DA audit](../docs/MTP_DA_UPSTREAM_CONTRACT_AUDIT.md) for the corrected fail-closed scope. This report remains a historical receipt, NOT a current speculative-serving qualification.
 
 # STARLIGHT Benchmark System Readiness Report — Seven-Arm Official Hooked Neural Engine

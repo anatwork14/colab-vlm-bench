@@ -38,3 +38,17 @@ Official references:
 - DA/DA+MTP: scripted mask diagnostic only; keep model-declared DA and real KV reads gated.
 - Never label artificial policy targets as measured findings.
 - No Colab A100 authorization is implied by this audit.
+
+## Additional 2026-11-09 numeric integrity repair
+
+- **Baseline MTP overhead (P0):** Former official Qwen forward computed its extra MTP head for every Base, H2O, DA and ECRD step. This contaminated baseline latency with draft-head compute. Now only the three MTP-designated reference arms invoke the MTP module; standard Base does not.
+- **MTP positional / cache limitation (P0):** The former MTP proposal rebuilt 3-axis rotary positions from zero on every decode step. Corrected to pass each next-token absolute position into the one-step MTP head. However, **this reference head lacks persistent drafter KV state**. Its `proposal_match_rate` is explicitly nonpublishable and must not be used to claim native MTP acceptance or speedup. Actual vLLM native MTP remains gated.
+- **DA measured denominator (P0):** The former `attention_mask_restriction_ratio` used density of the entire causal LxL mask even though only the final query row executes at decode. It now reports the last-row logical restriction ratio and preserves the full-causal-area diagnostic separately. The scripted visual focus is kept active to avoid removing image evidence. Neither metric means HBM reduction.
+- **H2O KV bytes (P0):** Legacy `physical_kv_bytes_freed` sums KV tensor size deltas over decode iterations; it does not measure CUDA allocator/free or peak VRAM reductions. The new `kv_memory_accounting` marks this as `SUM_OF_KV_TENSOR_FOOTPRINT_DELTAS_NOT_GPU_VRAM_SAVING`, leaves actual peak VRAM savings null, and reports the final KV tensor payload as a separate quantity. Do not cite 638,976 B or 811,008 B as device memory savings.
+- **Correctness:** Per-layer visual masks are separately tracked and compacted; the global original visual mask is not mutated by each full-attention layer. Add multi-layer divergent-index and MTP rollback tests.
+
+## 2026-11-09 multimodal quality score invalidation
+
+Historical Test D four canonical image tasks used substring heuristics instead of objective scoring. In particular, the couch attribute fixture lists `ground_truth_label=Yellow`, but the old rule accepted any of `pink`, `yellow`, `color`, `pattern`, or `couch`. This could PASS a wrong answer. **The 4/4 score is not accuracy, F1, or grounded correctness.** The current Test D only checks that four pretrained ViT/image requests run, records output, and sets `ground_truth_match=null` / `quality_score_qualified=false`. Real image quality awaits AMBER's official scorer with independent labels.
+
+The old artifact `artifacts/qwen35_pretrained_qualification_receipt.json` was based on the invalid forced MTP acceptance, hand-fit DA 0.1895, H2O tensor-footprint deltas miscalled GPU frees, baseline draft-head overhead and permissive four-task substring checks. It has been preserved byte-for-byte under `artifacts/historical/` and replaced at the active path with an explicit supersession notice. **No post-fix pretrained GPU numbers have been rerun or forged.**

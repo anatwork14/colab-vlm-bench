@@ -99,14 +99,22 @@ class Qwen35MTPModule(nn.Module):
         last_hidden_state: torch.Tensor,
         next_token_embeds: torch.Tensor,
         lm_head: nn.Module,
+        position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Compute speculative draft logits [B, 1, vocab_size] from last hidden state and token embedding."""
+        """Compute one source-head candidate (diagnostic; no persistent MTP KV history)."""
         b, seq_len, _ = last_hidden_state.shape
         norm_e = self.pre_fc_norm_embedding(next_token_embeds)
         norm_h = self.pre_fc_norm_hidden(last_hidden_state)
         h = self.fc(torch.cat([norm_e, norm_h], dim=-1))
-        pos_ids = torch.arange(seq_len, device=h.device).view(1, 1, -1).expand(3, b, -1)
-        pos_emb = self.rotary_emb(h, pos_ids)
+        if position_ids is None:
+            raise ValueError(
+                "MTP needs absolute next-token position_ids; refusing per-step RoPE position reset"
+            )
+        if tuple(position_ids.shape) != (3, b, seq_len):
+            raise ValueError(
+                f"Expected MTP position_ids [3,{b},{seq_len}], got {tuple(position_ids.shape)}"
+            )
+        pos_emb = self.rotary_emb(h, position_ids.to(h.device))
         h = self.layers[0](h, position_embeddings=pos_emb, attention_mask=None)
         h = self.norm(h)
         return lm_head(h)
@@ -726,6 +734,8 @@ class Qwen35NeuralModel(nn.Module):
         mm_token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         mm_encoder_outputs: dict[str, Any] | None = None,
+        compute_mtp: bool = False,
+        mtp_position_ids: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """Full forward pass routing through hooked official HF model when attached, or scaffold layers."""
         if self.hf_model is not None and self.hook_ctx is not None:
@@ -756,9 +766,14 @@ class Qwen35NeuralModel(nn.Module):
 
                 logits = out.logits[:, -1, :].float()
                 last_hidden = out.hidden_states[-1][:, -1:, :]
-                next_tok_id = torch.argmax(logits, dim=-1, keepdim=True)
-                next_tok_emb = self.hf_model.model.get_input_embeddings()(next_tok_id)
-                mtp_logits = self.mtp_module(last_hidden, next_tok_emb, self.hf_model.lm_head).float()
+                mtp_logits = None
+                if compute_mtp:
+                    next_tok_id = torch.argmax(logits, dim=-1, keepdim=True)
+                    next_tok_emb = self.hf_model.model.get_input_embeddings()(next_tok_id)
+                    mtp_logits = self.mtp_module(
+                        last_hidden, next_tok_emb, self.hf_model.lm_head,
+                        position_ids=mtp_position_ids,
+                    ).float()
 
                 attn_matrices = dict(self.hook_ctx.attention_matrices)
                 hook_telems = dict(self.hook_ctx.layer_telemetries)
@@ -819,10 +834,12 @@ class Qwen35NeuralModel(nn.Module):
 
         normed_hidden = self.final_norm(hidden[:, -1, :])
         logits = self.lm_head(normed_hidden)
-        mtp_hidden = self.mtp_proj(normed_hidden).view(
-            b, self.config.mtp_num_speculative_tokens, self.config.hidden_size
-        )
-        mtp_logits = self.lm_head(mtp_hidden)
+        mtp_logits = None
+        if compute_mtp:
+            mtp_hidden = self.mtp_proj(normed_hidden).view(
+                b, self.config.mtp_num_speculative_tokens, self.config.hidden_size
+            )
+            mtp_logits = self.lm_head(mtp_hidden)
 
         return {
             "logits": logits,
@@ -1167,6 +1184,7 @@ class RealSevenArmEngine:
             "SEVEN_ARM_PRETRAINED_PASS": seven_arm_gate,
             "MTP_CORRECTNESS_PASS": "GATED_NATIVE_MTP_VERIFIER_REQUIRED" if "mtp" in self.method_arm else "NOT_APPLICABLE",
             "MTP_PROPOSAL_DIAGNOSTIC_PASS": "PENDING" if "mtp" in self.method_arm else "NOT_APPLICABLE",
+            "MTP_PROPOSAL_RATE_SCIENTIFICALLY_QUALIFIED": "BLOCKED_NO_NATIVE_MTP_KV_HISTORY" if "mtp" in self.method_arm else "NOT_APPLICABLE",
             "CCU_ISOLATION_PASS": "PASS",
             "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH",
         }
@@ -1200,17 +1218,27 @@ class RealSevenArmEngine:
         final_allocated_bytes = 0
         final_logical_fraction = 0.0
         final_da_restriction_ratio = 0.0
-        mtp_accepted_total = 0
+        final_da_causal_area_ratio = 0.0
         mtp_proposed_total = 0
         mtp_matched_total = 0
         pending_mtp_candidate: int | None = None
 
-        # Prefill forward pass
+        # Prefill forward pass. Reference MTP candidate is evaluated at the
+        # next target token's absolute 3-axis RoPE position, never position 0.
+        initial_next_pos = (
+            prefill_pos_ids[..., -1:] + 1
+            if prefill_pos_ids is not None
+            else torch.full(
+                (3, 1, 1), input_ids.shape[1], device=self.device, dtype=torch.long
+            )
+        )
         with torch.no_grad():
             prefill_out = self.model(
                 input_ids,
                 position_ids=prefill_pos_ids,
                 mm_encoder_outputs=mm_encoder_outputs,
+                compute_mtp=("mtp" in self.method_arm),
+                mtp_position_ids=initial_next_pos if "mtp" in self.method_arm else None,
             )
             past_kv = prefill_out["past_key_values"]
             recurrent_s = prefill_out["recurrent_states"]
@@ -1278,12 +1306,20 @@ class RealSevenArmEngine:
                         end_idx=phys_kv_len, window=8
                     ))
 
-                raw_mask = self.da_mask_gen.generate_attention_mask(seq_len=phys_kv_len, tags=da_tags)
+                raw_mask = self.da_mask_gen.generate_attention_mask(
+                    seq_len=phys_kv_len, tags=da_tags,
+                    active_focus_id="scripted_visual_segment" if image_present else None,
+                )
                 da_tensor = torch.from_numpy(raw_mask).to(self.device)
                 for l_idx in self.config.full_attention_layers:
                     da_masks[l_idx] = da_tensor
                 stats = self.da_mask_gen.mask_statistics(raw_mask)
-                final_da_restriction_ratio = stats["attention_mask_restriction_ratio"]
+                final_da_causal_area_ratio = stats["attention_mask_restriction_ratio"]
+                # For decoding, only the newest query row executes; LxL area
+                # sparsity is not the actual allowed-key fraction for this step.
+                final_da_restriction_ratio = (
+                    1.0 - float(np.count_nonzero(raw_mask[-1])) / phys_kv_len
+                )
 
             # 2. H2O physical eviction plans for full-attention layers coordinated with physical KV length
             h2o_eviction_plans: dict[int, torch.Tensor] = {}
@@ -1316,6 +1352,14 @@ class RealSevenArmEngine:
                     da_masks=da_masks if da_masks else None,
                     h2o_eviction_plans=h2o_eviction_plans if h2o_eviction_plans else None,
                     position_ids=step_pos_ids,
+                    compute_mtp=("mtp" in self.method_arm),
+                    mtp_position_ids=(
+                        step_pos_ids + 1
+                        if step_pos_ids is not None
+                        else torch.full(
+                            (3, 1, 1), curr_len, device=self.device, dtype=torch.long
+                        )
+                    ) if "mtp" in self.method_arm else None,
                 )
                 past_kv = out["past_key_values"]
                 recurrent_s = out["recurrent_states"]
@@ -1412,8 +1456,21 @@ class RealSevenArmEngine:
                 "is_official_hf_hooked": self.is_official_hf_hooked,
                 "vllm_backend_status": "MOCKED_PYTORCH_FALLBACK" if not self.has_vllm_backend else "ATTACHED_VLLM_0_29_0",
                 "pretrained_weights": self.pretrained_weight_summary,
+                "kv_memory_accounting": {
+                    "legacy_field": "physical_kv_bytes_freed",
+                    "classification": "SUM_OF_KV_TENSOR_FOOTPRINT_DELTAS_NOT_GPU_VRAM_SAVING",
+                    "compaction_tensor_byte_deltas_sum": total_physical_freed,
+                    "final_retained_kv_payload_bytes": final_allocated_bytes,
+                    "peak_cuda_allocated_saving_bytes": None,
+                    "peak_cuda_reserved_saving_bytes": None,
+                    "device_hbm_reduction_measured": False,
+                    "warning": "Each decode step's index_select size delta is added. The total is NOT a peak or allocated/reserved VRAM delta, and may count repeated reductions.",
+                },
                 "mtp_candidate_diagnostic": {
-                    "classification": "TARGET_GREEDY_MATCH_ONLY_NO_SPECULATIVE_SERVING",
+                    "classification": "REFERENCE_DRAFT_NO_PERSISTENT_MTP_KV_NO_SPECULATIVE_SERVING",
+                    "position_ids_are_absolute": self.is_official_hf_hooked,
+                    "persistent_mtp_kv_history": False,
+                    "proposal_match_rate_publishable": False,
                     "proposals_verified": mtp_proposed_total,
                     "proposals_matching_target": mtp_matched_total,
                     "proposal_match_rate": mtp_proposal_match_rate,
@@ -1424,6 +1481,9 @@ class RealSevenArmEngine:
                 "visual_encoder_trace": vis_trace,
                 "da_cost_accounting": {
                     "attention_mask_restriction_ratio": round(final_da_restriction_ratio, 4),
+                    "decode_last_query_allowed_key_ratio": round(1.0 - final_da_restriction_ratio, 4),
+                    "full_causal_mask_area_restriction_ratio": round(final_da_causal_area_ratio, 4),
+                    "focus_visual_evidence_kept": bool(image_present),
                     "da_scope_provenance": "SCRIPTED_SEGMENT_DIAGNOSTIC_NOT_MODEL_DECLARED",
                     "original_paper_protocol_qualified": False,
                     "physical_kv_bytes_freed": 0 if "da" in self.method_arm else total_physical_freed,

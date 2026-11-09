@@ -69,6 +69,29 @@ def test_mtp_diagnostic_is_token_equivalent_to_greedy_base():
     assert outputs["base"] == outputs["mtp"]
 
 
+def test_baseline_does_not_execute_mtp_head():
+    for arm, expected in (("base", 0), ("h2o_base", 0), ("da_base", 0), ("mtp", 6)):
+        torch.manual_seed(1234)
+        engine = RealSevenArmEngine(
+            method_arm=arm, device="cpu", config=tiny_qwen_config()
+        )
+        calls = []
+        hook = engine.model.mtp_proj.register_forward_hook(
+            lambda *args: calls.append(1)
+        )
+        try:
+            result = engine.execute_request(
+                request_id=f"mtp_head_overhead_{arm}",
+                prompt_token_ids=[100, 101, 102, 103],
+                image_present=False, max_new_tokens=6,
+            )
+            assert len(result.tokens_generated) == 6
+            assert len(calls) == expected, (arm, len(calls), expected)
+        finally:
+            hook.remove()
+            engine.close()
+
+
 def test_da_does_not_fit_target_sparsity():
     source = (Path(__file__).resolve().parents[1] / "src/vlmbench/infrastructure/real_engine.py").read_text()
     assert "round(0.1895 *" not in source
@@ -85,5 +108,12 @@ def test_da_does_not_fit_target_sparsity():
         assert result.telemetry["da_cost_accounting"]["original_paper_protocol_qualified"] is False
         assert result.telemetry["da_cost_accounting"]["physical_kv_read_saving_claimed"] is False
         assert result.physical_kv_bytes_freed == 0
+        cost = result.telemetry["da_cost_accounting"]
+        assert 0.0 <= cost["full_causal_mask_area_restriction_ratio"] <= 1.0
+        assert 0.0 <= cost["attention_mask_restriction_ratio"] <= 1.0
+        assert cost["focus_visual_evidence_kept"] is False
+        assert result.attention_mask_restriction_ratio > 0.0, (
+            "The deliberately long input must exercise nontrivial scripted masking"
+        )
     finally:
         engine.close()
