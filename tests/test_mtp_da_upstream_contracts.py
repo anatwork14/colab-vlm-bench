@@ -45,7 +45,7 @@ def test_mtp_cannot_commit_unverified_drafts_or_fake_acceptance():
         assert 0 <= diagnostic["proposals_matching_target"] <= 5
         assert diagnostic["committed_draft_tokens"] == 0
         assert diagnostic["speculative_speedup_claimed"] is False
-        assert result.mtp_acceptance_rate == 0.0
+        assert result.mtp_acceptance_rate is None  # unverified: no verifier in the serving arm
         assert result.gates["MTP_CORRECTNESS_PASS"] == "GATED_NATIVE_MTP_VERIFIER_REQUIRED"
         assert result.gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS"
     finally:

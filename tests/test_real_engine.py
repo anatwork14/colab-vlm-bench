@@ -153,7 +153,7 @@ def test_real_mtp_speculative_verification_and_rollback():
     assert len(res.tokens_generated) == 8
     assert res.gates["MTP_CORRECTNESS_PASS"] == "GATED_NATIVE_MTP_VERIFIER_REQUIRED"
     assert res.gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS"
-    assert res.mtp_acceptance_rate == 0.0
+    assert res.mtp_acceptance_rate is None  # unverified serving arm: never a literal 0.0
     assert res.telemetry["mtp_candidate_diagnostic"]["committed_draft_tokens"] == 0
     engine.close()
 
@@ -460,7 +460,8 @@ def test_p7_da_mask_geometry_stable_across_decode_steps():
 
 
 def test_p7_mtp_reference_path_is_token_identical_to_base():
-    """MTP never commits drafts, so its committed sequence must equal Base under the same weights."""
+    """Serving-arm MTP commits only target tokens, so its output equals Base. This does NOT test
+    speculative MTP: the real verifier-backed equivalence is in tests/test_mtp_speculative_official.py."""
     prompt = list(range(10, 50))
     tokens = {}
     for arm in ("base", "mtp"):
@@ -471,7 +472,7 @@ def test_p7_mtp_reference_path_is_token_identical_to_base():
         tokens[arm] = res.tokens_generated
         if arm == "mtp":
             assert res.telemetry["mtp_candidate_diagnostic"]["committed_draft_tokens"] == 0
-            assert res.mtp_acceptance_rate == 0.0
+            assert res.mtp_acceptance_rate is None
         engine.close()
     assert tokens["mtp"] == tokens["base"]
 
