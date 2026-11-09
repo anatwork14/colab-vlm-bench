@@ -1787,6 +1787,12 @@ class RealSevenArmEngine:
                 "architectural_status": arch_status,
                 "is_official_hf_hooked": self.is_official_hf_hooked,
                 "forward_path_executed": forward_path_executed,
+                # R5-5: serving-style arms never speculate. The verifier-backed reference is a separate helper.
+                "speculation_executed": False,
+                "arm_label": (
+                    "mtp_serving_arm_diagnostic_no_speculation" if "mtp" in self.method_arm
+                    else "non_speculative_arm"
+                ),
                 "generation": {
                     "stop_at_eos": self.stop_at_eos,
                     "eos_token_ids": list(self.eos_token_ids),
