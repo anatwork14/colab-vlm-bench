@@ -31,6 +31,17 @@ from .adapters import (
     InfrastructureRunner,
     check_vllm_hardware_compatibility,
 )
+from .model_config import (
+    Qwen35ModelConfig,
+    load_model_config,
+)
+from .real_engine import (
+    RealSevenArmEngine,
+    RealExecutionResult,
+    DeltaNetRecurrentLayer,
+    QwenFullAttentionLayer,
+    Qwen35NeuralModel,
+)
 
 __all__ = [
     "H2OConfig",
@@ -51,4 +62,11 @@ __all__ = [
     "SevenArmEngine",
     "InfrastructureRunner",
     "check_vllm_hardware_compatibility",
+    "Qwen35ModelConfig",
+    "load_model_config",
+    "RealSevenArmEngine",
+    "RealExecutionResult",
+    "DeltaNetRecurrentLayer",
+    "QwenFullAttentionLayer",
+    "Qwen35NeuralModel",
 ]
