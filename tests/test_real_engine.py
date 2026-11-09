@@ -333,8 +333,10 @@ def test_real_engine_pretrained_checkpoint_loading(tmp_path):
     assert engine.has_vision_encoder is True
 
     res = engine.execute_request("req_pretrained_tiny", prompt_token_ids=[10, 11, 12], max_new_tokens=4)
-    assert res.gates["REAL_MODEL_FORWARD_PASS"] == "PASS"
-    assert res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS"
+    # R3-1: partial reference weights are NOT a real forward qualification. These gates
+    # previously read PASS here; they now report the partial-coverage status explicitly.
+    assert res.gates["REAL_MODEL_FORWARD_PASS"] == "PARTIAL_COVERAGE_NOT_QUALIFIED"
+    assert res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PARTIAL_COVERAGE_NOT_QUALIFIED"
     assert res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "GATED_OFFICIAL_HF_HOOK_REQUIRED"
     assert res.telemetry["architectural_status"] == "PARTIALLY_WEIGHTED_PYTORCH_REFERENCE"
     assert res.telemetry["pretrained_weights"]["mapped_tensors_count"] == 13
@@ -654,3 +656,34 @@ def test_p7_4b_config_is_explicitly_unpinned():
     assert cfg.model_id == "Qwen/Qwen3.5-4B"
     assert cfg.pin_status == "UNPINNED_NO_LOCAL_CONFIG_JSON"
     assert load_model_config("Qwen/Qwen3.5-0.8B").pin_status == "HARDCODED_NOT_FROM_LOCAL_FILE"
+
+
+def test_p7_r3_low_coverage_partial_checkpoint_never_passes_real_forward_gates(tmp_path):
+    """R3-1 red test: a ~10%-coverage partial checkpoint (auditor probe: mapped 2 / unmapped 7,
+    parameter_coverage_ratio 0.100044) must not emit REAL_MODEL_FORWARD_PASS or
+    REAL_MULTIMODAL_INFERENCE_PASS = PASS. Only official hooked coverage may."""
+    from safetensors.torch import save_file
+
+    save_file({
+        "model.language_model.embed_tokens.weight": torch.randn(512, 64),
+        "model.language_model.layers.0.linear_attn.out_proj.weight": torch.randn(64, 64),
+        "model.language_model.layers.3.mlp.gate_proj.weight": torch.randn(128, 64),
+        "model.language_model.layers.3.mlp.up_proj.weight": torch.randn(128, 64),
+        "model.language_model.layers.3.mlp.down_proj.weight": torch.randn(64, 128),
+        "model.language_model.layers.3.self_attn.v_proj.weight": torch.randn(32, 64),
+        "model.visual.merger.linear_fc2.weight": torch.randn(64, 64),
+        "model.visual.merger.linear_fc2.bias": torch.zeros(64),
+        "model.visual.blocks.0.attn.qkv.weight": torch.randn(192, 64),
+        # Large unmapped vision block drives coverage to ~10%, matching the auditor probe.
+        "model.visual.blocks.1.mlp.linear_fc1.weight": torch.randn(9600, 64),
+    }, str(tmp_path / "model.safetensors"))
+    engine = RealSevenArmEngine(method_arm="base", config=_p7_small_cfg(), device="cpu",
+                                checkpoint_dir=tmp_path)
+    assert engine.is_official_hf_hooked is False
+    res = engine.execute_request("p7_r3_low_cov", prompt_token_ids=[10, 11, 12], max_new_tokens=2)
+    assert res.gates["REAL_MODEL_FORWARD_PASS"] != "PASS"
+    assert res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] != "PASS"
+    assert res.gates["SEVEN_ARM_PRETRAINED_PASS"] != "PASS"
+    assert res.gates["REAL_MODEL_FORWARD_PASS"] == "PARTIAL_COVERAGE_NOT_QUALIFIED"
+    assert engine.pretrained_weight_summary["parameter_coverage_ratio"] < 0.15
+    engine.close()
