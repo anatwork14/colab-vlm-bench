@@ -618,28 +618,31 @@ class Qwen35NeuralModel(nn.Module):
                         mapped_keys.add("model.language_model.norm.weight")
                         mapped_sf_params += int(norm_w.numel())
 
+                    # Projection tensors are mapped ONLY on exact shape match. A mismatched
+                    # tensor stays unmapped so coverage cannot be inflated by silent slicing.
                     if "mtp.fc.weight" in keys:
                         mtp_fc = sf.get_tensor("mtp.fc.weight").to(dtype=dtype)
                         mtp_t = mtp_fc.t()
-                        r_rows = min(self.mtp_proj.weight.shape[0], mtp_t.shape[0])
-                        c_cols = min(self.mtp_proj.weight.shape[1], mtp_t.shape[1])
-                        self.mtp_proj.weight[:r_rows, :c_cols].copy_(mtp_t[:r_rows, :c_cols])
-                        mtp_loaded += 1
-                        mapped_keys.add("mtp.fc.weight")
-                        mapped_sf_params += int(mtp_fc.numel())
+                        if tuple(mtp_t.shape) == tuple(self.mtp_proj.weight.shape):
+                            self.mtp_proj.weight.copy_(mtp_t)
+                            mtp_loaded += 1
+                            mapped_keys.add("mtp.fc.weight")
+                            mapped_sf_params += int(mtp_fc.numel())
 
                     if "model.visual.merger.linear_fc2.weight" in keys:
                         vis_w = sf.get_tensor("model.visual.merger.linear_fc2.weight").to(dtype=dtype)
-                        self.visual_merger.weight.copy_(vis_w[:hidden_size, :hidden_size])
-                        visual_loaded += 1
-                        mapped_keys.add("model.visual.merger.linear_fc2.weight")
-                        mapped_sf_params += int(vis_w.numel())
+                        if tuple(vis_w.shape) == tuple(self.visual_merger.weight.shape):
+                            self.visual_merger.weight.copy_(vis_w)
+                            visual_loaded += 1
+                            mapped_keys.add("model.visual.merger.linear_fc2.weight")
+                            mapped_sf_params += int(vis_w.numel())
                     if "model.visual.merger.linear_fc2.bias" in keys:
                         vis_b = sf.get_tensor("model.visual.merger.linear_fc2.bias").to(dtype=dtype)
-                        self.visual_merger.bias.copy_(vis_b[:hidden_size])
-                        visual_loaded += 1
-                        mapped_keys.add("model.visual.merger.linear_fc2.bias")
-                        mapped_sf_params += int(vis_b.numel())
+                        if tuple(vis_b.shape) == tuple(self.visual_merger.bias.shape):
+                            self.visual_merger.bias.copy_(vis_b)
+                            visual_loaded += 1
+                            mapped_keys.add("model.visual.merger.linear_fc2.bias")
+                            mapped_sf_params += int(vis_b.numel())
 
                     for i, layer in enumerate(self.layers):
                         ln_key = f"model.language_model.layers.{i}.input_layernorm.weight"
@@ -663,7 +666,9 @@ class Qwen35NeuralModel(nn.Module):
                                 full_k = f"model.language_model.layers.{i}.self_attn.{key_suffix}"
                                 if full_k in keys:
                                     t = sf.get_tensor(full_k).to(dtype=dtype)
-                                    getattr(layer, proj_attr).weight.copy_(t[:rows, :cols])
+                                    if tuple(t.shape) != (rows, cols):
+                                        continue  # shape mismatch: leave unmapped, never slice
+                                    getattr(layer, proj_attr).weight.copy_(t)
                                     language_loaded += 1
                                     mapped_keys.add(full_k)
                                     mapped_sf_params += int(t.numel())
@@ -673,19 +678,21 @@ class Qwen35NeuralModel(nn.Module):
                             out_key = f"model.language_model.layers.{i}.linear_attn.out_proj.weight"
                             if qkv_key in keys:
                                 qkv = sf.get_tensor(qkv_key).to(dtype=dtype)
-                                stride = qkv.shape[0] // 3
-                                layer.q_proj.weight.copy_(qkv[:r_dim, :hidden_size])
-                                layer.k_proj.weight.copy_(qkv[stride : stride + r_dim, :hidden_size])
-                                layer.v_proj.weight.copy_(qkv[2 * stride : 2 * stride + r_dim, :hidden_size])
-                                language_loaded += 3
-                                mapped_keys.add(qkv_key)
-                                mapped_sf_params += int(qkv.numel())
+                                if tuple(qkv.shape) == (3 * r_dim, hidden_size):
+                                    stride = r_dim
+                                    layer.q_proj.weight.copy_(qkv[:r_dim, :])
+                                    layer.k_proj.weight.copy_(qkv[stride : stride + r_dim, :])
+                                    layer.v_proj.weight.copy_(qkv[2 * stride : 2 * stride + r_dim, :])
+                                    language_loaded += 3
+                                    mapped_keys.add(qkv_key)
+                                    mapped_sf_params += int(qkv.numel())
                             if out_key in keys:
                                 t_out = sf.get_tensor(out_key).to(dtype=dtype)
-                                layer.out_proj.weight.copy_(t_out[:hidden_size, :r_dim])
-                                language_loaded += 1
-                                mapped_keys.add(out_key)
-                                mapped_sf_params += int(t_out.numel())
+                                if tuple(t_out.shape) == (hidden_size, r_dim):
+                                    layer.out_proj.weight.copy_(t_out)
+                                    language_loaded += 1
+                                    mapped_keys.add(out_key)
+                                    mapped_sf_params += int(t_out.numel())
 
         total_loaded = language_loaded + mtp_loaded + visual_loaded
         if total_loaded == 0:
@@ -849,6 +856,28 @@ class Qwen35NeuralModel(nn.Module):
             "attention_matrices": attention_matrices,
             "layer_telemetries": layer_telemetries,
         }
+
+
+def _da_scripted_tags(anchor_len: int, phys_len: int, n_visual: int, image_present: bool) -> list[DATag]:
+    """SCRIPTED DA diagnostic geometry, fixed from the prompt anchor.
+
+    Sink, focus and visual-segment bounds are computed ONCE from the prefill length, so
+    the prompt region keeps the same tag class at every decode step. Only the trailing
+    LOCAL window moves with the generated suffix (phys_len). Deriving the bounds from the
+    growing KV length instead reclassified prompt keys between steps.
+    """
+    sink_end = min(16, max(1, anchor_len // 4))
+    if not n_visual and image_present:
+        n_visual = min(4, max(0, anchor_len - sink_end - 1))
+    tags = [DATag(DATagType.GLOBAL, start_idx=0, end_idx=sink_end)]
+    if anchor_len > sink_end + 1:
+        focus_end = min(anchor_len - 1, sink_end + max(1, n_visual))
+        tags.append(DATag(
+            DATagType.FOCUS, start_idx=sink_end, end_idx=focus_end,
+            focus_id="scripted_visual_segment",
+        ))
+        tags.append(DATag(DATagType.LOCAL, start_idx=focus_end, end_idx=phys_len, window=8))
+    return tags
 
 
 # --- 2. Production Seven-Arm Engine with True Backend Interventions ---
@@ -1218,6 +1247,8 @@ class RealSevenArmEngine:
 
         past_kv: Any = None
         recurrent_s: list[Any] | None = None
+        da_anchor_len = len(full_prompt)  # DA geometry is anchored to the prefill, not the growing KV
+        da_n_visual = int(vis_trace.get("visual_token_embeddings_count", 0))
 
         tokens_generated: list[int] = []
         step_latencies: list[float] = []
@@ -1299,23 +1330,10 @@ class RealSevenArmEngine:
                 # <focus magic_chunks="..."> protocol. No target sparsity is fitted.
                 # Bounds derive from the current prompt/vision geometry, and the
                 # observed mask density is calculated after actual construction.
-                sink_end = min(16, max(1, phys_kv_len // 4))
-                n_visual = int(vis_trace.get("visual_token_embeddings_count", 0))
-                if not n_visual and image_present:
-                    n_visual = min(4, max(0, phys_kv_len - sink_end - 1))
-                da_tags = [DATag(DATagType.GLOBAL, start_idx=0, end_idx=sink_end)]
-                if phys_kv_len > sink_end + 1:
-                    focus_end = min(
-                        phys_kv_len - 1, sink_end + max(1, n_visual)
-                    )
-                    da_tags.append(DATag(
-                        DATagType.FOCUS, start_idx=sink_end,
-                        end_idx=focus_end, focus_id="scripted_visual_segment"
-                    ))
-                    da_tags.append(DATag(
-                        DATagType.LOCAL, start_idx=focus_end,
-                        end_idx=phys_kv_len, window=8
-                    ))
+                da_tags = _da_scripted_tags(
+                    anchor_len=da_anchor_len, phys_len=phys_kv_len,
+                    n_visual=da_n_visual, image_present=image_present,
+                )
 
                 raw_mask = self.da_mask_gen.generate_attention_mask(
                     seq_len=phys_kv_len, tags=da_tags,

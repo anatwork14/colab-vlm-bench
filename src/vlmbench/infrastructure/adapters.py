@@ -388,6 +388,13 @@ class SevenArmEngine:
 
                 if self.mtp_tx is not None:
                     self.mtp_tx.begin()
+                    # Speculative positions must be scored INSIDE the transaction, so commit()
+                    # keeps only the accepted prefix and rollback() erases every proposed position.
+                    for i in range(len(proposed_tokens)):
+                        spec_len = current_seq_len + i + 1
+                        spec_attn = np.full((self.num_kv_heads, 1, spec_len), 1.0 / spec_len, dtype=np.float32)
+                        for l_idx in range(self.num_layers):
+                            self.h2o_tracker.update_attention_scores(l_idx, spec_attn)
                     if accepted_count > 0:
                         self.mtp_tx.commit(accepted_count)
                         step_trace["mtp_action"] = f"commit_{accepted_count}"

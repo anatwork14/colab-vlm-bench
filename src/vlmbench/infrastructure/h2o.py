@@ -297,6 +297,12 @@ class H2OMTPTransaction:
             raise RuntimeError("No active MTP transaction to commit")
         if accepted_tokens < 0:
             raise ValueError(f"accepted_tokens cannot be negative: {accepted_tokens}")
+        proposed = max(0, self.tracker.seq_len - self._snapshot["seq_len"])
+        if accepted_tokens > proposed:
+            raise ValueError(
+                f"accepted_tokens {accepted_tokens} exceed {proposed} proposed tokens; "
+                "refusing to commit positions that were never scored"
+            )
 
         if accepted_tokens == 0:
             self.rollback()
