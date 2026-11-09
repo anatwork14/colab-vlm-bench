@@ -293,3 +293,44 @@ def test_combine_summaries_adds_steps_and_keeps_invariant_counts():
     assert total["evicted_total"] == 2 * one["evicted_total"]
     assert total["protected_evicted"] == 0 and total["evicted_not_candidate"] == 0
     assert total["status_counts"] == {STATUS_OK: 4}  # 2 steps x 2 full-attention layers
+
+
+# --- ITER2 D4 S-1 (auditor HIGH): candidate set is ablation-independent --------------------
+
+_S1_SCORES = [0, 0, 5, 4, 3, 2, 1, 1, 1, 1]
+_S1_ARMS = {
+    "starlight_s1": ("da", "grounding", "structural"),
+    "starlight_s1_no_da": ("grounding", "structural"),
+    "starlight_s1_no_grounding": ("da", "structural"),
+}
+
+
+def test_s1_candidate_set_is_ablation_independent_and_only_the_veto_differs():
+    plans_by_arm = {}
+    for arm, enabled in _S1_ARMS.items():
+        engine = _engine(arm)
+        tracker = _scored_tracker(_S1_SCORES)
+        _, _, plans = _step(engine, tracker, length=10, budget=6,
+                            da_spans=[("sink_global", 0, 2)], enabled=enabled)
+        plans_by_arm[arm] = plans[0]
+
+    def candidates(plan):
+        return frozenset(d.entry_id for d in plan.decisions if d.h2o_candidate)
+
+    full = plans_by_arm["starlight_s1"]
+    # The candidate set is computed once from the FULL arm's protected count, never per ablation.
+    assert candidates(full) == frozenset({0, 1, 5, 6, 7, 8})
+    for arm, plan in plans_by_arm.items():
+        assert candidates(plan) == candidates(full), arm
+        assert len(plan.retained) <= 6, f"{arm}: retained {len(plan.retained)} exceeds budget"
+
+    # Only the DA veto is removed in the no-DA arm: the released entries are exactly the
+    # DA-protected candidates {0, 1}; nothing else changes.
+    no_da = plans_by_arm["starlight_s1_no_da"]
+    assert set(no_da.evicted) - set(full.evicted) == {0, 1}
+    assert set(full.evicted) - set(no_da.evicted) == set()
+
+    # Ablating grounding (no grounding labels supplied) changes nothing here.
+    no_ground = plans_by_arm["starlight_s1_no_grounding"]
+    assert no_ground.evicted == full.evicted
+    assert no_ground.retained == full.retained
