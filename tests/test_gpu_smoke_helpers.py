@@ -53,10 +53,13 @@ def test_label_and_limits_are_the_agreed_ones():
     assert smoke.MAX_NEW_TOKENS <= 8
 
 
-def _receipt(status="RUN_COMPLETED", sha="a" * 40, dtype="float16", tokens=None, inputs=("text0", "text1", "image")):
+def _receipt(status="RUN_COMPLETED", sha="a" * 40, dtype="float16", tokens=None, inputs=("text0", "text1", "image"),
+             device=None):
     tokens = tokens or {arm: [[1, 2]] * len(inputs) for arm in smoke.ARMS}
+    # C-9: the receipt names its device. Default: float32 is the CPU reference, float16 is CUDA.
+    device = device or ("cpu" if dtype == "float32" else "cuda")
     return {
-        "status": status, "git_sha": sha, "dtype": dtype,
+        "status": status, "git_sha": sha, "dtype": dtype, "device": device, "tag": smoke.TAG[device],
         "results": {
             arm: [{"input": name, "tokens": list(t), "tokens_generated_count": len(t)}
                   for name, t in zip(inputs, tokens[arm])]
@@ -97,3 +100,32 @@ def test_request_is_complete_at_eos_or_at_the_token_cap_and_not_otherwise():
     assert smoke.request_complete({"stop_reason": "max_new_tokens", "tokens_generated_count": smoke.MAX_NEW_TOKENS}) is True
     assert smoke.request_complete({"stop_reason": "max_new_tokens", "tokens_generated_count": 3}) is False
     assert smoke.request_complete({"stop_reason": None, "tokens_generated_count": smoke.MAX_NEW_TOKENS}) is False
+
+
+# --- C-9: compare_receipts requires exactly (CUDA, CPU), in that order -----------------------------
+
+def test_C9_two_cuda_receipts_are_refused():
+    with pytest.raises(ValueError, match="cpu"):
+        smoke.compare_receipts(_receipt(), _receipt())
+
+
+def test_C9_cpu_first_and_cuda_second_is_refused():
+    with pytest.raises(ValueError, match="cuda"):
+        smoke.compare_receipts(_receipt(dtype="float32"), _receipt())
+
+
+def test_C9_a_cuda_receipt_in_the_cpu_slot_is_refused():
+    with pytest.raises(ValueError):
+        smoke.compare_receipts(_receipt(), _receipt(device="cuda", dtype="float16"))
+
+
+def test_C9_the_tag_must_match_the_device():
+    bad = _receipt(dtype="float32")
+    bad["tag"] = "gpu_fp16"  # a CPU-labelled receipt carrying the GPU tag
+    with pytest.raises(ValueError):
+        smoke.compare_receipts(_receipt(), bad)
+
+
+def test_C9_correct_order_compares():
+    out = smoke.compare_receipts(_receipt(), _receipt(dtype="float32"))
+    assert out["token_agreement"] == "IDENTICAL_ALL_INPUTS"
