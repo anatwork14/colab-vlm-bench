@@ -233,3 +233,88 @@ Auditor ambiguities (A-1..A-6) and the choices made:
 Tests added after the implementation, not red-first (coverage of existing behaviour):
 `test_I7_*`, `test_A_MASK_*`, `test_HC13` (measurement), and the grounding-verdict reason-code
 change in `test_expired_evidence_*`.
+
+## 13. ITER2 D4 changes (lead rulings, auditor REVIEW_ITER2 §2)
+
+- **Structural source (Q2 / I-8).** `vision_start` and `vision_end` are protected by an explicit
+  `structural` source, with reason codes and telemetry (`structural_policy` =
+  `PROTECTED_LEAD_DECISION_Q2`, `structural_tokens_evicted`). Protection is an unratified lead
+  decision. HC-13 asserts both tokens are protected and never evicted on a prompt that contains them.
+- **Veto precedence.** A candidate protected by several sources gets one reason code by fixed
+  precedence (DA, then grounding, then structural).
+- **INFEASIBLE evicts nothing (Q3 / S-3).** When protected entries exceed the budget, or the budget
+  stays unmet after eligible eviction, the step retains every entry. Status
+  `INFEASIBLE_PROTECTED_EXCEEDS_BUDGET`, distinct decision `RETAIN_INFEASIBLE_NO_EVICTION` and reason
+  `INFEASIBLE_NO_EVICTION`, and `kv_budget_violated` is reported per layer, per step, and in
+  telemetry. The DA sink is not capped (Q6).
+- **Ablation-independent candidate set (S-1).** All signal sources are computed on every arm. The
+  effective H2O budget comes from the full protected union. An ablation only removes protection as a
+  veto, so candidate sets are identical across arms (tested on the oracle fixture).
+- **Grounding declaration (Q4).** Not fail-closed. A missing or unusable declaration sets
+  `grounding_declaration_missing` and the arm reports `degraded_to_h2o_plus_da` (or
+  `degraded_to_h2o_only` without DA). Q5 (auditor confirmation) is pending.
+- **Protection-only evidence.** Unverified evidence protects nothing (S-6). Keyword matching is
+  tested over bare, space-prefixed and capitalised forms, and under-protection fails the test (S-7).
+- **Testable H-6 check (S-4).** The cache-length comparison has a test-only injection point; the
+  mutation `if False:` fails the test.
+- **Summary invariants (S-5).** Protected-evicted and evicted-not-candidate counters are tested on a
+  hand-built violating plan.
+
+## 14. Retained entries and matched retention (S-2, S-8)
+
+- Every arm reports `retained_entries_per_layer` (mean, min, max, samples). It is measured as the
+  physical full-attention cache length after each **decode** step; prefill is excluded because the
+  prefill cache is unbounded. Memory fields state the scope: "per decode step, prefill cache
+  unbounded".
+- **Matched retention** calibrates H2O's budget to a STARLIGHT arm's measured mean retained count by
+  measurement (`calibrate_h2o_ratio_to_retained`: bisection over the integer budget, with the real
+  engine as the measure callback). A budget-to-retained formula was tried first and rejected:
+  measured H2O retained count is not a fixed function of its budget (H2O keeps protected entries
+  outside the budget). On the tiny fixture, STARLIGHT's mean is 29.0; the calibrated H2O budget is
+  28, which gives a measured mean of 29.0.
+
+## 15. Stage 2 (CPU reference, `cpu_pytorch_reference_not_vllm`, no speed claims)
+
+**(a) Serving-style `mtp` arm.** On text-only requests of the official checkpoint, `mtp` now commits
+tokens through the verified helper `_speculative_mtp_greedy_k1` (label
+`cpu_greedy_k1_reference_not_vllm_mtp`). EOS is never emitted and stops generation, including an
+accepted EOS draft. `proposed`, `accepted`, `rejected`, `verifier_calls` (one per target forward,
+counted in the loop) and `committed` are measured. Image requests and scaffold engines keep the
+diagnostic path (`speculation_executed` = False). Tests: committed stream equals non-speculative
+greedy for 40 tokens with natural drafts, all-reject, and mixed drafts; verifier calls match an
+instrumented model wrapper.
+
+**(b) Policy-state rollback for `h2o_mtp` and `starlight_s1_mtp`** (new arm, signals da, grounding,
+structural).
+- *Eviction-free rule.* A 2-row verify block runs only when no full-attention layer would evict for
+  either row (H2O: `unprotected_count(l, L+2) <= budget`; STARLIGHT: `L+2 <= budget_total`).
+  Otherwise the pending token is fed alone and no draft is verified (`fallback_steps`). `proposed`
+  counts only verified blocks.
+- *Rollback.* A reject restores the DynamicCache and the policy state atomically: tracker scores,
+  evicted masks, visual masks, budgets, `seq_len`, and the STARLIGHT original-position map. The
+  pending token is then refed through the normal single-row path.
+- *Digests.* `decision_digest` covers evicted masks, budgets and position maps. `policy_digest`
+  adds scores, visual masks and `seq_len`. Both are sha256 over raw bytes.
+- *Exactness.* On a forced reject, the state after refeed equals the normal (non-speculative) run's
+  state at the same logical position, bit-for-bit (the same code path). Measured: all-reject runs
+  reproduce tokens and policy digests at every common position, for H2O and STARLIGHT. For mixed
+  accept/reject runs, retained decisions are identical; score values are not asserted to be
+  bit-identical, because a 2-row attention block is numerically not identical to two single-row
+  steps.
+- *Found and fixed by the equivalence test.* The normal STARLIGHT path builds scripted DA spans
+  (`sink_global`, focus segment) even on text-only prefills. The driver mirrors them.
+- *Limits.* Text-only requests; no evidence pool (grounding not declared, `arm_status`
+  `degraded_text_only_no_evidence`); `da_mtp` stays non-speculative (no 2-row DA mask path); image
+  requests stay on the diagnostic path; the driver does not measure bytes freed (evictions happen).
+
+**(c) Per-KV-head score selection** (upstream fidelity A4-02). `H2OConfig.per_kv_head_selection`,
+default False (default path unchanged). `compute_eviction_plan_per_head` gives each KV head its own
+heavy hitters with the same budget. The shared `compute_eviction_plan` refuses the flag rather than
+silently using the layer mean. **Not wired into the engine**: per-head KV compaction needs a per-head
+gather in the hooked attention, which is not implemented. Tracker level only.
+
+## 16. Open items
+
+- Auditor confirmation of Q5 is pending (lead decision: confirm, do not change).
+- The DA sink is not capped (Q6): INFEASIBLE stays explicit.
+- Per-head selection is not wired into the engine (see §15c).
