@@ -1,0 +1,139 @@
+# Readiness ladder and trust model (ITER3 C1)
+
+Scope: `scripts/harness_inventory.py`. This document says what a status can and cannot mean. It
+does not claim that the benchmark host is trustworthy. It describes what the code checks and who
+would have to be trusted for each claim.
+
+## 1. The ladder
+
+A cell's `ladder_state` is the highest rung such that every check on that rung and on every lower
+rung is `PASS`. Checks are cumulative: a passing GPU check cannot lift a failing static check.
+
+| Rung | Checks on this rung | Meaning |
+|---|---|---|
+| `NONE` | none passing | nothing is established for this cell |
+| `PLAN_AUTHORIZED` | `owner_authorization` | an `ssh-keygen` signature by the owner key verifies over the record, the record names this campaign and the plan's SHA-256, and the record carries `resource` and `approved_on` |
+| `STATIC_PREREQUISITES_VALID` | `arm_supported`, `weights_present`, `weights_verified`, `model_revision_pinned`, `dataset_present`, `dataset_checksum`, `dataset_revision_pinned`, `disk_headroom`, `context_fits` | weights match a manifest whose SHA-256 is owner-signed and that covers every `.safetensors` file; revisions and the dataset checksum equal the signed pins; disk and context budgets hold |
+| `LIVE_ENVIRONMENT_VERIFIED` | `vllm_importable`, `gpu_identity`, `gpu_compute_capability`, `gpu_memory`, `live_probe` | vLLM version and distribution RECORD equal the signed pins; probed GPU name and uuid equal the signed GPU pin; a live probe ran in this process tree and passed (§3) |
+| `GPU_SMOKE_VERIFIED` | `gpu_smoke_receipt` | a receipt listed in the index whose SHA-256 is owner-signed reports `PASS_MEASURED` for this exact cell |
+| `BENCHMARK_CELL_COMPLETED` | — | **unreachable from this inventory.** It exists in the vocabulary so that a future run record can name it. Nothing here can produce it, because there is no attestation of a finished cell. |
+
+`READY` is exactly `GPU_SMOKE_VERIFIED` with every check `PASS`. `status` keeps its earlier meaning:
+the first failing check gives the primary `BLOCKED_*` code, and every failing check is listed in
+`blockers`. A cell that passes all static checks but has no receipt is `NOT_TESTED`, not `READY`.
+
+The rung assignment is the constant `LADDER_RUNGS` in the script. The module refuses to load if a
+check is on zero or two rungs.
+
+## 2. Where each pin comes from
+
+Every pin is read from the **owner-signed record** (`--owner-record`, default `--authorization`). The
+record is used only when its `ssh-keygen -Y verify` succeeds against the owner signer file. The
+signer file must be kept outside the repository and off the benchmark host.
+
+```json
+{
+  "campaigns": [{"campaign_id": "...", "plan_sha256": "..."}],
+  "resource": "NVIDIA A100-SXM4-40GB x1, 40 GPU-hours",
+  "approved_on": "YYYY-MM-DD",
+  "pins": {
+    "models": {"qwen35_08b": {"revision": "<40-hex>", "weights_manifest_sha256": "<64-hex>"}},
+    "datasets": {"memlens": {"revision": "<40-hex>", "native_sha256": "<64-hex>"}},
+    "vllm": {"version": "0.29.0", "distribution_record_sha256": "<64-hex>"},
+    "receipt_index_sha256": "<64-hex>",
+    "gpu": {"name": "NVIDIA A100-SXM4-40GB", "uuid": "GPU-..."}
+  }
+}
+```
+
+What is **not** a pin:
+
+- `revision`, `native_sha256` and `vllm_pin` in the pilot config (`configs/a100_qwen_priority_pilot.json`).
+  Those values are shown in the report under `config_values_ignored` and are never used.
+- `--pin-manifest`. The flag was removed.
+- A `starlight_local_manifest.json` on disk. Its own SHA-256 must be in the signed record.
+- A `GPU_RECEIPT_INDEX.json` on disk. Its SHA-256 must be in the signed record. An index that is
+  not signed counts for nothing, even when every receipt it lists matches.
+- A dataset file's checksum written next to the file.
+- `nvidia-smi` output reporting the planned name. The name and uuid must both equal the signed GPU pin.
+
+A signed pin that is missing or malformed is treated as absent. Degenerate revisions (one to three
+distinct hex characters) are refused even when signed.
+
+## 3. The live probe
+
+`LIVE_PROBE_CODE` runs in a separate interpreter (`python -I`) with a fresh nonce. The parent
+checks, against the signed values:
+
+- the echoed nonce and that the probe process is not the parent;
+- `vllm` distribution version, `vllm` and `vllm._C` import, and the RECORD SHA-256;
+- the GPU name and uuid reported by `nvidia-smi`;
+- a CUDA kernel's result and device name;
+- the weight SHA-256 and size of every file in the signed weights manifest, recomputed in that process.
+
+`evaluate_probe` lists every refusal reason. A missing signed value is a refusal, not a skipped check.
+
+## 4. Trust model: what this can and cannot establish
+
+**The only external trust anchor is the owner's signing key.** Everything else the inventory reads is
+produced on the benchmark host:
+
+- weight hashes and file sizes;
+- the vLLM RECORD hash and version;
+- `nvidia-smi` name, uuid and compute capability;
+- the live probe's report, including its nonce echo and CUDA result;
+- the receipt files and their hashes;
+- disk usage.
+
+A local actor who controls this host can change any of these. A patched vLLM with a rewritten
+RECORD, a mocked `nvidia-smi`, a probe that prints the expected JSON, or a receipt that was written
+by hand and then hashed into the index all produce the same output as a genuine run, **unless the
+signed record was also written by the owner**. The signed record is what defeats these attacks, and
+it defeats them only when the owner's key is off this host.
+
+So:
+
+- `READY` means: at the moment of this run, every precondition was observed on this host, and
+  the observations matched values the owner signed. It is **not** an attestation that the hardware
+  or software is what it claims, and it is not evidence that a benchmark cell ran.
+- Self-generated checksums, self-generated receipts and self-reported GPU identity are not
+  hardware attestation. They are consistency checks against the owner's signed values.
+- The tests in `tests/test_harness_pins.py`, `tests/test_harness_forgery.py` and
+  `tests/test_harness_live_probe.py` show that the inventory refuses the forgeries listed in
+  §5. They do not show that a determined local actor is stopped. No test here can.
+
+Stronger evidence would need an external anchor that this host cannot write to: a remote attestation
+service, a signed log written off-host, or the owner re-running the probe on a machine they control.
+None of those exist in this repository. This is a documented gap, not a solved problem.
+
+## 5. Adversarial cases covered by tests
+
+| Forgery | Result | Test |
+|---|---|---|
+| config revisions and checksums with no signed record | `model_revision_pinned` and `dataset_checksum` FAIL | `test_config_revisions_alone_do_not_pin_a_revision` |
+| weights manifest pinned by the local actor on the command line or on disk | not a pin: `manifest_verified` False | `test_a_weights_manifest_pin_outside_the_signed_record_is_not_a_pin` |
+| dataset checksum written by the local actor | not verified | `test_a_dataset_checksum_written_by_the_local_actor_does_not_verify_the_dataset` |
+| receipt index whose hash is not the signed one | no receipt counts | `test_a_receipt_index_whose_hash_is_not_the_signed_pin_counts_nothing` |
+| receipt index with no signed hash, or edited after signing | no receipt counts | `test_an_index_without_a_signed_hash_counts_nothing`, `test_an_index_edited_after_it_was_signed_counts_nothing` |
+| GPU with the planned name but another uuid | `gpu_identity` FAIL | `test_a_gpu_with_the_planned_name_but_another_uuid_fails_the_identity_check` |
+| GPU that self-reports the right name with no signed pin | `gpu_identity` FAIL | `test_a_self_reported_gpu_with_the_right_name_and_no_signed_pin_fails_identity` |
+| stub vLLM package | not verified | `test_stub_vllm_package_is_not_verified` |
+| vLLM with the right version string and a different RECORD | not verified | `test_vllm_whose_distribution_record_differs_from_the_signed_pin_is_refused` |
+| vLLM with the right RECORD and another version | not verified | `test_vllm_with_the_right_record_but_another_version_is_refused` |
+| probe RECORD or GPU uuid differing from the signed pin | probe refused | `test_a_vllm_distribution_record_differing_from_the_signed_pin_is_refused`, `test_a_gpu_with_the_signed_name_but_another_uuid_is_refused` |
+| signed plan with forged environment | zero READY | `test_full_bundle_with_a_signed_owner_plan_and_forged_environment_is_zero_ready` |
+| no reachable path to `BENCHMARK_CELL_COMPLETED` | never reported | `test_no_environment_reaches_benchmark_cell_completed` |
+
+Positive controls exist for the vLLM and receipt-index cases, so the verifiers are not simply
+refusing everything.
+
+## 6. Not closed
+
+- **Sentinel-file checks on vLLM.** The brief asked for RECORD and sentinel-file mismatch. The RECORD
+  hash is implemented. A sentinel file (for example a hash of `vllm/_C*.so`) would need its own
+  signed pin, and none is defined. Not implemented.
+- **External anchor.** See §4. Not available in this repository.
+- **Owner signature itself.** The inventory verifies the signature. It cannot check that the owner
+  made the decision the record describes.
+- **Pilot GPU run.** No cell is READY and none has a smoke receipt. The GPU run is still unexecuted
+  (see `docs/harness/GPU_RUNBOOK.md`).
