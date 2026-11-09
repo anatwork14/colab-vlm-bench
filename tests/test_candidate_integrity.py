@@ -27,6 +27,14 @@ def candidate(sid="source-1__text2048", dataset="memlens", length=2048):
     }
 
 
+def test_generic_jsonl_reader_reports_damaged_line(tmp_path):
+    from vlmbench.workloads import load_jsonl
+    broken = tmp_path / "derived.jsonl"
+    broken.write_text('{"id": "unterminated string\n', encoding="utf-8")
+    with pytest.raises(WorkloadError, match="INVALID_JSONL .* line 1 col"):
+        load_jsonl(broken, dataset="memlens", track="derived_serving")
+
+
 def test_corrupt_first_line_caught_before_gpu(tmp_path):
     file = tmp_path / "previously-existed.jsonl"
     file.write_text('{"id": "unterminated string\n', encoding="utf-8")
