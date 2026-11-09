@@ -211,7 +211,7 @@ def test_h2o_sequence_above_min_budget_physical_eviction():
 
     # Compaction must have physically triggered and freed bytes
     assert res.physical_kv_bytes_freed > 0, "H2O must physically free bytes when seq_len > min_budget"
-    assert res.logical_selection_fraction > 0.0
+    assert res.per_step_evicted_slot_rate > 0.0
     assert res.physical_kv_bytes_allocated > 0
     engine.close()
 
@@ -260,7 +260,7 @@ def test_all_seven_arms_real_neural_forward_and_gates():
 
         if "h2o" in arm:
             assert res.physical_kv_bytes_freed >= 0
-            assert res.logical_selection_fraction >= 0.0
+            assert res.per_step_evicted_slot_rate >= 0.0
         if "da" in arm:
             # Small prompts may genuinely have zero exclusion: do not demand
             # a positive sparsity measurement where no selective read is needed.
@@ -758,3 +758,25 @@ def test_p7_r3_h2o_telemetry_states_multimodal_compression_limitation():
     assert "protected" in acct["limitation"].lower()
     assert acct["unprotected_original_h2o_variant"] == "NOT_IMPLEMENTED_OWNER_DECISION"
     engine.close()
+
+
+def test_r4_h2o_telemetry_has_explicit_cumulative_fields():
+    """R4-1: the ambiguous per-step 'logical_selection_fraction' is replaced by explicitly named
+    cumulative fields plus a clearly per-step rate. Still no physical VRAM saving is claimed."""
+    cfg = _p7_small_cfg()
+    prompt = list(range(10, 50))
+    engine = RealSevenArmEngine(method_arm="h2o_base", config=cfg, device="cpu")
+    try:
+        res = engine.execute_request("r4_h2o_fields", prompt_token_ids=prompt,
+                                     max_new_tokens=6, image_present=False)
+    finally:
+        engine.close()
+    assert not hasattr(res, "logical_selection_fraction")
+    acc = res.telemetry["h2o_logical_selection_accounting"]
+    assert "logical_selection_fraction" not in acc
+    assert isinstance(acc["per_step_evicted_slot_rate"], float)
+    assert acc["cumulative_total_slots_at_prefill"] == len(cfg.full_attention_layers) * len(prompt)
+    assert isinstance(acc["cumulative_evicted_slots"], int) and acc["cumulative_evicted_slots"] >= 0
+    assert isinstance(acc["final_retained_fraction"], float)
+    assert acc["physical_vram_saving_claimed"] is False
+    assert "no physical" in acc["limitation"].lower() or "not measured" in acc["limitation"].lower()
