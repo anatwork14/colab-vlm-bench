@@ -992,9 +992,9 @@ def _da_scripted_tags(
 # STARLIGHT Stage 1 (cpu_pytorch_reference_not_vllm): arm -> enabled controller signals.
 # The seven original arms are not in this map; their behaviour is unchanged.
 STARLIGHT_ARM_SIGNALS: dict[str, tuple[str, ...]] = {
-    "starlight_s1": ("da", "grounding"),
-    "starlight_s1_no_da": ("grounding",),
-    "starlight_s1_no_grounding": ("da",),
+    "starlight_s1": ("da", "grounding", "structural"),
+    "starlight_s1_no_da": ("grounding", "structural"),
+    "starlight_s1_no_grounding": ("da", "structural"),
 }
 STARLIGHT_MEASUREMENT_LABEL = "cpu_pytorch_reference_not_vllm"
 # Arms that run the DA attention mask. Exact membership, never a substring test: the name
@@ -1008,7 +1008,8 @@ EVIDENCE_REASON_CODES: dict[str, str] = {
     "unverified": "UNVERIFIED_EVIDENCE",
 }
 GDN_EXEMPT_LABEL = "GDN_EXEMPT_NOT_TOKEN_ADDRESSABLE"
-STRUCTURAL_POLICY_LABEL = "NOT_RATIFIED_A4_POLICY_DEPENDENT"
+# Lead decision Q2: vision_start/vision_end are protected as an explicit structural source.
+STRUCTURAL_POLICY_LABEL = "PROTECTED_LEAD_DECISION_Q2"
 
 
 def _image_sha256(image_bytes: bytes | None, image_path: str | Path | None) -> str | None:
@@ -1441,6 +1442,7 @@ class RealSevenArmEngine:
         da_spans: Sequence[tuple[str, int, int]],
         grounding_positions: dict[int, tuple[str, ...]],
         enabled: Sequence[str],
+        structural: dict[int, tuple[str, ...]] | None = None,
     ) -> tuple[dict[int, torch.Tensor], dict[int, np.ndarray], list[StarlightLayerPlan]]:
         """One decode step of STARLIGHT Stage 1 over every full-attention layer (CPU reference).
 
@@ -1468,16 +1470,21 @@ class RealSevenArmEngine:
                 (label, pos, pos + 1) for pos, labels in grounding_positions.items() for label in labels
             ]
             gr_slots = da_protection_from_spans(grounding_spans, orig) if "grounding" in enabled_t else {}
+            structural_spans = [
+                (label, pos, pos + 1) for pos, labels in (structural or {}).items() for label in labels
+            ]
+            st_slots = da_protection_from_spans(structural_spans, orig) if "structural" in enabled_t else {}
             if k_len <= budget_total:
                 candidates: list[int] = []  # within budget: nothing to evict
             else:
-                n_protected = len(set(da_slots) | set(gr_slots))
+                n_protected = len(set(da_slots) | set(gr_slots) | set(st_slots))
                 effective = budget_total - n_protected if n_protected <= budget_total else 0
                 keep = tracker.keep_mask_without_protection(l_idx, k_len, effective)
                 candidates = np.flatnonzero(~keep).tolist()
             plan = plan_starlight_layer(
                 layer=l_idx, length=k_len, budget=budget_total, h2o_candidates=candidates,
-                signals={"da": da_slots, "grounding": gr_slots}, enabled_signals=enabled_t,
+                signals={"da": da_slots, "grounding": gr_slots, "structural": st_slots},
+                enabled_signals=enabled_t,
             )
             retained = np.asarray(plan.retained, dtype=np.int64)
             plans_tensor[l_idx] = torch.as_tensor(retained, dtype=torch.long, device=self.device)
@@ -1516,10 +1523,14 @@ class RealSevenArmEngine:
                     "h2o_candidate": d.h2o_candidate,
                     "da_protected": any(sig.startswith("da:") for sig in d.signals_fired),
                     "grounding_protected": any(sig.startswith("grounding:") for sig in d.signals_fired),
+                    "structural_protected": any(sig.startswith("structural:") for sig in d.signals_fired),
                     "decision": d.decision,
                     "reason_code": d.reason_code,
                 })
-            n_protected = sum(1 for e in entries if e["da_protected"] or e["grounding_protected"])
+            n_protected = sum(
+                1 for e in entries
+                if e["da_protected"] or e["grounding_protected"] or e["structural_protected"]
+            )
             records.append({
                 "step": step,
                 "phase": "decode",
@@ -1657,6 +1668,7 @@ class RealSevenArmEngine:
         starlight_next_orig: dict[int, np.ndarray] = {}
         starlight_records: list[dict[str, Any]] = []
         starlight_structural: set[int] = set()
+        starlight_structural_labels: dict[int, tuple[str, ...]] = {}
         starlight_structural_evicted = 0
         starlight_cache_mismatch_steps = 0
         if starlight_active:
@@ -1669,10 +1681,12 @@ class RealSevenArmEngine:
             starlight_text_positions = np.asarray(
                 [i for i, t in enumerate(full_prompt) if t not in visual_ids], dtype=np.int64,
             )
-            starlight_structural = {
-                i for i, t in enumerate(full_prompt)
-                if t in (self.config.vision_start_token_id, self.config.vision_end_token_id)
-            }
+            for i, t in enumerate(full_prompt):
+                if t == self.config.vision_start_token_id:
+                    starlight_structural_labels[i] = ("vision_start",)
+                elif t == self.config.vision_end_token_id:
+                    starlight_structural_labels[i] = ("vision_end",)
+            starlight_structural = set(starlight_structural_labels)
             if "da" in starlight_enabled:
                 # SCRIPTED DIAGNOSTIC DA scope, anchored to the prefill. Only GLOBAL (sink, question) and
                 # FOCUS spans protect; the LOCAL window is a mask-only scope and does not protect.
@@ -1844,6 +1858,7 @@ class RealSevenArmEngine:
                 h2o_eviction_plans, starlight_next_orig, step_plans = self._starlight_build_step_plans(
                     tracker, k_lens, starlight_orig, curr_len - 1, starlight_budget,
                     starlight_da_spans, starlight_grounding, starlight_enabled,
+                    structural=starlight_structural_labels,
                 )
                 starlight_summaries.append(summarize_plans(step_plans))
                 step_records, step_structural = self._starlight_step_records(
@@ -2182,6 +2197,17 @@ class RealSevenArmEngine:
         )
         if starlight_active:
             summary = combine_summaries(starlight_summaries)
+            # Lead decision Q4: not fail-closed. A missing or unusable grounding declaration is flagged,
+            # and the arm reports the degraded configuration it actually ran.
+            grounding_missing = (
+                "grounding" in starlight_enabled and starlight_grounding_status != "ACTIVE"
+            )
+            if not grounding_missing:
+                arm_status = "nominal"
+            elif "da" in starlight_enabled:
+                arm_status = "degraded_to_h2o_plus_da"
+            else:
+                arm_status = "degraded_to_h2o_only"
             grounding_by_evidence: dict[str, int] = {}
             for labels in starlight_grounding.values():
                 for eid in labels:
@@ -2199,6 +2225,8 @@ class RealSevenArmEngine:
                     "SCRIPTED_DIAGNOSTIC_NOT_MODEL_DECLARED" if "da" in starlight_enabled else "DISABLED_ABLATION"
                 ),
                 "grounding_signal_status": starlight_grounding_status,
+                "grounding_declaration_missing": grounding_missing,
+                "arm_status": arm_status,
                 "grounding_evidence_verdicts": starlight_verdicts,
                 "grounding_protected_by_evidence": grounding_by_evidence,
                 "candidate_basis": "H2O keep set over all positions with NO internal protection, at budget - protected",
