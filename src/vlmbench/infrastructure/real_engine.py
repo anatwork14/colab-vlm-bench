@@ -53,7 +53,8 @@ from .declarative_attention import DAConfig, DAFSM, DAMaskGenerator, DATag, DATa
 from .grounding_evidence import ECRDConfig, EvidencePool, EvidenceItem, ECRDLogitsProcessor
 from .starlight import (
     STATUS_INFEASIBLE, StarlightLayerPlan, combine_summaries, compact_orig_positions,
-    da_protection_from_spans, evidence_provenance, evidence_validity, grounding_protection_from_pool,
+    VISUAL_EVIDENCE_NOTE, da_protection_from_spans, evidence_provenance, evidence_validity,
+    grounding_protection_from_pool, visual_evidence_protection_status,
     plan_starlight_layer, summarize_plans,
 )
 from .adapters import HardwareGateError, check_vllm_hardware_compatibility
@@ -2970,6 +2971,9 @@ class RealSevenArmEngine:
                 "grounding_evidence_verdicts": starlight_verdicts,
                 # ITER3 R2 C-3: `verified` is a caller declaration; source hash is checked only vs image bytes.
                 "grounding_evidence_provenance": starlight_provenance,
+                # ITER3 R2 C-5: image evidence protects no visual tokens. Stated, never silent.
+                "visual_evidence_protection": visual_evidence_protection_status(evidence_pool),
+                "visual_evidence_protection_note": VISUAL_EVIDENCE_NOTE,
                 "grounding_protected_by_evidence": grounding_by_evidence,
                 "candidate_basis": (
                     "SHARED H2O keep set (mean of head-mean scores over all full-attention layers) over all "

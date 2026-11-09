@@ -476,6 +476,28 @@ def evidence_provenance(pool: Any, image_sha256: str | None) -> dict[str, dict[s
     return out
 
 
+VISUAL_EVIDENCE_NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
+VISUAL_EVIDENCE_NOTE = (
+    "Grounding protects token spans of evidence KEYWORDS in the text prompt only. image_region evidence "
+    "protects NO visual tokens (no bounding-box-to-vision-token mapping exists). Visual evidence coverage is "
+    "not claimed."
+)
+
+
+def visual_evidence_protection_status(pool: Any) -> str:
+    """ITER3 R2 C-5: explicit status of protection for image evidence. Never a silent pass.
+
+    NOT_IMPLEMENTED when the pool declares any image_region evidence (the controller protects none of its
+    visual tokens); NO_IMAGE_EVIDENCE_DECLARED when the pool has only text evidence; NO_EVIDENCE_DECLARED
+    without a pool.
+    """
+    if pool is None:
+        return "NO_EVIDENCE_DECLARED"
+    if any(item.modality == "image_region" for item in pool.items()):
+        return VISUAL_EVIDENCE_NOT_IMPLEMENTED
+    return "NO_IMAGE_EVIDENCE_DECLARED"
+
+
 def grounding_protection_from_pool(
     pool: Any,
     prompt_ids: Sequence[int],
