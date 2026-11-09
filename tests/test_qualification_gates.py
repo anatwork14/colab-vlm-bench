@@ -205,3 +205,40 @@ def test_main_refuses_existing_receipt_before_running_any_test(tmp_path, monkeyp
         qual.main()
     assert exc.value.code != 0
     assert existing.read_text(encoding="utf8") == "{}"
+
+
+# ITER2 G-1 (REVIEW_ITER2 §4): the MTP gate reads the MTP arms only. Non-MTP arms have no MTP
+# correctness to report, so their values never enter the gate.
+
+def test_non_mtp_arms_do_not_turn_a_gated_mtp_gate_into_fail():
+    tests = _all_passing_tests()
+    for arm in ("base", "h2o_base", "da_base", "ecrd_base"):
+        tests["test_d_seven_arms"]["arms"][arm]["gates"]["MTP_CORRECTNESS_PASS"] = "NOT_APPLICABLE"
+    gates = qual.compute_release_gates(tests, device_name=GPU)
+    assert gates["MTP_CORRECTNESS_PASS"] == ENGINE_GATES["MTP_CORRECTNESS_PASS"]
+
+
+def test_an_mtp_arm_disagreeing_with_the_others_still_fails_the_gate():
+    tests = _all_passing_tests()
+    tests["test_d_seven_arms"]["arms"]["da_mtp"]["gates"]["MTP_CORRECTNESS_PASS"] = "PASS"
+    gates = qual.compute_release_gates(tests, device_name=GPU)
+    assert gates["MTP_CORRECTNESS_PASS"] == "FAIL"
+
+
+def test_not_applicable_is_not_a_gate_value():
+    gates = qual.compute_release_gates(_all_passing_tests(), device_name=GPU)
+    assert "NOT_APPLICABLE" not in gates.values()
+
+
+def test_a_missing_mtp_arm_leaves_the_mtp_gate_not_tested():
+    tests = _all_passing_tests()
+    del tests["test_d_seven_arms"]["arms"]["da_mtp"]
+    gates = qual.compute_release_gates(tests, device_name=GPU)
+    assert gates["MTP_CORRECTNESS_PASS"] == "NOT_TESTED"
+
+
+def test_an_mtp_arm_reporting_not_applicable_leaves_the_mtp_gate_not_tested():
+    tests = _all_passing_tests()
+    tests["test_d_seven_arms"]["arms"]["h2o_mtp"]["gates"]["MTP_CORRECTNESS_PASS"] = "NOT_APPLICABLE"
+    gates = qual.compute_release_gates(tests, device_name=GPU)
+    assert gates["MTP_CORRECTNESS_PASS"] == "NOT_TESTED"

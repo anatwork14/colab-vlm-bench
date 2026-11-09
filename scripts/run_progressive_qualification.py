@@ -631,15 +631,30 @@ def _combine(*statuses: str) -> str:
     return "NOT_TESTED"
 
 
-def _engine_gate(test_d: dict[str, Any] | None, name: str) -> str:
-    """The value the engine itself reported, used only if every arm reporting it agrees."""
+MTP_ARMS = ("mtp", "h2o_mtp", "da_mtp")
+
+
+def _engine_gate(test_d: dict[str, Any] | None, name: str, arms: tuple[str, ...] | None = None) -> str:
+    """The value the engine itself reported, used only if every arm in scope reports it and they agree.
+
+    `arms` limits the gate to the arms it describes (None = all arms). A missing arm in scope, or a
+    `NOT_APPLICABLE` value, is NOT_TESTED: NOT_APPLICABLE is not a gate value.
+    """
     status = _test_status(test_d)
     if status != "PASS":
         return status
-    values = {arm["gates"][name] for arm in (test_d or {}).get("arms", {}).values() if name in arm.get("gates", {})}
-    if not values:
+    reported = (test_d or {}).get("arms", {})
+    scope = list(reported) if arms is None else list(arms)
+    if not scope or any(arm not in reported for arm in scope):
         return "NOT_TESTED"
-    return values.pop() if len(values) == 1 else "FAIL"
+    if any(name not in reported[arm].get("gates", {}) for arm in scope):
+        return "NOT_TESTED"
+    values = {reported[arm]["gates"][name] for arm in scope}
+    if "NOT_APPLICABLE" in values:
+        return "NOT_TESTED"
+    if len(values) != 1:
+        return "FAIL"
+    return values.pop()
 
 
 def compute_release_gates(tests: dict[str, dict[str, Any]], device_name: str) -> dict[str, str]:
@@ -651,7 +666,7 @@ def compute_release_gates(tests: dict[str, dict[str, Any]], device_name: str) ->
         "REAL_MODEL_FORWARD_PASS": _combine(_test_status(a), _test_status(b)),
         "REAL_MULTIMODAL_INFERENCE_PASS": _combine(_test_status(c), _test_status(d)),
         "SEVEN_ARM_PRETRAINED_PASS": _test_status(d),
-        "MTP_CORRECTNESS_PASS": _engine_gate(d, "MTP_CORRECTNESS_PASS"),
+        "MTP_CORRECTNESS_PASS": _engine_gate(d, "MTP_CORRECTNESS_PASS", arms=MTP_ARMS),
         "MTP_PROPOSAL_DIAGNOSTIC_PASS": _test_status(e),
         "CCU_REQUEST_ISOLATION_TEST_PASS": _test_status(g),
         # This script runs no vLLM scheduler load test and no A100 run.
