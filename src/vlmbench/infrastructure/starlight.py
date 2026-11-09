@@ -233,20 +233,29 @@ def plan_starlight_layer(
 
 
 def summarize_plans(plans: Sequence[StarlightLayerPlan]) -> dict[str, Any]:
-    """Aggregate per-layer plans into the telemetry fields reported by the engine."""
+    """Aggregate per-layer plans into the telemetry fields reported by the engine.
+
+    `protected_evicted` and `evicted_not_candidate` are invariant counters. Both must be 0:
+    they are recomputed from the decisions, not assumed from the policy.
+    """
     conflicts: Counter[str] = Counter()
     protected: Counter[str] = Counter()
     statuses: Counter[str] = Counter()
-    vetoed = 0
-    evicted = 0
-    retained = 0
+    vetoed = evicted = retained = protected_evicted = evicted_not_candidate = 0
+    max_retained = 0
     for p in plans:
         vetoed += p.h2o_candidates_vetoed
         evicted += len(p.evicted)
         retained += len(p.retained)
+        max_retained = max(max_retained, len(p.retained))
         statuses[p.status] += 1
         conflicts.update(p.conflicts_by_source)
         protected.update(p.protected_count_by_source)
+        for d in p.decisions:
+            if d.decision == DECISION_EVICT and d.internally_protected:
+                protected_evicted += 1
+            if d.decision == DECISION_EVICT and not d.h2o_candidate:
+                evicted_not_candidate += 1
     return {
         "measurement_label": MEASUREMENT_LABEL,
         "layers": [p.layer for p in plans],
@@ -261,4 +270,159 @@ def summarize_plans(plans: Sequence[StarlightLayerPlan]) -> dict[str, Any]:
         "status_counts": dict(statuses),
         "evicted_total": evicted,
         "retained_total": retained,
+        "max_retained_per_layer": max_retained,
+        "protected_evicted": protected_evicted,
+        "evicted_not_candidate": evicted_not_candidate,
     }
+
+
+def combine_summaries(summaries: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Sum per-step summaries (from summarize_plans) into one request-level record."""
+    total: dict[str, Any] = {
+        "measurement_label": MEASUREMENT_LABEL,
+        "steps": 0,
+        "h2o_candidates_vetoed": 0,
+        "conflicts_resolved_by_protection": 0,
+        "conflicts_by_source": {src: 0 for src in SIGNAL_SOURCES},
+        "protected_count_by_source": {"da": 0, "grounding": 0, "union": 0},
+        "status_counts": {},
+        "evicted_total": 0,
+        "retained_total": 0,
+        "max_retained_per_layer": 0,
+        "protected_evicted": 0,
+        "evicted_not_candidate": 0,
+    }
+    for s in summaries:
+        total["steps"] += 1
+        for key in ("h2o_candidates_vetoed", "conflicts_resolved_by_protection", "evicted_total",
+                    "retained_total", "protected_evicted", "evicted_not_candidate"):
+            total[key] += int(s[key])
+        total["max_retained_per_layer"] = max(total["max_retained_per_layer"], int(s["max_retained_per_layer"]))
+        for src in SIGNAL_SOURCES:
+            total["conflicts_by_source"][src] += int(s["conflicts_by_source"].get(src, 0))
+        for key in ("da", "grounding", "union"):
+            total["protected_count_by_source"][key] += int(s["protected_count_by_source"].get(key, 0))
+        for status, n in s["status_counts"].items():
+            total["status_counts"][status] = total["status_counts"].get(status, 0) + int(n)
+    return total
+
+
+# --- Signal sources ---------------------------------------------------------------------------
+# Pure helpers that turn engine-side declarations into the {idx: labels} maps the policy reads.
+# No torch: each takes plain sequences, so a different backend can reuse them unchanged.
+
+
+def da_protection_from_spans(
+    spans: Iterable[tuple[str, int, int]], original_positions: Sequence[int],
+) -> dict[int, tuple[str, ...]]:
+    """DA scope spans (label, start, end) on ORIGINAL token positions -> physical-slot labels.
+
+    `original_positions[i]` is the original absolute position of physical slot i. Spans are
+    matched on that original position, so protection follows the token through KV compaction.
+    Spans come from the scripted DA diagnostic (sink/GLOBAL, FOCUS, readable question); the LOCAL
+    window is a mask-only scope and is not passed here.
+    """
+    normalized: list[tuple[str, int, int]] = []
+    for label, start, end in spans:
+        if not isinstance(label, str) or not label:
+            raise ValueError("DA span label must be a non-empty string")
+        if not isinstance(start, int) or not isinstance(end, int) or start < 0 or end < start:
+            raise ValueError(f"malformed DA span ({label!r}, {start}, {end})")
+        if end > start:
+            normalized.append((label, start, end))
+    protected: dict[int, tuple[str, ...]] = {}
+    for slot, pos in enumerate(original_positions):
+        labels = tuple(label for label, start, end in normalized if start <= pos < end)
+        if labels:
+            protected[slot] = labels
+    return protected
+
+
+def compact_orig_positions(
+    original_positions: Sequence[int],
+    retained: Sequence[int] | None,
+    appended: int | None,
+) -> list[int]:
+    """Track original positions through one step: append the new token, or compact by retained.
+
+    `retained` must be sorted, unique and in range (the same contract as the H2O tracker).
+    """
+    if retained is None:
+        if appended is None:
+            raise ValueError("either retained or appended must be given")
+        return [int(p) for p in original_positions] + [int(appended)]
+    idx = [int(i) for i in retained]
+    if any(i < 0 or i >= len(original_positions) for i in idx):
+        raise ValueError("retained index out of range")
+    if any(b <= a for a, b in zip(idx, idx[1:])):
+        raise ValueError("retained indices must be sorted and unique")
+    return [int(original_positions[i]) for i in idx]
+
+
+def match_token_spans(prompt_ids: Sequence[int], needle_ids: Sequence[int]) -> list[int]:
+    """Start indices of every contiguous occurrence of needle_ids in prompt_ids."""
+    needle = [int(t) for t in needle_ids]
+    n = len(needle)
+    if n == 0:
+        return []
+    prompt = [int(t) for t in prompt_ids]
+    return [i for i in range(len(prompt) - n + 1) if prompt[i:i + n] == needle]
+
+
+def evidence_validity(pool: Any, current_request_id: str, image_sha256: str | None) -> dict[str, tuple[str, str]]:
+    """Per evidence id: (status, reason) with status in {valid, expired, stale, unverified}.
+
+    - expired: the pool was built for a different request id (it outlived its request).
+    - stale: the image source hash differs from the source the evidence was declared against.
+    - text-only requests have no image hash to check; they are valid with an explicit
+      `source_unchecked_text_only` reason, so the gap stays visible in telemetry.
+    """
+    verdicts: dict[str, tuple[str, str]] = {}
+    if pool is None:
+        return verdicts
+    for item in pool.items():
+        if not item.verified:
+            verdicts[item.evidence_id] = ("unverified", "verified_false")
+        elif pool.request_id != current_request_id:
+            verdicts[item.evidence_id] = ("expired", "pool_request_id_mismatch")
+        elif image_sha256 is None:
+            verdicts[item.evidence_id] = ("valid", "source_unchecked_text_only")
+        elif item.source_sha256.lower() != image_sha256.lower():
+            verdicts[item.evidence_id] = ("stale", "source_sha256_mismatch")
+        else:
+            verdicts[item.evidence_id] = ("valid", "source_sha256_match")
+    return verdicts
+
+
+def grounding_protection_from_pool(
+    pool: Any,
+    prompt_ids: Sequence[int],
+    encode: Any,
+    current_request_id: str,
+    image_sha256: str | None,
+) -> dict[int, tuple[str, ...]]:
+    """Grounding-protected prompt positions: token spans of valid evidence keywords.
+
+    Uses the same keyword index ECRD matches on. Each keyword is tokenized in the bare,
+    space-prefixed and capitalised forms, and every contiguous occurrence in the prompt is
+    protected, labelled with the evidence ids it supports. Only `valid` evidence protects.
+    Benchmark answers are never read: the input is the pool's declared keywords and the prompt.
+    Keyword matching is token-level, so a word split across tokens in a different way can be
+    missed (documented limitation).
+    """
+    if pool is None:
+        return {}
+    verdicts = evidence_validity(pool, current_request_id, image_sha256)
+    valid_ids = {eid for eid, (status, _) in verdicts.items() if status == "valid"}
+    protected: dict[int, set[str]] = {}
+    for keyword, evidence_ids in pool.keyword_index().items():
+        supporting = [eid for eid in evidence_ids if eid in valid_ids]
+        if not supporting:
+            continue
+        variants = {keyword, f" {keyword}", keyword.capitalize(), f" {keyword.capitalize()}"}
+        for variant in sorted(variants):
+            tokens = list(encode(variant))
+            for start in match_token_spans(prompt_ids, tokens):
+                for pos in range(start, start + len(tokens)):
+                    protected.setdefault(pos, set()).update(supporting)
+    return {pos: tuple(sorted(ids)) for pos, ids in sorted(protected.items())}
