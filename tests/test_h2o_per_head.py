@@ -2,7 +2,8 @@
 
 Default (per_kv_head_selection=False) keeps the layer-mean selection unchanged. With the flag on,
 each KV head keeps its own heavy hitters with the same budget; the recent window is shared. The
-flag is refused by the shared compute_eviction_plan (no silent mean-based result) and is NOT wired
+flag is refused by the shared compute_eviction_plan and by the STARLIGHT keep_mask_without_protection
+(no silent mean-based result) and is NOT wired
 into the engine: per-head KV compaction needs a per-head gather in the hooked attention, which is
 not implemented. Tracker-level only; cpu_pytorch_reference_not_vllm.
 """
@@ -83,3 +84,10 @@ def test_per_head_plan_with_unset_budget_computes_it_without_storing_it_or_paddi
     assert np.array_equal(t.layers[0].evicted_mask, mask_before)
     assert t.layers[0].scores.shape == scores_shape_before
 
+
+def test_starlight_candidate_path_refuses_the_per_head_flag_instead_of_running_the_mean():
+    # ITER2 D10 N-13 (review): keep_mask_without_protection is the STARLIGHT candidate selection and
+    # is layer-mean based. With the per-head flag on it must refuse, not silently ignore the flag.
+    t = _tracker(per_head=True)
+    with pytest.raises(NotImplementedError, match="per_kv_head_selection"):
+        t.keep_mask_without_protection(0, length=12, keep_budget=5)

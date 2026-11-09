@@ -30,7 +30,8 @@ class H2OConfig:
     tie_breaking: str = "recent"       # Deterministic tie-breaking: 'recent' prefers later tokens
     # ITER2 Stage 2(c), upstream fidelity A4-02. Opt-in. False (default) keeps the layer-mean
     # selection. True selects heavy hitters PER KV HEAD via compute_eviction_plan_per_head; the
-    # shared compute_eviction_plan refuses it. Not wired into the engine (needs per-head KV gather).
+    # shared compute_eviction_plan and the STARLIGHT keep_mask_without_protection both refuse it
+    # (ITER2 D10 N-13). Not wired into the engine (needs per-head KV gather).
     per_kv_head_selection: bool = False
 
 
@@ -300,7 +301,15 @@ class H2OCacheTracker:
         candidates that are protected instead of evicting them. Existing h2o_base behaviour is
         unchanged; this is a separate method and does not touch the layer's budget or masks.
         Returns a bool keep mask of length `length` with exactly min(keep_budget, length) True.
+
+        Refuses per_kv_head_selection=True (ITER2 D10 N-13): this candidate selection is layer-mean
+        based and would silently ignore the flag. Per-head STARLIGHT candidates are not implemented.
         """
+        if self.config.per_kv_head_selection:
+            raise NotImplementedError(
+                "per_kv_head_selection is not supported on the STARLIGHT candidate path: "
+                "keep_mask_without_protection is layer-mean based and would silently ignore the flag"
+            )
         if length < 0 or keep_budget < 0:
             raise ValueError("length and keep_budget must be non-negative")
         keep = np.zeros(length, dtype=bool)
