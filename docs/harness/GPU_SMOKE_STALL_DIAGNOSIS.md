@@ -35,7 +35,7 @@ The faulthandler dump at 90 s shows the stack inside `RealSevenArmEngine.__init_
 
 ## D9 update: short CPU fp32 reference (decision c), BLOCKED
 
-- The GPU run completed: `RUN_COMPLETED` in 12.3 s, receipt `artifacts/runs/20261109T200806Z_pytorch_reference_gtx1080ti_smoke_gpu_fp16.json`. The first GPU attempt was `RUN_INCOMPLETE` only because the check required 8 tokens; the engine stops at EOS (`<|im_end|>`, id 248046), which is correct. Fixed in `960fb17`.
+- The GPU run completed: `RUN_COMPLETED` in 12.3 s, receipt `artifacts/runs/20261109T200806Z_pytorch_reference_gtx1080ti_smoke_gpu_fp16.json`. **Local only (ITER2 C-7):** that file is gitignored (`artifacts/*`, `runs/`) and is in no commit. Commit `e68945c`'s message refers to it, but the file is not in git. Its SHA-256 is `919a8029…abac1`. It is not indexed in `GPU_RECEIPT_INDEX.json`. The first GPU attempt was `RUN_INCOMPLETE` only because the check required 8 tokens; the engine stops at EOS (`<|im_end|>`, id 248046), which is correct. Fixed in `960fb17`.
 - The short CPU fp32 reference, separate run, 300 s outer deadline, two attempts, **both aborted at 300 s with no receipt**:
   - Attempt 1: host load about 17 (8 cores), another session's pytest using about 580% CPU.
   - Attempt 2: host load 18.2, the same competing process at about 700% CPU.

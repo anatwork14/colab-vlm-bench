@@ -117,7 +117,7 @@ def _report(tmp_path, owner_record_path, *, models, pilot_path, signers, live=No
 
 def test_config_revisions_alone_do_not_pin_a_revision(tmp_path, owner, monkeypatch):
     pilot, pilot_path, _ = _forged_configs(tmp_path)
-    plan = _plan(tmp_path, pilot["campaign_id"], "plan_pilot.json")
+    plan = pilot_path  # the inventory hashes the pilot config as the plan
     record = _sign_record(owner, tmp_path, _record({"pilot": plan}, {"pilot": pilot["campaign_id"]}, pins=None))
     models, _ = _models_root(tmp_path, manifest=False)
     report = _report(tmp_path, record, models=models, pilot_path=pilot_path, signers=owner["signers"])
@@ -133,7 +133,7 @@ def test_a_weights_manifest_pin_outside_the_signed_record_is_not_a_pin(tmp_path,
                               pinned_manifest_sha256=inv.sha256_hex(manifest.read_bytes()))
     assert probe["manifest_pinned"] is True  # the function still accepts a hash it is given...
     _, pilot_path, _ = _forged_configs(tmp_path)
-    plan = _plan(tmp_path, json.loads(PILOT.read_text())["campaign_id"], "plan_pilot.json")
+    plan = pilot_path  # the inventory hashes the pilot config as the plan
     record = _sign_record(owner, tmp_path, _record({"pilot": plan}, {"pilot": json.loads(PILOT.read_text())["campaign_id"]}, pins=None))
     report = _report(tmp_path, record, models=models, pilot_path=pilot_path, signers=owner["signers"])
     # ...but the report takes pins only from the signed record, so this one is not pinned.
@@ -143,7 +143,7 @@ def test_a_weights_manifest_pin_outside_the_signed_record_is_not_a_pin(tmp_path,
 
 def test_a_dataset_checksum_written_by_the_local_actor_does_not_verify_the_dataset(tmp_path, owner):
     pilot, pilot_path, _ = _forged_configs(tmp_path)  # config holds a self-written checksum
-    plan = _plan(tmp_path, pilot["campaign_id"], "plan_pilot.json")
+    plan = pilot_path  # the inventory hashes the pilot config as the plan
     record = _sign_record(owner, tmp_path, _record({"pilot": plan}, {"pilot": pilot["campaign_id"]}, pins=None))
     models, _ = _models_root(tmp_path, manifest=False)
     report = _report(tmp_path, record, models=models, pilot_path=pilot_path, signers=owner["signers"])
@@ -152,8 +152,8 @@ def test_a_dataset_checksum_written_by_the_local_actor_does_not_verify_the_datas
 
 
 def test_a_receipt_index_whose_hash_is_not_the_signed_pin_counts_nothing(tmp_path, owner):
-    pilot, _, _ = _forged_configs(tmp_path)
-    plan = _plan(tmp_path, pilot["campaign_id"], "plan_pilot.json")
+    pilot, pilot_path, _ = _forged_configs(tmp_path)
+    plan = pilot_path  # the inventory hashes the pilot config as the plan
     pins = {"receipt_index_sha256": "ef" * 32}  # signed, but not the hash of the index that exists
     _sign_record(owner, tmp_path, _record({"pilot": plan}, {"pilot": pilot["campaign_id"]}, pins=pins))
     receipts = tmp_path / "receipts"
@@ -166,7 +166,7 @@ def test_a_receipt_index_whose_hash_is_not_the_signed_pin_counts_nothing(tmp_pat
 
 def test_a_gpu_with_the_planned_name_but_another_uuid_fails_the_identity_check(tmp_path, owner):
     pilot, pilot_path, _ = _forged_configs(tmp_path)
-    plan = _plan(tmp_path, pilot["campaign_id"], "plan_pilot.json")
+    plan = pilot_path  # the inventory hashes the pilot config as the plan
     pins = {"gpu": {"name": GPU_NAME, "uuid": GPU_UUID}}
     record = _sign_record(owner, tmp_path, _record({"pilot": plan}, {"pilot": pilot["campaign_id"]}, pins=pins))
     models, _ = _models_root(tmp_path, manifest=False)
