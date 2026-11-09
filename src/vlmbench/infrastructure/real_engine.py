@@ -1086,6 +1086,29 @@ def _retained_entries_summary(samples: Sequence[int], *, unit: str, n_layers: in
     }
 
 
+# ITER2 D10 N-7 (review): one glossary of memory/KV-byte fields, attached to every arm's telemetry
+# so each byte field states what it covers. The scope strings are tested (test_matched_retention.py).
+MEMORY_FIELD_SCOPES: dict[str, str] = {
+    "physical_kv_bytes_allocated": (
+        "FINAL_STATE_SNAPSHOT: KV payload bytes held after the last decode step (prefill cache "
+        "unbounded). Not a per decode step quantity."
+    ),
+    "physical_kv_bytes_freed": (
+        "PER_DECODE_STEP_SUM: per decode step compaction tensor deltas, summed over steps; prefill "
+        "cache unbounded. None = not measured (policy driver, evictions happen); 0 = no eviction "
+        "policy on the arm."
+    ),
+    "final_retained_kv_payload_bytes": (
+        "FINAL_STATE_SNAPSHOT: same value as physical_kv_bytes_allocated, after the last decode step; "
+        "not per decode step."
+    ),
+    "compaction_tensor_byte_deltas_sum": (
+        "PER_DECODE_STEP_SUM: per decode step compaction tensor deltas, summed over steps; may count "
+        "repeated reductions; not a peak or VRAM delta."
+    ),
+}
+
+
 @dataclass
 class RealExecutionResult:
     """Telemetry and outputs of real model execution across the 7 arms."""
@@ -1095,8 +1118,8 @@ class RealExecutionResult:
     total_latency_ms: float
     ttft_ms: float
     tpot_ms: float
-    physical_kv_bytes_allocated: int
-    physical_kv_bytes_freed: int
+    physical_kv_bytes_allocated: int  # final-state snapshot; see MEMORY_FIELD_SCOPES
+    physical_kv_bytes_freed: int  # per-decode-step sum; None/0 meanings in MEMORY_FIELD_SCOPES
     per_step_evicted_slot_rate: float | None  # H2O: last decode step only; None if no H2O step ran
     attention_read_restriction_ratio: float | None  # None when no decode step built a DA mask
     grounded_citations: list[dict[str, Any]]
@@ -1586,6 +1609,7 @@ class RealSevenArmEngine:
             mtp_acceptance_rate=spec["acceptance_rate"],
             gates=gates,
             telemetry={
+                "memory_field_scopes": dict(MEMORY_FIELD_SCOPES),
                 "request_id": request_id,
                 "model_id": self.config.model_id,
                 "device": self.device,
@@ -1703,6 +1727,7 @@ class RealSevenArmEngine:
             mtp_acceptance_rate=spec["acceptance_rate"],
             gates=gates,
             telemetry={
+                "memory_field_scopes": dict(MEMORY_FIELD_SCOPES),
                 "request_id": request_id,
                 "model_id": self.config.model_id,
                 "device": self.device,
@@ -2699,6 +2724,7 @@ class RealSevenArmEngine:
             mtp_acceptance_rate=mtp_acc_rate,
             gates=gates,
             telemetry={
+                "memory_field_scopes": dict(MEMORY_FIELD_SCOPES),
                 "model_id": self.config.model_id,
                 "vocab_size": self.config.vocab_size,
                 "num_layers": self.config.num_hidden_layers,
@@ -2736,6 +2762,7 @@ class RealSevenArmEngine:
                     "classification": "SUM_OF_KV_TENSOR_FOOTPRINT_DELTAS_NOT_GPU_VRAM_SAVING",
                     "compaction_tensor_byte_deltas_sum": total_physical_freed,
                     "final_retained_kv_payload_bytes": final_allocated_bytes,
+                    "final_retained_kv_payload_bytes_scope": MEMORY_FIELD_SCOPES["final_retained_kv_payload_bytes"],
                     "peak_cuda_allocated_saving_bytes": None,
                     "peak_cuda_reserved_saving_bytes": None,
                     "device_hbm_reduction_measured": False,
@@ -2834,6 +2861,7 @@ class RealSevenArmEngine:
                     ),
                     "original_paper_protocol_qualified": False,
                     "physical_kv_bytes_freed": 0 if self.method_arm in DA_MASKING_ARMS else total_physical_freed,
+                    "physical_kv_bytes_freed_scope": MEMORY_FIELD_SCOPES["physical_kv_bytes_freed"],
                     "kv_residency_preserved_ratio": 1.0 if self.method_arm in DA_MASKING_ARMS else (
                         round(h2o_final_retained_fraction, 4) if h2o_final_retained_fraction is not None else None),
                     "kv_residency_preserved_pct": 100.0 if self.method_arm in DA_MASKING_ARMS else (

@@ -82,3 +82,26 @@ def test_memory_fields_state_the_scope_per_decode_step_prefill_unbounded(arm):
     res = _run(arm)
     acct = res.telemetry["kv_memory_accounting"]
     assert acct["scope"] == "per decode step, prefill cache unbounded", acct
+
+
+# ITER2 D10 N-7 (review): every memory/KV-byte field must declare its own scope. The block-level
+# scope string does not describe final_retained_kv_payload_bytes (a final-state snapshot).
+MEMORY_FIELDS = (
+    "physical_kv_bytes_allocated",
+    "physical_kv_bytes_freed",
+    "final_retained_kv_payload_bytes",
+    "compaction_tensor_byte_deltas_sum",
+)
+
+
+@pytest.mark.parametrize("arm", ["base", "h2o_base", "starlight_s1"])
+def test_every_memory_field_declares_its_own_scope(arm):
+    res = _run(arm)
+    scopes = res.telemetry["memory_field_scopes"]
+    for name in MEMORY_FIELDS:
+        assert isinstance(scopes.get(name), str) and scopes[name], name
+    assert "final" in scopes["final_retained_kv_payload_bytes"].lower()
+    assert "not per decode step" in scopes["final_retained_kv_payload_bytes"]
+    assert "per decode step" in scopes["compaction_tensor_byte_deltas_sum"]
+    assert "per decode step" in scopes["physical_kv_bytes_freed"]
+    assert "None" in scopes["physical_kv_bytes_freed"] and "0" in scopes["physical_kv_bytes_freed"]
