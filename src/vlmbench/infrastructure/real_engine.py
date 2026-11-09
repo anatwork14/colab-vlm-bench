@@ -191,8 +191,12 @@ class Qwen35NeuralModel(nn.Module):
 
         self.final_norm = nn.LayerNorm(self.config.hidden_size)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        # Speculative MTP prediction head for next 2 tokens
-        self.mtp_head = nn.Linear(self.config.hidden_size, self.config.vocab_size * self.config.mtp_num_speculative_tokens, bias=False)
+        # Speculative MTP prediction uses hidden projection + shared lm_head (matching authentic Qwen3.5 MTP)
+        self.mtp_proj = nn.Linear(
+            self.config.hidden_size,
+            self.config.hidden_size * self.config.mtp_num_speculative_tokens,
+            bias=False,
+        )
 
     def forward(
         self,
@@ -238,8 +242,11 @@ class Qwen35NeuralModel(nn.Module):
 
         normed_hidden = self.final_norm(hidden[:, -1, :])
         logits = self.lm_head(normed_hidden)  # [B, vocab_size]
-        # Multi-token speculative proposals
-        mtp_logits = self.mtp_head(normed_hidden).view(b, self.config.mtp_num_speculative_tokens, self.config.vocab_size)
+        # Multi-token speculative proposals via MTP projection + shared lm_head
+        mtp_hidden = self.mtp_proj(normed_hidden).view(
+            b, self.config.mtp_num_speculative_tokens, self.config.hidden_size
+        )
+        mtp_logits = self.lm_head(mtp_hidden)  # [B, num_speculative_tokens, vocab_size]
 
         return {
             "logits": logits,

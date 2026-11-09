@@ -121,7 +121,12 @@ def _create_mock_model_tree(model_dir: Path, name: str) -> Path:
         "vocab_size": 152064,
     }
     (m_path / "config.json").write_text(json.dumps(config), encoding="utf8")
-    (m_path / "tokenizer.json").write_text(json.dumps({"version": "1.0"}), encoding="utf8")
+    tok_json = {
+        "version": "1.0",
+        "added_tokens": [],
+        "model": {"type": "BPE", "vocab": {}, "merges": []},
+    }
+    (m_path / "tokenizer.json").write_text(json.dumps(tok_json), encoding="utf8")
     (m_path / "tokenizer_config.json").write_text(json.dumps({"bos_token": "<|im_start|>"}), encoding="utf8")
     (m_path / "model.safetensors").write_bytes(b"mock_safetensors_shard_bytes_12345")
     return m_path
