@@ -343,3 +343,120 @@ def test_amber_upstream_manifest_and_parse_helpers():
     # Test AmberError is a ValueError
     assert issubclass(AmberError, ValueError)
 
+
+def test_amber_dict_ground_truth_strict_validation():
+    # DS-02 P0: Dictionary ground truth must not bypass schema validation
+    # Invalid label
+    with pytest.raises(ValueError, match="missing or invalid required 'label'"):
+        score_amber_discriminative(
+            [{"id": "1", "prediction": "No"}],
+            {"1": {"label": "INVALID", "dimension": "existence"}},
+        )
+
+    # Missing dimension/type
+    with pytest.raises(ValueError, match="missing or invalid required 'type'"):
+        score_amber_discriminative(
+            [{"id": "1", "prediction": "Yes"}],
+            {"1": {"label": "Yes"}},
+        )
+
+    # Invalid entry type (not a dict)
+    with pytest.raises(TypeError, match="value must be a dictionary"):
+        score_amber_discriminative(
+            [{"id": "1", "prediction": "Yes"}],
+            {"1": "Yes"},
+        )
+
+
+def test_amber_empty_or_bad_root_schema_rejected(tmp_path):
+    # DS-02: normalize_amber must reject empty root {} or unsupported wrappers
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(parents=True)
+
+    # Empty root object {}
+    empty_src = tmp_path / "empty_root.json"
+    empty_src.write_text("{}", encoding="utf8")
+    with pytest.raises(ValueError, match="dict must contain one of"):
+        normalize_amber(empty_src, img_dir, tmp_path / "out1.jsonl")
+
+    # Unsupported wrapper key
+    bad_wrapper = tmp_path / "bad_wrapper.json"
+    bad_wrapper.write_text(json.dumps({"unknown_wrapper": []}), encoding="utf8")
+    with pytest.raises(ValueError, match="dict must contain one of"):
+        normalize_amber(bad_wrapper, img_dir, tmp_path / "out2.jsonl")
+
+    # Empty list under valid wrapper
+    empty_list_src = tmp_path / "empty_list.json"
+    empty_list_src.write_text(json.dumps({"queries": []}), encoding="utf8")
+    with pytest.raises(ValueError, match="must be a non-empty list"):
+        normalize_amber(empty_list_src, img_dir, tmp_path / "out3.jsonl")
+
+
+def test_amber_missing_and_unparseable_positives_in_recall_and_composite():
+    # DS-03 P1: Two positive ground-truth items
+    gt = [
+        {"id": "1", "label": "Yes", "type": "existence"},
+        {"id": "2", "label": "Yes", "type": "existence"},
+    ]
+
+    # Case A: One answered 'Yes', one missing
+    preds_missing = [{"id": "1", "prediction": "Yes"}]
+    scores_a = score_amber_discriminative(preds_missing, gt)
+    assert scores_a["overall"]["count"] == 2
+    assert scores_a["overall"]["missing_count"] == 1
+    assert scores_a["overall"]["accuracy"] == 0.5
+    assert scores_a["overall"]["precision"] == 1.0
+    # Recall MUST be 0.5 (1 TP, 1 FN due to missing), not 1.0!
+    assert scores_a["overall"]["recall"] == 0.5
+    # F1 = 2 * 1.0 * 0.5 / 1.5 = 2/3 ~ 0.6667
+    assert pytest.approx(scores_a["overall"]["f1"], rel=1e-3) == 2.0 / 3.0
+
+    # Case B: One answered 'Yes', one unparseable
+    preds_unparseable = [
+        {"id": "1", "prediction": "Yes"},
+        {"id": "2", "prediction": "I don't know"},
+    ]
+    scores_b = score_amber_discriminative(preds_unparseable, gt)
+    assert scores_b["overall"]["count"] == 2
+    assert scores_b["overall"]["unparseable_count"] == 1
+    assert scores_b["overall"]["accuracy"] == 0.5
+    assert scores_b["overall"]["precision"] == 1.0
+    assert scores_b["overall"]["recall"] == 0.5
+    assert pytest.approx(scores_b["overall"]["f1"], rel=1e-3) == 2.0 / 3.0
+
+    # Case C: Check composite score with a generative item
+    ann_unified = [
+        {"id": 1, "task": "generative", "objects": ["dog"]},
+        {"id": 1005, "task": "discriminative", "label": "Yes", "type": "existence"},
+        {"id": 1006, "task": "discriminative", "label": "Yes", "type": "existence"},
+    ]
+    preds_unified = [
+        {"id": "amber__generative__1", "prediction": "A cute dog."},
+        {"id": "amber__discriminative__1005", "prediction": "Yes"},
+        # 1006 is missing
+    ]
+    report = score_amber(preds_unified, ann_unified)
+    assert report["composite_status"] == "COMPOSITE_SCORE_CALCULATED"
+    # CHAIR_i = 0.0 (perfect generative). Discriminative F1 = 2/3.
+    # amber_score = 0.5 * ((1.0 - 0.0) + 2/3) ~ 0.8333, strictly NOT 1.0!
+    assert pytest.approx(report["amber_score"], rel=1e-3) == 0.5 * (1.0 + 2.0 / 3.0)
+
+
+def test_score_amber_generative_missing_does_not_count_as_hallucination():
+    # DS-03: Missing prediction in generative must not be counted as hallucinated
+    ann = [
+        {"id": "1", "objects": ["dog"]},
+        {"id": "2", "objects": ["cat"]},
+    ]
+    # Sample 1 answered with 0 hallucinations; Sample 2 is missing
+    preds = [{"id": "1", "prediction": "A dog."}]
+    scores = score_amber_generative(preds, ann)
+    assert scores["count"] == 2
+    assert scores["missing_count"] == 1
+    assert scores["evaluated_count"] == 1
+    assert scores["coverage_rate"] == 0.5
+    # Evaluated sample has 0 hallucinations -> chair_s is 0.0, NOT 0.5!
+    assert scores["chair_s"] == 0.0
+    assert scores["hallucination_rate"] == 0.0
+
+

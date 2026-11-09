@@ -374,3 +374,100 @@ def test_memlens_7bin_builder_guards_and_limits(tmp_path):
     assert result["derived_records"] == 0
 
 
+def test_memlens_7bin_builder_strict_tolerance_and_length_validation(tmp_path):
+    # DS-04: Strict tolerance validation (must be finite float in (0.0, 0.05])
+    import math
+
+    from vlmbench.datasets import build_memlens_context_bins
+
+    class DummyTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) for c in text]
+
+        def decode(self, token_ids, skip_special_tokens=False):
+            return "".join(chr(t) for t in token_ids)
+
+    native_path = tmp_path / "native.jsonl"
+    native_row = {
+        "id": "q1", "dataset": "memlens", "track": "native_quality",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "H" * 500},
+            {"type": "image_path", "path": str(tmp_path / "img.jpg"), "asset_root": str(tmp_path)},
+            {"type": "text", "text": "Q?"},
+        ]}],
+        "native_context_complete": True,
+    }
+    native_path.write_text(json.dumps(native_row) + "\n", encoding="utf8")
+    tok = DummyTokenizer()
+
+    # tolerance > 0.05 (e.g. 0.5) must raise ValueError
+    with pytest.raises(ValueError, match=r"tolerance must be strictly in \(0.0, 0.05\]"):
+        build_memlens_context_bins(native_path, tmp_path / "out.jsonl", tokenizer=tok, tolerance=0.5)
+
+    # tolerance is NaN must raise ValueError
+    with pytest.raises(ValueError, match="tolerance must be a finite float"):
+        build_memlens_context_bins(native_path, tmp_path / "out.jsonl", tokenizer=tok, tolerance=math.nan)
+
+    # tolerance is inf must raise ValueError
+    with pytest.raises(ValueError, match="tolerance must be a finite float"):
+        build_memlens_context_bins(native_path, tmp_path / "out.jsonl", tokenizer=tok, tolerance=math.inf)
+
+    # tolerance <= 0.0 must raise ValueError
+    with pytest.raises(ValueError, match=r"tolerance must be strictly in \(0.0, 0.05\]"):
+        build_memlens_context_bins(native_path, tmp_path / "out.jsonl", tokenizer=tok, tolerance=0.0)
+
+    with pytest.raises(ValueError, match=r"tolerance must be strictly in \(0.0, 0.05\]"):
+        build_memlens_context_bins(native_path, tmp_path / "out.jsonl", tokenizer=tok, tolerance=-0.05)
+
+    # input_lengths empty must raise ValueError
+    with pytest.raises(ValueError, match="input_lengths must not be empty"):
+        build_memlens_context_bins(native_path, tmp_path / "out.jsonl", tokenizer=tok, input_lengths=[])
+
+    # input_lengths containing non-positive or unsupported values
+    with pytest.raises(ValueError, match="positive integers"):
+        build_memlens_context_bins(native_path, tmp_path / "out.jsonl", tokenizer=tok, input_lengths=[128, -512])
+
+    with pytest.raises(ValueError, match="Unsupported context length"):
+        build_memlens_context_bins(native_path, tmp_path / "out.jsonl", tokenizer=tok, input_lengths=[999])
+
+
+def test_memlens_7bin_builder_tolerance_mismatch_rejection_probe(tmp_path):
+    # DS-04: Independent deterministic test from sol-lead audit
+    # Character tokenizer whose decode returns the first half of its input
+    from vlmbench.datasets import build_memlens_context_bins
+
+    class HalfDecodeTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) for c in text]
+
+        def decode(self, token_ids, skip_special_tokens=False):
+            # Returns first half of tokens as text
+            half = len(token_ids) // 2
+            return "".join(chr(t) for t in token_ids[:half])
+
+    native_path = tmp_path / "probe_native.jsonl"
+    native_row = {
+        "id": "probe_sample", "dataset": "memlens", "track": "native_quality",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "H" * 2000},
+            {"type": "image_path", "path": str(tmp_path / "img.jpg"), "asset_root": str(tmp_path)},
+            {"type": "text", "text": "Q?"},
+        ]}],
+        "native_context_complete": True,
+    }
+    native_path.write_text(json.dumps(native_row) + "\n", encoding="utf8")
+
+    out_path = tmp_path / "probe_out.jsonl"
+    tok = HalfDecodeTokenizer()
+    result = build_memlens_context_bins(
+        native_path, out_path,
+        tokenizer=tok,
+        input_lengths=[128],
+        tolerance=0.05,
+    )
+    # The best candidate is ~92 tokens, outside [121.6, 134.4]. It must NOT be emitted!
+    assert result["derived_records"] == 0
+    assert result["skip_reasons"]["tolerance_mismatch_for_128"] == 1
+
+
+

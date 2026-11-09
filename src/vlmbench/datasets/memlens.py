@@ -5,6 +5,7 @@ and deterministically generates 7-context-bin serving workloads.
 """
 from __future__ import annotations
 
+import math
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -151,12 +152,29 @@ def build_memlens_context_bins(
     if tokenizer is None:
         raise ValueError("Tokenizer is mandatory for build_memlens_context_bins to enforce ±5% token tolerance")
 
+    # DS-04: Strict tolerance validation (must be finite float in (0.0, 0.05])
+    if not isinstance(tolerance, (int, float)) or isinstance(tolerance, bool) or math.isnan(tolerance) or math.isinf(tolerance):
+        raise ValueError(f"tolerance must be a finite float, got {tolerance!r}")
+    if tolerance <= 0.0 or tolerance > 0.05:
+        raise ValueError(f"tolerance must be strictly in (0.0, 0.05], got {tolerance}")
+
+    # DS-04: Strict target lengths validation (must be positive canonical lengths)
+    if not input_lengths:
+        raise ValueError("input_lengths must not be empty")
+    canonical_targets_list = []
+    for x in input_lengths:
+        if not isinstance(x, int) or isinstance(x, bool) or x <= 0:
+            raise ValueError(f"input_lengths must contain only positive integers, got {x!r}")
+        if x not in CANONICAL_LENGTHS:
+            raise ValueError(f"Unsupported context length: {x}. Must be in {CANONICAL_LENGTHS}")
+        canonical_targets_list.append(x)
+    canonical_targets = tuple(canonical_targets_list)
+
     native_path = Path(native_path)
     output_path = Path(output_path)
     if not 0 <= image_limit <= 8:
         raise ValueError("image_limit must be between 0 and 8")
 
-    canonical_targets = tuple(int(x) for x in input_lengths)
     rows = load_jsonl(native_path, dataset="memlens", track="native_quality")
 
     candidates: list[dict[str, Any]] = []

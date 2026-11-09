@@ -155,9 +155,17 @@ def normalize_amber(
         raise AmberError(f"Failed to parse AMBER source JSON: {exc}") from exc
 
     if isinstance(data, dict):
-        data = data.get("data", data.get("queries", data.get("annotations", [])))
+        valid_keys = [k for k in ("queries", "data", "annotations") if k in data]
+        if not valid_keys:
+            raise ValueError(
+                f"AMBER source JSON dict must contain one of ('queries', 'data', 'annotations'), got keys: {list(data.keys())}"
+            )
+        data = data[valid_keys[0]]
+
     if not isinstance(data, list):
-        raise AmberError("AMBER source JSON must be a list of query/annotation objects")
+        raise TypeError(f"AMBER source data must be a list of query/annotation objects, got {type(data).__name__}")
+    if len(data) == 0:
+        raise ValueError("AMBER source data must be a non-empty list of items")
 
     seen_ids: set[str] = set()
     records: list[dict[str, Any]] = []
@@ -347,24 +355,34 @@ def score_amber_discriminative(
     answers count as incorrect in accuracy; empty denominators return None/NOT_MEASURED.
     """
     if isinstance(ground_truth, list):
-        gt_map = {}
+        items_to_check = []
         for x in ground_truth:
             if not isinstance(x, dict):
                 raise TypeError("Ground-truth items must be dictionaries")
             sid = x.get("id")
             if sid is None:
                 raise ValueError("Ground-truth item missing required 'id'")
-            label = x.get("label")
-            if not label or str(label).strip() not in ("Yes", "No"):
-                raise ValueError(f"Ground-truth item {sid} missing or invalid required 'label' ('Yes'/'No')")
-            dim = x.get("type") or x.get("meta", {}).get("dimension")
-            if not dim or str(dim).lower().strip() not in DISCRIMINATIVE_DIMENSIONS:
-                raise ValueError(f"Ground-truth item {sid} missing or invalid required 'type' ({DISCRIMINATIVE_DIMENSIONS})")
-            gt_map[str(sid)] = {"label": str(label).strip().capitalize(), "dimension": str(dim).lower().strip()}
+            items_to_check.append((str(sid), x))
     elif isinstance(ground_truth, dict):
-        gt_map = ground_truth
+        items_to_check = []
+        for k, v in ground_truth.items():
+            if not isinstance(v, dict):
+                raise TypeError(f"Ground-truth item {k} value must be a dictionary")
+            items_to_check.append((str(k), v))
     else:
         raise TypeError("Ground truth must be a list or dict")
+
+    gt_map: dict[str, dict[str, str]] = {}
+    for sid, x in items_to_check:
+        label = x.get("label")
+        if not label or not isinstance(label, str) or label.strip() not in ("Yes", "No"):
+            raise ValueError(f"Ground-truth item {sid} missing or invalid required 'label' ('Yes'/'No'), got {label!r}")
+        dim = x.get("type") or x.get("dimension") or (x.get("meta", {}).get("dimension") if isinstance(x.get("meta"), dict) else None)
+        if not dim or not isinstance(dim, str) or dim.lower().strip() not in DISCRIMINATIVE_DIMENSIONS:
+            raise ValueError(f"Ground-truth item {sid} missing or invalid required 'type' ({DISCRIMINATIVE_DIMENSIONS}), got {dim!r}")
+        if sid in gt_map:
+            raise ValueError(f"Duplicate ground-truth item id: {sid}")
+        gt_map[sid] = {"label": label.strip().capitalize(), "dimension": dim.lower().strip()}
 
     total_gt = len(gt_map)
     if total_gt == 0:
@@ -395,45 +413,57 @@ def score_amber_discriminative(
         pred_map[norm_sid] = pred.get("prediction") or pred.get("response") or ""
 
     dim_metrics: dict[str, dict[str, int]] = {
-        dim: {"tp": 0, "fp": 0, "tn": 0, "fn": 0, "unparseable": 0, "missing": 0, "total": 0}
+        dim: {
+            "tp": 0, "fp": 0, "tn": 0, "fn": 0,
+            "unparseable": 0, "missing": 0, "total": 0,
+        }
         for dim in DISCRIMINATIVE_DIMENSIONS
     }
-    overall = {"tp": 0, "fp": 0, "tn": 0, "fn": 0, "unparseable": 0, "missing": 0, "total": total_gt}
+    overall = {
+        "tp": 0, "fp": 0, "tn": 0, "fn": 0,
+        "unparseable": 0, "missing": 0, "total": total_gt,
+    }
 
     # Score over EVERY item in the frozen ground-truth population (DS-03)
     for sid, gt_item in gt_map.items():
         dimension = gt_item["dimension"]
         gt_label = gt_item["label"]
+        is_positive = (gt_label == "Yes")
         dim_metrics[dimension]["total"] += 1
 
         if sid not in pred_map:
-            # Missing answer counts as failure in accuracy
+            # Missing answer counts as failure in accuracy and false negative if positive
             dim_metrics[dimension]["missing"] += 1
             overall["missing"] += 1
+            if is_positive:
+                dim_metrics[dimension]["fn"] += 1
+                overall["fn"] += 1
             continue
 
         raw_pred = pred_map[sid]
         parsed = parse_binary_yes_no(str(raw_pred))
 
         if parsed is None:
-            # Unparseable answer counts as failure in accuracy
+            # Unparseable answer counts as failure in accuracy and false negative if positive
             dim_metrics[dimension]["unparseable"] += 1
             overall["unparseable"] += 1
+            if is_positive:
+                dim_metrics[dimension]["fn"] += 1
+                overall["fn"] += 1
             continue
 
-        is_yes_gt = gt_label == "Yes"
-        is_yes_pred = parsed == "Yes"
+        is_yes_pred = (parsed == "Yes")
 
-        if is_yes_gt and is_yes_pred:
+        if is_positive and is_yes_pred:
             dim_metrics[dimension]["tp"] += 1
             overall["tp"] += 1
-        elif not is_yes_gt and is_yes_pred:
+        elif not is_positive and is_yes_pred:
             dim_metrics[dimension]["fp"] += 1
             overall["fp"] += 1
-        elif not is_yes_gt and not is_yes_pred:
+        elif not is_positive and not is_yes_pred:
             dim_metrics[dimension]["tn"] += 1
             overall["tn"] += 1
-        elif is_yes_gt and not is_yes_pred:
+        elif is_positive and not is_yes_pred:
             dim_metrics[dimension]["fn"] += 1
             overall["fn"] += 1
 
@@ -499,21 +529,31 @@ def score_amber_generative(
     empty denominators return None/NOT_MEASURED.
     """
     if isinstance(annotations, list):
-        ann_map = {}
+        ann_items = []
         for a in annotations:
             if not isinstance(a, dict):
                 raise TypeError("Annotation items must be dictionaries")
             aid = a.get("id")
             if aid is None:
                 raise ValueError("Annotation item missing required 'id'")
-            objs = a.get("objects")
-            if not isinstance(objs, list) or not all(isinstance(o, str) for o in objs):
-                raise ValueError(f"Annotation item {aid} missing or invalid required 'objects' list")
-            ann_map[str(aid)] = {str(o).lower().strip() for o in objs}
+            ann_items.append((str(aid), a))
     elif isinstance(annotations, dict):
-        ann_map = annotations
+        ann_items = []
+        for k, v in annotations.items():
+            if not isinstance(v, dict):
+                raise TypeError(f"Annotation item {k} value must be a dictionary")
+            ann_items.append((str(k), v))
     else:
         raise TypeError("Annotations must be a list or dict")
+
+    ann_map: dict[str, set[str]] = {}
+    for aid, a in ann_items:
+        objs = a.get("objects")
+        if not isinstance(objs, list) or not all(isinstance(o, str) for o in objs):
+            raise ValueError(f"Annotation item {aid} missing or invalid required 'objects' list")
+        if aid in ann_map:
+            raise ValueError(f"Duplicate annotation item id: {aid}")
+        ann_map[aid] = {str(o).lower().strip() for o in objs}
 
     total_gt_items = len(ann_map)
     if total_gt_items == 0:
@@ -527,6 +567,7 @@ def score_amber_generative(
             "recall": None,
             "f1": None,
             "missing_count": 0,
+            "coverage_rate": 0.0,
             "total_mentioned_objects": 0,
             "total_hallucinated_objects": 0,
         }
@@ -559,8 +600,8 @@ def score_amber_generative(
         total_gt_objects += len(gt_objects)
 
         if sid not in pred_map:
+            # Missing prediction is an execution failure; separate from hallucination count
             missing_count += 1
-            hallucinated_descriptions += 1  # Missing response counts as failure
             continue
 
         resp_text = str(pred_map[sid])
@@ -591,8 +632,13 @@ def score_amber_generative(
         if total_mentioned_objects > 0
         else None
     )
-    # Denominator includes all ground truth items
-    chair_s = hallucinated_descriptions / total_gt_items
+    evaluated_descriptions = total_gt_items - missing_count
+    chair_s = (
+        hallucinated_descriptions / evaluated_descriptions
+        if evaluated_descriptions > 0
+        else None
+    )
+    coverage_rate = evaluated_descriptions / total_gt_items
 
     correct_objects = total_mentioned_objects - total_hallucinated_objects
     precision = (
@@ -614,6 +660,7 @@ def score_amber_generative(
     return {
         "status": "AMBER_GENERATIVE_PROXY_UNVERIFIED",  # DS-01
         "count": total_gt_items,
+        "evaluated_count": evaluated_descriptions,
         "chair_i": chair_i,
         "chair_s": chair_s,
         "hallucination_rate": chair_s,
@@ -621,6 +668,7 @@ def score_amber_generative(
         "recall": recall,
         "f1": f1,
         "missing_count": missing_count,
+        "coverage_rate": coverage_rate,
         "total_mentioned_objects": total_mentioned_objects,
         "total_hallucinated_objects": total_hallucinated_objects,
         "details_sample_count": len(per_sample_details),
