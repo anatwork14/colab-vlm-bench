@@ -503,3 +503,73 @@ def test_p7_da_zero_window_keeps_self_attention():
     mask = DAMaskGenerator().generate_attention_mask(
         seq_len=3, tags=[DATag(DATagType.LOCAL, 0, 3, window=0)])
     assert np.all(np.diag(mask))
+
+
+# --- P7 round 2: fixed H2O budget from prefill length (audit wF:p9, CRITICAL) ---
+
+def _h2o_decode_steps(tracker, layer_idx, start_len, steps, seed=0):
+    """Drive repeated decode compaction exactly like the engine: plan -> compact -> score."""
+    rng = np.random.RandomState(seed)
+    length = start_len
+    tracker.update_attention_scores(layer_idx, rng.rand(1, length, length).astype(np.float32))
+    retained_counts = []
+    for step in range(steps):
+        keep, _ = tracker.compute_eviction_plan(layer_idx, current_length=length + 1)
+        idx = np.where(keep)[0]
+        tracker.compact_layer_state(layer_idx, idx)
+        tracker.update_attention_scores(
+            layer_idx, rng.rand(1, 1, len(idx)).astype(np.float32))
+        length = len(idx)
+        retained_counts.append(int(keep.sum()))
+    return retained_counts
+
+
+def test_p7_h2o_budget_does_not_decay_under_repeated_compaction():
+    """Regression: the budget was recomputed from the already-compacted length each step
+    (300 -> 150 -> 75 -> 38 -> 32). A fixed prefill-derived budget must hold steady."""
+    tracker = H2OCacheTracker(H2OConfig(budget_ratio=0.5, min_budget=32), num_layers=1, num_kv_heads=1)
+    tracker.initialize_budget(0, prefill_length=300)
+    counts = _h2o_decode_steps(tracker, 0, start_len=300, steps=8)
+    assert counts == [150] * 8, f"retained count decayed: {counts}"
+
+
+def test_p7_h2o_zero_eviction_while_within_budget():
+    tracker = H2OCacheTracker(H2OConfig(budget_ratio=0.5, min_budget=4), num_layers=1, num_kv_heads=1)
+    tracker.initialize_budget(0, prefill_length=20)  # budget 10
+    tracker.update_attention_scores(0, np.ones((1, 1, 10), dtype=np.float32))
+    for length in (5, 9, 10):
+        keep, m = tracker.compute_eviction_plan(0, current_length=length)
+        assert keep.all() and m["evicted_tokens"] == 0, f"evicted within budget at length {length}"
+    keep, m = tracker.compute_eviction_plan(0, current_length=11)
+    assert int(keep.sum()) == 10 and m["evicted_tokens"] == 1
+
+
+def test_p7_h2o_protected_saturation_is_explicit():
+    """Protected visual+sink tokens count inside the budget. When they alone reach it,
+    the plan keeps every protected token plus the newest token, and says so."""
+    tracker = H2OCacheTracker(
+        H2OConfig(budget_ratio=0.5, recent_ratio=0.2, min_budget=4,
+                  protect_system_tokens=2, protect_visual_tokens=True),
+        num_layers=1, num_kv_heads=1)
+    visual = [False] * 30
+    visual[4:24] = [True] * 20
+    tracker.set_visual_tokens(visual)
+    tracker.initialize_budget(0, prefill_length=30)  # budget 15 < 22 protected
+    tracker.update_attention_scores(0, np.ones((1, 1, 30), dtype=np.float32))
+    keep, m = tracker.compute_eviction_plan(0, current_length=30)
+    assert m["protected_saturated"] is True
+    assert keep[:2].all() and keep[4:24].all() and keep[-1]
+    assert int(keep.sum()) == 23  # 22 protected + newest token, no heavy hitters
+    assert m["heavy_hitters"] == 0
+
+
+def test_p7_h2o_unsaturated_protected_keeps_total_budget():
+    tracker = H2OCacheTracker(
+        H2OConfig(budget_ratio=0.5, recent_ratio=0.2, min_budget=4,
+                  protect_system_tokens=2, protect_visual_tokens=True),
+        num_layers=1, num_kv_heads=1)
+    visual = [False] * 40
+    visual[5:9] = [True] * 4
+    tracker.set_visual_tokens(visual)
+    counts = _h2o_decode_steps(tracker, 0, start_len=40, steps=6, seed=3)
+    assert counts == [20] * 6
