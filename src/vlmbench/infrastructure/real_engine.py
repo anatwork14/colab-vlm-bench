@@ -1295,6 +1295,11 @@ class RealSevenArmEngine:
         if "mtp" in self.method_arm:
             pending_mtp_candidate = int(torch.argmax(prefill_out["mtp_logits"][0, 0]).item())
 
+        # Fix each full-attention layer's H2O budget from the PREFILL length, once.
+        if tracker is not None:
+            for l_idx in self.config.full_attention_layers:
+                tracker.initialize_budget(l_idx, len(full_prompt))
+
         # Feed prefill attention scores into H2O tracker
         if tracker is not None:
             for l_idx, attn_w in prefill_out["attention_matrices"].items():
