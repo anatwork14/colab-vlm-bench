@@ -1031,6 +1031,7 @@ class RealSevenArmEngine:
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         h2o_budget_ratio: float = 0.5,
         target_backend: str = "pytorch",
+        h2o_min_budget: int = 32,
         tokenizer: Any | None = None,
         checkpoint_dir: str | Path | None = None,
     ):
@@ -1080,7 +1081,9 @@ class RealSevenArmEngine:
 
         # Arm-specific components
         self.h2o_trackers: dict[str, H2OCacheTracker] = {}
-        self.h2o_config = H2OConfig(budget_ratio=h2o_budget_ratio)
+        # min_budget is the floor of the per-layer budget. With a fixed budget it can dominate on
+        # short prompts (see docs/H2O_DEVIATIONS.md). Default 32 is unsourced and kept as-is.
+        self.h2o_config = H2OConfig(budget_ratio=h2o_budget_ratio, min_budget=h2o_min_budget)
         self.da_fsm = DAFSM() if "da" in self.method_arm else None
         self.da_mask_gen = DAMaskGenerator() if "da" in self.method_arm else None
         self.ecrd_processors: dict[str, ECRDLogitsProcessor] = {}
