@@ -1037,3 +1037,26 @@ def test_r5_text_side_fields_are_none_before_any_decode_step():
     acc = res.telemetry["h2o_logical_selection_accounting"]
     assert acc["unprotected_retained_slots_last_step"] is None
     assert acc["text_side_retained_fraction"] is None
+
+
+# --- R5-3 (auditor R4 §2): name the variant, document every deviation, keep arm IDs ---
+
+def test_r5_h2o_arm_reports_method_variant_and_keeps_arm_ids():
+    from pathlib import Path
+    assert RealSevenArmEngine.SUPPORTED_ARMS == frozenset((
+        "base", "h2o_base", "da_base", "ecrd_base", "mtp", "h2o_mtp", "da_mtp"))
+    cfg = _p7_small_cfg()
+    engine = RealSevenArmEngine(method_arm="h2o_base", config=cfg, device="cpu")
+    try:
+        res = engine.execute_request("r5_variant", prompt_token_ids=list(range(10, 50)),
+                                     max_new_tokens=3, image_present=False)
+    finally:
+        engine.close()
+    acc = res.telemetry["h2o_logical_selection_accounting"]
+    assert acc["method_variant"] == "h2o_visual_anchor_text_budget"
+    assert acc["method_variant_is_upstream_h2o"] is False
+
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "H2O_DEVIATIONS.md").read_text(encoding="utf8")
+    for required in ("h2o_visual_anchor_text_budget", "min_budget", "per KV head",
+                     "NOT_IMPLEMENTED_OWNER_DECISION", "sinks", "protected", "ratio"):
+        assert required in doc, f"H2O_DEVIATIONS.md must mention {required!r}"
