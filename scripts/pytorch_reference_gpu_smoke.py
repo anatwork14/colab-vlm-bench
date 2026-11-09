@@ -16,8 +16,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -146,11 +149,8 @@ def run_arm(device: str, arm: str, dtype_override: str | None, deadline: float) 
     return results
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--out-dir", type=Path, default=REPO_ROOT / "artifacts" / "runs")
-    args = parser.parse_args()
-
+def build_receipt() -> dict[str, Any]:
+    """The child's work: the bounded smoke. Runs only inside the child process."""
     import torch
     import transformers
 
@@ -210,14 +210,67 @@ def main() -> int:
         receipt["status"] = f"FAILED: {type(exc).__name__}: {exc}"
 
     receipt["elapsed_wall_s"] = round(time.monotonic() - t0, 1)
+    return receipt
+
+
+def child_main(result_path: Path) -> int:
+    receipt = build_receipt()
+    result_path.write_text(json.dumps(receipt, indent=2, ensure_ascii=False), encoding="utf8")
+    return 0
+
+
+def build_child_cmd(result_path: Path) -> list[str]:
+    return [sys.executable, str(Path(__file__).resolve()), "--child", "--result", str(result_path)]
+
+
+def run_outer(cmd: list[str], timeout_s: float) -> dict[str, Any]:
+    """Run cmd in its own session; at the deadline kill the whole session, grandchildren included.
+
+    The parent enforces the bound, so a hung CUDA call inside the child cannot defeat it.
+    """
+    t0 = time.monotonic()
+    proc = subprocess.Popen(cmd, start_new_session=True)
+    try:
+        rc = proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        return {"outcome": "OUTER_DEADLINE", "returncode": None, "elapsed_s": round(time.monotonic() - t0, 1)}
+    return {"outcome": "EXITED", "returncode": rc, "elapsed_s": round(time.monotonic() - t0, 1)}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--out-dir", type=Path, default=REPO_ROOT / "artifacts" / "runs")
+    parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--result", type=Path, help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    if args.child:
+        return child_main(args.result)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        result_path = Path(tmp) / "result.json"
+        run = run_outer(build_child_cmd(result_path), WALL_LIMIT_S)
+        if run["outcome"] == "OUTER_DEADLINE":
+            print(f"ABORTED: outer hard deadline {WALL_LIMIT_S}s reached; child session killed; no receipt written",
+                  flush=True)
+            return 2
+        if not result_path.exists():
+            print(f"FAILED: child exited {run['returncode']} without a result; no receipt written", flush=True)
+            return 1
+        receipt = json.loads(result_path.read_text(encoding="utf8"))
+
+    if receipt["status"] != "RUN_COMPLETED":
+        print(f"status={receipt['status']}; not a completed run, so no receipt written", flush=True)
+        return 1
     args.out_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     out = args.out_dir / f"{stamp}_pytorch_reference_gtx1080ti_smoke.json"
     with open(out, "x", encoding="utf8") as f:  # exclusive create: never replace a receipt
         json.dump(receipt, f, indent=2, ensure_ascii=False)
     print(f"status={receipt['status']} token_agreement={receipt.get('token_agreement')} "
-          f"elapsed={receipt['elapsed_wall_s']}s receipt={out}")
-    return 0 if receipt["status"] == "RUN_COMPLETED" else 1
+          f"elapsed={receipt['elapsed_wall_s']}s receipt={out}", flush=True)
+    return 0
 
 
 if __name__ == "__main__":
