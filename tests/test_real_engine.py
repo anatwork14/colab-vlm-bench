@@ -740,3 +740,20 @@ def test_p7_r3_da_constructed_official_case_masks_real_reads_to_exact_zero():
                 checked_masked += 1
     assert checked_masked > 0, "no masked key was verified against real attention weights"
     engine.close()
+
+
+def test_p7_r3_h2o_telemetry_states_multimodal_compression_limitation():
+    """D2: with a protected vision block, H2O KV savings are ~0, so h2o arms must not be
+    read as multimodal KV-compression evidence. The limitation is explicit in telemetry."""
+    cfg = _p7_small_cfg()
+    vs, ve, img = cfg.vision_start_token_id, cfg.vision_end_token_id, cfg.image_token_id
+    engine = RealSevenArmEngine(method_arm="h2o_base", config=cfg, device="cpu")
+    prompt = [vs] + [img] * 30 + [ve] + list(range(100, 112))
+    res = engine.execute_request("p7_r3_h2o_limit", prompt_token_ids=prompt, max_new_tokens=6,
+                                 image_present=True)
+    acct = res.telemetry["h2o_logical_selection_accounting"]
+    assert acct["multimodal_kv_compression_evidence"] is False
+    assert acct["protected_vision_tokens_in_prompt"] == 32
+    assert "protected" in acct["limitation"].lower()
+    assert acct["unprotected_original_h2o_variant"] == "NOT_IMPLEMENTED_OWNER_DECISION"
+    engine.close()
