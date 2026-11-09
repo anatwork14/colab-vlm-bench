@@ -28,3 +28,4 @@ outputs/
 # Agent-operated Colab CLI: never commit local receipts / source snapshots
 agent_artifacts/
 *.pending
+*.egg-info/
