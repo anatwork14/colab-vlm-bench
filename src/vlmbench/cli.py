@@ -24,6 +24,7 @@ from .resume import COMPLETED, NON_COMPLETE, MISSING, classify_cell_receipt, qua
 from .derivation_labels import read_derivation_labels, single_label
 from .methods import manifest_from_path, plan as methods_plan, native_mode_or_block, blocked_method_receipt, MethodUnqualified
 from .hallucination import read_annotations, score_evidence_annotations
+from .telemetry import ensure_pci_bus_order
 
 from .derivation import generate_candidates, annotate_with_backend
 from .preflight import (assess_resources, checkpoint_inventory,
@@ -139,6 +140,8 @@ def _quality_outcome(result):
 
 def run_job(args) -> int:
     require_compute_approval(getattr(args, "owner_approved_compute", None))
+    # R4-A: the GPU sampler and the vLLM child inherit this; PCI_BUS_ID makes CUDA indices match nvidia-smi.
+    ensure_pci_bus_order()
     cfg = load_config(args.config, execution=True)
     model = next((m for m in cfg["models"] if m["id"] == args.model), None)
     ds = next((d for d in cfg["datasets"] if d["id"] == args.dataset), None)
