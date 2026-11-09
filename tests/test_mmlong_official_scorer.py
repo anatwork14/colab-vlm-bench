@@ -114,9 +114,11 @@ def test_a_question_without_an_extraction_blocks_rather_than_raising_or_scoring(
     assert out["status"] == "BLOCKED_NO_JUDGE" and out["official_acc"] is None
 
 
-def test_the_official_extractor_and_prompt_produce_the_official_stage3_label():
+def test_the_official_extractor_and_prompt_alone_do_not_produce_the_official_label():
+    # ITER3 C4: declared model and prompt hash are not enough; the positive path (signed qualification)
+    # is tested in tests/test_official_qualification.py
     ext = ms.ExtractedAnswer("q1", "10", ms.OFFICIAL_EXTRACTOR_MODEL, ms.EXTRACTION_PROMPT_SHA256)
     out = ms.score_records([RECORD], {"q1": ext})
-    assert out["status"] == "OFFICIAL_SCORED_STAGE3_ONLY"
-    assert out["overall_acc"] == 1.0
-    assert out["extractor_prompt_sha256"] == [ms.EXTRACTION_PROMPT_SHA256]
+    assert out["status"] == "BLOCKED_NO_JUDGE"
+    assert out["reason_code"] == "NO_QUALIFICATION"
+    assert "overall_acc" not in out

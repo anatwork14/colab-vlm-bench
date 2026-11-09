@@ -63,7 +63,9 @@ def test_official_import_requires_provenance(tmp_path):
     with pytest.raises(ValueError, match="pin"):
         import_official(p, dataset="memlens", judge_revision="", sample_manifest_sha256="")
     obj = import_official(p, dataset="memlens", judge_revision="frozen", sample_manifest_sha256="abc")
-    assert obj["status"] == "QUALITY_OFFICIAL_IMPORTED_UNVERIFIED"
+    # ITER3 C4: no judge is ported or pinned for MemLens, so nothing is labelled official
+    assert obj["status"] == "BLOCKED_NO_JUDGE"
+    assert "scorer_payload" not in obj
 
 
 def test_empty_campaign_not_misreported_as_gpu(tmp_path):
