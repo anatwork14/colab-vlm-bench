@@ -8,11 +8,12 @@ from .artifacts import atomic_json, sha256, staged_copy
 from .config import load_config
 from .execution_safety import require_compute_approval
 from .datasets import normalize_memlens, normalize_mmlong, normalize_amber, build_memlens_context_bins
+from .drive_inventory import inspect_existing_drive
 from .engine import a100_inventory, server_argv, start_server, stop_server, wait_ready
 from .hf_sources import DATASETS, MODELS, _qa_file, fetch_dataset, fetch_model
-from .drive_inventory import inspect_existing_drive
 from .notebook_bridge import build_serving_candidates, write_local_campaign
 from .preflight import assess_resources, checkpoint_inventory, host_resources
+from .qualification import qualify_all_drive_assets
 from .source_mapping import read_mapping, verify_mapping, drive_path, stage_amber_archive
 
 
@@ -248,6 +249,7 @@ def stage_for_gpu(cfg: dict, job: dict, paths: dict) -> tuple[dict, dict]:
     require_compute_approval(job.get("owner_approved_compute"))
     a100_inventory()
     import importlib.metadata
+
     import torch
     if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
         raise RuntimeError("A100 BF16 unavailable")
@@ -275,10 +277,11 @@ def annotate(job: dict) -> dict:
     if type(limit) is not int or not 1 <= limit <= 128:
         raise ValueError("Annotation budget must be 1..128")
     spec, staged = stage_for_gpu(cfg, job, p)
-    from .derivation import annotate_with_backend
-    from .bench import request_payload
-    from .workloads import load_jsonl
     import httpx
+
+    from .bench import request_payload
+    from .derivation import annotate_with_backend
+    from .workloads import load_jsonl
 
     log = p["root"] / "logs" / (
         f"{job['model']}_{job['dataset']}_base_annotation.log")
@@ -322,8 +325,9 @@ def benchmark(job: dict) -> dict:
     max_cells = job.get("max_cells", 1)
     if type(max_cells) is not int or not 1 <= max_cells <= 6:
         raise ValueError("GPU run max_cells must be between 1 and 6")
-    from .cli import run_job
     from types import SimpleNamespace
+
+    from .cli import run_job
     status = run_job(SimpleNamespace(
         config=config_path, model=job["model"], mode=job["mode"],
         dataset=job["dataset"], max_cells=max_cells,
@@ -356,6 +360,11 @@ def execute(job: dict) -> dict:
     if action == "drive-inventory":
         # A read-only, CPU-only source discovery action: no downloads or vLLM.
         return inspect_existing_drive()
+    if action == "qualify-drive":
+        # A read-only, CPU-only dataset/model qualification action.
+        drive_root = Path(job.get("drive_root", "/content/drive/MyDrive"))
+        tolerance = float(job.get("tolerance", 0.05))
+        return qualify_all_drive_assets(drive_root, tolerance=tolerance)
     if action == "prepare":
         return prepare(job)
     if action == "annotate":
