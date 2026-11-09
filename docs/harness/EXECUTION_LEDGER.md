@@ -36,7 +36,7 @@ Agents (observed banners): p5 Sonnet 5.5 (lead); p7, p8, p9 Haiku 5.5. No Opus r
   - Execution inventory (`PILOT_INVENTORY.md`): pilot 48 cells, 0 READY (24 BLOCKED_WEIGHTS_MISSING for 4B, all BLOCKED on dataset missing/GPU/authorization/vLLM/revision pins); full matrix 3528, 0 READY, 2520 UNSUPPORTED (arms without a qualified backend).
   - MMLongBench-Doc official stage-3 scorer ported with provenance; stage 2 BLOCKED_NO_JUDGE. Release gates now derived from measured results (no literals). Claim reconciliation in `CLAIM_RECONCILIATION.md`.
 - Independent reviews (Haiku 5.5): `REVIEW_ITER2.md`, `REVIEW_ITER2B.md`. Findings S-1..S-8, G-1..G-4, I-1, N-1..N-13 fixed or routed; closure of the final round (D9-D11 fixes) was NOT re-reviewed independently. Open: A-2/A-4/A-5/A-6 owner rulings (lead rulings recorded in commits), S-9 (DA scripted, not model-declared), HC-5 relevance labels (NOT_MEASURED).
-- Real execution: GPU PyTorch reference probes on GTX 1080 Ti completed for base/h2o_base (piecewise, no receipt; fla/causal_conv1d absent; CPU fp32 reference too slow under host load). No vLLM, no real benchmark cells, no Qwen3.5-4B.
+- Real execution: GPU PyTorch reference probes on GTX 1080 Ti completed for base/h2o_base (piecewise, no receipt; fla/causal_conv1d absent; CPU fp32 reference too slow under host load). ITER2 C-7 correction: one GPU smoke receipt exists as a LOCAL, gitignored file (not in git, not indexed; see GPU_RECEIPT_INDEX.json note). The 'no receipt' wording above refers to committed receipts. No vLLM, no real benchmark cells, no Qwen3.5-4B.
 
 ## Blocker handoff (update)
 | ID | Needed | Status |

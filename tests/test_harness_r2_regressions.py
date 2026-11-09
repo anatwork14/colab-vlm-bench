@@ -276,3 +276,19 @@ def test_positive_control_a_signed_record_authorises_the_pilot(tmp_path, owner):
     record = _signed_record(owner, tmp_path, pilot, pins={})
     report = _report(tmp_path, record, owner["signers"], models, pilot_path)
     assert report["environment"]["authorization_ok"]["pilot"] is True
+
+
+# --- C-7: the GPU smoke receipt is documented honestly (not in git) ----------------------------------
+
+def test_C7_the_receipt_index_says_the_smoke_receipt_is_not_in_git():
+    index = json.loads((ROOT / "docs/harness/GPU_RECEIPT_INDEX.json").read_text(encoding="utf8"))
+    note = index["note"]
+    assert "not in any commit" in note
+    assert "gitignored" in note
+    assert "919a8029" in note  # the local receipt's SHA-256, recorded so the claim is checkable
+    assert index["receipts"] == [], "a smoke receipt is not a cell receipt and must not be indexed as one"
+
+
+def test_C7_the_stall_diagnosis_states_the_receipt_is_local_only():
+    text = (ROOT / "docs/harness/GPU_SMOKE_STALL_DIAGNOSIS.md").read_text(encoding="utf8")
+    assert "gitignored" in text and "not in git" in text

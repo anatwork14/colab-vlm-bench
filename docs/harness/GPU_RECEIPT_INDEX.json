@@ -1,5 +1,5 @@
 {
   "schema": "gpu_receipt_index/1",
-  "note": "A cell receipt counts toward READY only if listed here with its SHA-256 (ITER2 I-1). The GPU smoke receipts are not cell receipts and are not listed.",
+  "note": "A cell receipt counts toward READY only if listed here with its SHA-256 (ITER2 I-1) AND this index's own SHA-256 is the owner-signed receipt_index_sha256 (ITER3 C1). The GPU smoke receipts are not cell receipts and are not listed. STATUS OF THE ONLY GPU SMOKE RECEIPT (ITER2 C-7, honest record): artifacts/runs/20261109T200806Z_pytorch_reference_gtx1080ti_smoke_gpu_fp16.json (RUN_COMPLETED, device cuda, git_sha 960fb17, sha256 919a8029822b9b7ad7b001380fb27c4b67392e573c3d3101d8afbea1438abac1) exists only as a local file in the it2-p8 worktree. It is gitignored (.gitignore: artifacts/* with runs/) and is not in any commit. Commit e68945c's message refers to it, but the file it names is not in that commit. Nothing in git proves that GPU run. The receipt is not indexed here.",
   "receipts": []
 }
