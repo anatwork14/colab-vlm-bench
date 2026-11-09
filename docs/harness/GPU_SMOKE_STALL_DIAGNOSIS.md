@@ -32,3 +32,12 @@ The faulthandler dump at 90 s shows the stack inside `RealSevenArmEngine.__init_
 - Done (`9b332bc`): the wall limit is an outer hard deadline. The parent kills the child's session at 600 s and writes no receipt on a deadline or incomplete run. A stall is now bounded, not open-ended.
 - Not done: the CPU fp32 reference phase cannot finish within the bound with the current reference kernels. Options, none applied here: (a) drop the CPU reference from the smoke and report GPU-only, which is honest but gives no fp32 comparison; (b) install `fla` and `causal_conv1d` for the optimized kernels, which is an install and needs owner authorization; (c) a shorter CPU reference (one prompt, fewer tokens) with its own budget. Option (b) is also untested on Pascal, so it is not a plan yet.
 - No receipt exists. A receipt is written only when a run completes, so none is written here.
+
+## D9 update: short CPU fp32 reference (decision c), BLOCKED
+
+- The GPU run completed: `RUN_COMPLETED` in 12.3 s, receipt `artifacts/runs/20261109T200806Z_pytorch_reference_gtx1080ti_smoke_gpu_fp16.json`. The first GPU attempt was `RUN_INCOMPLETE` only because the check required 8 tokens; the engine stops at EOS (`<|im_end|>`, id 248046), which is correct. Fixed in `960fb17`.
+- The short CPU fp32 reference, separate run, 300 s outer deadline, two attempts, **both aborted at 300 s with no receipt**:
+  - Attempt 1: host load about 17 (8 cores), another session's pytest using about 580% CPU.
+  - Attempt 2: host load 18.2, the same competing process at about 700% CPU.
+- No CPU reference result exists, so no GPU-vs-CPU token comparison is claimed. Status: BLOCKED_CPU_REFERENCE_TIMEOUT on this host under load.
+- Not done: raising the budget (not authorized), killing the other session's process (not ours). The CPU run should be repeated when the host is quiet, with `--device cpu`, and the comparison step run only if both receipts complete.
