@@ -1577,18 +1577,21 @@ class RealSevenArmEngine:
                     f"{prev.shape[0]} tracked vs {k_len - 1} cached entries"
                 )
             orig = np.asarray(compact_orig_positions(prev, None, appended=appended_position), dtype=np.int64)
-            da_slots = da_protection_from_spans(da_spans, orig) if "da" in enabled_t else {}
+            # S-1 (auditor HIGH): ALL signals are computed on every arm. The candidate set must not
+            # depend on the ablation; an ablation only removes protection as a veto (below).
+            da_slots = da_protection_from_spans(da_spans, orig)
             grounding_spans = [
                 (label, pos, pos + 1) for pos, labels in grounding_positions.items() for label in labels
             ]
-            gr_slots = da_protection_from_spans(grounding_spans, orig) if "grounding" in enabled_t else {}
+            gr_slots = da_protection_from_spans(grounding_spans, orig)
             structural_spans = [
                 (label, pos, pos + 1) for pos, labels in (structural or {}).items() for label in labels
             ]
-            st_slots = da_protection_from_spans(structural_spans, orig) if "structural" in enabled_t else {}
+            st_slots = da_protection_from_spans(structural_spans, orig)
             if k_len <= budget_total:
                 candidates: list[int] = []  # within budget: nothing to evict
             else:
+                # Effective H2O budget from the FULL protected union (all sources, ablation-independent).
                 n_protected = len(set(da_slots) | set(gr_slots) | set(st_slots))
                 effective = budget_total - n_protected if n_protected <= budget_total else 0
                 keep = tracker.keep_mask_without_protection(l_idx, k_len, effective)
