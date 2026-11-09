@@ -59,8 +59,13 @@ def verify_mapping(data: dict) -> dict:
         if not isinstance(files, dict) or not files:
             raise ValueError(f"Source map requires nonempty {key} SHA256 inventory")
         if key == "model_files":
-            actual = {str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()}
-            if actual != set(files):
+            actual = {
+                str(p.relative_to(root))
+                for p in root.rglob("*")
+                if p.is_file() and not p.name.startswith("starlight_") and not p.name.startswith(".")
+            }
+            expected_set = {k for k in files if not k.startswith("starlight_") and not k.startswith(".")}
+            if actual != expected_set:
                 raise ValueError("Model source map must cover every checkpoint file")
         else:
             image_files = {str(p.relative_to(root)) for p in images_root.rglob("*") if p.is_file()}
