@@ -233,6 +233,38 @@ class H2OCacheTracker:
         }
         return retained, metrics
 
+    def keep_mask_without_protection(self, layer_idx: int, length: int, keep_budget: int) -> np.ndarray:
+        """STARLIGHT candidate set: H2O's keep choice over ALL positions, with NO internal protection.
+
+        The same recent-window + heavy-hitter rule as compute_eviction_plan, but sinks and visual
+        tokens are not protected here. Under STARLIGHT the controller owns protection: it vetoes
+        candidates that are protected instead of evicting them. Existing h2o_base behaviour is
+        unchanged; this is a separate method and does not touch the layer's budget or masks.
+        Returns a bool keep mask of length `length` with exactly min(keep_budget, length) True.
+        """
+        if length < 0 or keep_budget < 0:
+            raise ValueError("length and keep_budget must be non-negative")
+        keep = np.zeros(length, dtype=bool)
+        if length == 0 or keep_budget == 0:
+            return keep
+        if length <= keep_budget:
+            keep[:] = True
+            return keep
+        layer = self.layers[layer_idx]
+        scores = np.zeros((self.num_kv_heads, length), dtype=np.float32)
+        usable = min(length, layer.scores.shape[1])
+        scores[:, :usable] = layer.scores[:, :usable]
+        recent = min(keep_budget, max(1, int(keep_budget * self.config.recent_ratio)))
+        keep[length - recent:] = True
+        heavy_budget = keep_budget - recent
+        older = np.arange(length - recent)
+        if heavy_budget > 0 and older.size > 0:
+            older_scores = scores[:, :older.size].mean(axis=0)
+            # Score descending; ties toward later positions, matching compute_eviction_plan.
+            order = np.lexsort((older, older_scores))[::-1]
+            keep[older[order[:min(heavy_budget, older.size)]]] = True
+        return keep
+
     def unprotected_count(self, layer_idx: int, length: int) -> int:
         """Number of UNPROTECTED (text-side) positions among the first `length` physical slots."""
         layer = self.layers[layer_idx]
