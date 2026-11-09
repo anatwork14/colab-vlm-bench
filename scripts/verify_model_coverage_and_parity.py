@@ -5,7 +5,9 @@ for Qwen/Qwen3.5-0.8B, verifying parity against official Hugging Face Transforme
 """
 from __future__ import annotations
 
+import argparse
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,70 @@ from vlmbench.infrastructure.real_engine import Qwen35ModelConfig, Qwen35NeuralM
 
 CHECKPOINT_DIR = Path("/mnt/ssd/genos2/research_workspace/models/Qwen/Qwen3.5-0.8B")
 INDEX_FILE = CHECKPOINT_DIR / "model.safetensors.index.json"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PARITY_TOLERANCE = 1e-4
+RUNS_DIR = REPO_ROOT / "artifacts" / "runs"
+
+
+# ---------------------------------------------------------------------------
+# Labels are functions of measured coverage and parity (ITER2 D2b C-01/C-02).
+# No status string is written by hand next to a number.
+# ---------------------------------------------------------------------------
+
+def default_out_file(stamp: str) -> Path:
+    """A new per-run file; the committed receipt is never the default target."""
+    return RUNS_DIR / f"{stamp}_model_coverage_and_parity_receipt.json"
+
+
+def write_receipt(path: Path, receipt: dict[str, Any], force: bool = False) -> None:
+    """Refuse to replace an existing receipt unless the caller explicitly forces it."""
+    if path.exists() and not force:
+        raise FileExistsError(f"Refusing to overwrite existing receipt {path}; pass --force to replace it")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w" if force else "x", encoding="utf-8") as f:
+        f.write(json.dumps(receipt, indent=2))
+
+
+def parity_status(max_diff: float, tolerance: float = PARITY_TOLERANCE) -> str:
+    """NaN compares false, so a non-finite difference is a FAIL."""
+    return "PASS" if max_diff < tolerance else "FAIL"
+
+
+def scaffold_scientific_status(coverage_pct: float) -> str:
+    if coverage_pct >= 100.0:
+        return "FULLY_WEIGHTED_PYTORCH_REFERENCE"
+    if coverage_pct > 0.0:
+        return "PARTIALLY_WEIGHTED_PYTORCH_REFERENCE"
+    return "UNWEIGHTED_PYTORCH_SCAFFOLD"
+
+
+def official_coverage_status(coverage_pct: float) -> str:
+    return "OFFICIAL_COVERAGE_COMPLETE" if coverage_pct >= 100.0 else "OFFICIAL_COVERAGE_INCOMPLETE"
+
+
+def official_hook_status(coverage_pct: float, parity: str) -> str:
+    if coverage_pct >= 100.0 and parity == "PASS":
+        return "OFFICIAL_TRANSFORMERS_HOOK_QUALIFIED"
+    return "OFFICIAL_TRANSFORMERS_HOOK_UNQUALIFIED"
+
+
+def unmapped_module_patterns(keys: list[str]) -> list[str]:
+    """layers.13.mlp.gate_proj.weight -> model.language_model.layers.*.mlp.gate_proj"""
+    patterns = {re.sub(r"\.(weight|bias)$", "", re.sub(r"\.\d+\.", ".*.", key)) for key in keys}
+    return sorted(patterns)
+
+
+def scientific_qualification_labels(scaffold_status: str, official_status: str) -> dict[str, str]:
+    recommendation = (
+        "Use official Transformers hooking for faithful pretrained inference"
+        if official_status == "OFFICIAL_TRANSFORMERS_HOOK_QUALIFIED"
+        else "No qualified hooking path in this receipt; do not report pretrained-faithful results from it"
+    )
+    return {
+        "custom_scaffold_label": scaffold_status,
+        "official_hooked_label": official_status,
+        "recommendation": recommendation,
+    }
 
 
 def audit_checkpoint_tensors(checkpoint_dir: Path = CHECKPOINT_DIR) -> dict[str, Any]:
@@ -65,13 +131,8 @@ def audit_checkpoint_tensors(checkpoint_dir: Path = CHECKPOINT_DIR) -> dict[str,
             "mapped_tensors": custom_mapped_count,
             "unmapped_tensors": custom_unmapped_count,
             "coverage_percentage": custom_coverage_pct,
-            "scientific_status": "PARTIALLY_WEIGHTED_PYTORCH_REFERENCE",
-            "unmapped_modules": [
-                "model.language_model.layers.*.mlp.gate_proj",
-                "model.language_model.layers.*.mlp.up_proj",
-                "model.language_model.layers.*.mlp.down_proj",
-                "model.visual.blocks.*",
-            ],
+            "scientific_status": scaffold_scientific_status(custom_coverage_pct),
+            "unmapped_modules": unmapped_module_patterns(custom_summary.get("unmapped_tensor_keys", [])),
         },
         "official_transformers_model": {
             "total_parameters": official_total_params,
@@ -83,8 +144,9 @@ def audit_checkpoint_tensors(checkpoint_dir: Path = CHECKPOINT_DIR) -> dict[str,
             "unmapped_tensors": hooked_summary["unmapped_tensors_count"],
             "coverage_percentage": official_coverage_pct,
             "parameter_coverage_ratio": hooked_summary["parameter_coverage_ratio"],
-            "scientific_status": "OFFICIAL_TRANSFORMERS_HOOK_QUALIFIED",
-            "unmapped_modules": [],
+            # Final hook status needs measured parity; main() sets it after the parity run.
+            "scientific_status": official_coverage_status(official_coverage_pct),
+            "unmapped_modules": unmapped_module_patterns(hooked_summary.get("unmapped_tensor_keys", [])),
         },
     }
 
@@ -135,7 +197,7 @@ def verify_one_step_logits_parity(checkpoint_dir: Path = CHECKPOINT_DIR, device:
     decoded = proc.decode([next_tok]).strip()
 
     parity_report = {
-        "status": "PASS" if max_diff < 1e-4 else "FAIL",
+        "status": parity_status(max_diff),
         "device": device,
         "prompt": prompt,
         "input_tokens_count": int(inputs["input_ids"].shape[1]),
@@ -143,12 +205,21 @@ def verify_one_step_logits_parity(checkpoint_dir: Path = CHECKPOINT_DIR, device:
         "max_logits_absolute_difference": max_diff,
         "predicted_next_token_id": next_tok,
         "predicted_next_token_text": decoded,
-        "parity_tolerance": 1e-4,
+        "parity_tolerance": PARITY_TOLERANCE,
     }
     return parity_report
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Checkpoint coverage and one-step logits parity receipt for Qwen3.5-0.8B.")
+    parser.add_argument("--out-file", type=Path, default=None,
+                        help="Receipt file to create. Default: a new timestamped file under artifacts/runs/.")
+    parser.add_argument("--force", action="store_true", help="Allow replacing an existing receipt file.")
+    args = parser.parse_args()
+    out_file = args.out_file or default_out_file(time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+    if out_file.exists() and not args.force:
+        parser.error(f"receipt already exists: {out_file} (pass --force to replace it)")
+
     print("=== [P0-01] Auditing Checkpoint Tensor Coverage ===")
     t0 = time.perf_counter()
     coverage = audit_checkpoint_tensors()
@@ -167,21 +238,21 @@ def main() -> None:
     print(f"Max Logits Absolute Difference: {parity['max_logits_absolute_difference']:.8f} (Status: {parity['status']})")
     print(f"Predicted: {parity['predicted_next_token_id']} '{parity['predicted_next_token_text']}'")
 
+    official = coverage["official_transformers_model"]
+    official["scientific_status"] = official_hook_status(official["coverage_percentage"], parity["status"])
+
     receipt = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         "checkpoint_dir": str(CHECKPOINT_DIR),
         "coverage_audit": coverage,
         "logits_parity": parity,
-        "scientific_qualification": {
-            "custom_scaffold_label": "PARTIALLY_WEIGHTED_PYTORCH_REFERENCE",
-            "official_hooked_label": "OFFICIAL_TRANSFORMERS_HOOK_QUALIFIED",
-            "recommendation": "Use official Transformers hooking for faithful pretrained inference",
-        },
+        "scientific_qualification": scientific_qualification_labels(
+            coverage["custom_neural_model_scaffold"]["scientific_status"],
+            official["scientific_status"],
+        ),
     }
 
-    out_file = Path("artifacts/model_coverage_and_parity_receipt.json")
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-    out_file.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+    write_receipt(out_file, receipt, force=args.force)
     print(f"\nSaved coverage & parity receipt to {out_file}")
 
 

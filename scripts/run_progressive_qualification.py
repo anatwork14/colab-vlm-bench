@@ -34,13 +34,13 @@ from transformers.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from vlmbench.infrastructure import (
+from vlmbench.infrastructure import (  # noqa: E402 - sys.path must be extended first
     Qwen35ModelConfig,
     RealSevenArmEngine,
     EvidencePool,
     EvidenceItem,
 )
-from vlmbench.multimodal_fixture import (
+from vlmbench.multimodal_fixture import (  # noqa: E402 - sys.path must be extended first
     CanonicalMultimodalFixture,
     CANONICAL_IMAGE_SHA256,
     CANONICAL_PANOPTIC_SHA256,
@@ -119,7 +119,6 @@ def run_test_a_architecture(model_dir: Path, device: str = "cpu") -> dict[str, A
 
     dt = time.perf_counter() - t0
     result = {
-        "status": "PASS",
         "duration_s": round(dt, 3),
         "total_parameters": 852985920,
         "mtp_parameters": 20452864,
@@ -172,7 +171,6 @@ def run_test_b_text_forward(model_dir: Path, device: str = "cpu") -> dict[str, A
 
     dt = time.perf_counter() - t0
     result = {
-        "status": "PASS",
         "duration_s": round(dt, 3),
         "prompt": prompt,
         "input_tokens_count": int(inputs["input_ids"].shape[1]),
@@ -225,7 +223,6 @@ def run_test_c_multimodal_forward(model_dir: Path, fixture_path: Path, device: s
 
     dt = time.perf_counter() - t0
     result = {
-        "status": "PASS",
         "duration_s": round(dt, 3),
         "image_fixture_sha256": img_sha,
         "question": question,
@@ -314,7 +311,10 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
         # Verify arm-specific interventions & P1-03 cost accounting
         if "h2o" in arm:
             assert res.physical_kv_bytes_freed > 0, f"{arm}: expected nonzero per-step KV tensor footprint deltas"
-            assert res.logical_selection_fraction > 0.0, f"{arm} must report logical selection fraction > 0"
+            h2o_acc = res.telemetry["h2o_logical_selection_accounting"]
+            assert h2o_acc["final_retained_fraction"] is not None and h2o_acc["final_retained_fraction"] > 0.0, (
+                f"{arm} must retain a nonzero logical selection after decoding"
+            )
         if "da" in arm:
             assert res.attention_mask_restriction_ratio > 0.0
             assert res.physical_kv_bytes_freed == 0, f"{arm} (P1-03) must report physical_kv_bytes_freed == 0"
@@ -340,10 +340,11 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
             "physical_kv_bytes_freed": res.physical_kv_bytes_freed,
             "kv_memory_accounting": res.telemetry["kv_memory_accounting"],
             "mtp_candidate_diagnostic": res.telemetry["mtp_candidate_diagnostic"],
-            "logical_selection_fraction": round(res.logical_selection_fraction, 4),
-            "attention_mask_restriction_ratio": round(res.attention_mask_restriction_ratio, 4),
+            "per_step_evicted_slot_rate": _round_or_none(res.per_step_evicted_slot_rate),
+            "attention_read_restriction_ratio": _round_or_none(res.attention_read_restriction_ratio),
+            "attention_mask_restriction_ratio": _round_or_none(res.attention_mask_restriction_ratio),
             "grounded_citations_count": len(res.grounded_citations),
-            "mtp_acceptance_rate": round(res.mtp_acceptance_rate, 4),
+            "mtp_acceptance_rate": _round_or_none(res.mtp_acceptance_rate),  # null = not verified
             "architectural_status": res.telemetry["architectural_status"],
             "pretrained_tensors_loaded": res.telemetry["pretrained_weights"]["loaded_tensors_count"],
             "parameter_coverage_ratio": res.telemetry["pretrained_weights"]["parameter_coverage_ratio"],
@@ -418,7 +419,6 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
 
     dt = time.perf_counter() - t0
     result = {
-        "status": "PASS",
         "duration_s": round(dt, 3),
         "arms_evaluated": len(expected_arms),
         "arms": arm_results,
@@ -450,9 +450,11 @@ def run_test_e_speculative_correctness(model_dir: Path, fixture_path: Path, devi
     assert res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS"
     assert res.gates["MTP_CORRECTNESS_PASS"] == "GATED_NATIVE_MTP_VERIFIER_REQUIRED"
     assert res.gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS"
-    assert res.mtp_acceptance_rate == 0.0
+    # Acceptance is NOT verified on this path (no native MTP verifier): it is null, never zero.
+    assert res.mtp_acceptance_rate is None, "unverified acceptance must be null, not a measured rate"
     assert res.physical_kv_bytes_freed > 0, "H2O diagnostic must show KV tensor footprint compaction"
-    assert 0.0 <= res.mtp_acceptance_rate <= 1.0
+    if res.mtp_acceptance_rate is not None:
+        assert 0.0 <= res.mtp_acceptance_rate <= 1.0
 
     engine.close()
     # Paired greedy-equivalence: the MTP diagnostic must NEVER change target
@@ -472,9 +474,9 @@ def run_test_e_speculative_correctness(model_dir: Path, fixture_path: Path, devi
     assert mtp_diag["proposals_verified"] > 0
     dt = time.perf_counter() - t0
     result = {
-        "status": "PASS_DIAGNOSTIC_ONLY",
+        "claim_scope": "DIAGNOSTIC_ONLY",
         "duration_s": round(dt, 3),
-        "mtp_acceptance_rate": 0.0,
+        "mtp_acceptance_rate": res.mtp_acceptance_rate,  # null = not verified
         "proposal_match_rate": mtp_diag["proposal_match_rate"],
         "greedy_target_equivalence": True,
         "legacy_physical_kv_freed_bytes": res.physical_kv_bytes_freed,
@@ -510,7 +512,6 @@ def run_test_f_fixed_output_serving(model_dir: Path, device: str = "cpu", target
 
     dt = time.perf_counter() - t0
     result = {
-        "status": "PASS",
         "duration_s": round(dt, 3),
         "target_tokens": target_tokens,
         "tokens_committed": len(res.tokens_generated),
@@ -578,7 +579,6 @@ def run_test_g_ccu_concurrency(model_dir: Path, device: str = "cpu") -> dict[str
 
     dt = time.perf_counter() - t0
     result = {
-        "status": "PASS",
         "concurrency_scope": "PYTORCH_THREAD_REQUEST_ISOLATION_NOT_VLLM_SCHEDULER",
         "duration_s": round(dt, 3),
         "levels": ccu_results,
@@ -587,13 +587,132 @@ def run_test_g_ccu_concurrency(model_dir: Path, device: str = "cpu") -> dict[str
     return result
 
 
+EXPECTED_TESTS = (
+    "test_a_architecture",
+    "test_b_text_forward",
+    "test_c_multimodal_forward",
+    "test_d_seven_arms",
+    "test_e_speculative_correctness",
+    "test_f_fixed_output_serving",
+    "test_g_ccu_concurrency",
+)
+OK_VERDICT = "PRETRAINED_FORWARD_AND_MTP_PROPOSAL_DIAGNOSTIC_ONLY"
+
+
+# ---------------------------------------------------------------------------
+# Result recording and release gates (ITER2 D2b G-01/G-02).
+# Every gate is derived from recorded test outcomes. Gate values are bare labels
+# (PASS, FAIL, NOT_TESTED, GATED_*, BLOCKED_*); evidence numbers live separately
+# in release_gate_evidence and are never embedded in a gate string.
+# ---------------------------------------------------------------------------
+
+def guarded(fn, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Run one qualification test and record its outcome. A failure is recorded, not dropped."""
+    try:
+        result = fn(*args, **kwargs)
+    except Exception as exc:  # recorded in the receipt; the run exits non-zero
+        print(f"[FAIL] {fn.__name__}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return {"status": "FAIL", "error_type": type(exc).__name__, "error": str(exc)[:2000]}
+    return {"status": "PASS", **result}
+
+
+def _test_status(test: dict[str, Any] | None) -> str:
+    if test is None:
+        return "NOT_TESTED"
+    status = test.get("status")
+    return status if status in ("PASS", "FAIL") else "NOT_TESTED"
+
+
+def _combine(*statuses: str) -> str:
+    if "FAIL" in statuses:
+        return "FAIL"
+    if statuses and all(s == "PASS" for s in statuses):
+        return "PASS"
+    return "NOT_TESTED"
+
+
+def _engine_gate(test_d: dict[str, Any] | None, name: str) -> str:
+    """The value the engine itself reported, used only if every arm reporting it agrees."""
+    status = _test_status(test_d)
+    if status != "PASS":
+        return status
+    values = {arm["gates"][name] for arm in (test_d or {}).get("arms", {}).values() if name in arm.get("gates", {})}
+    if not values:
+        return "NOT_TESTED"
+    return values.pop() if len(values) == 1 else "FAIL"
+
+
+def compute_release_gates(tests: dict[str, dict[str, Any]], device_name: str) -> dict[str, str]:
+    a, b, c = tests.get("test_a_architecture"), tests.get("test_b_text_forward"), tests.get("test_c_multimodal_forward")
+    d, e, g = tests.get("test_d_seven_arms"), tests.get("test_e_speculative_correctness"), tests.get("test_g_ccu_concurrency")
+    return {
+        "POLICY_HARNESS_PASS": _test_status(a),
+        "ACTUAL_BACKEND_HOOK_PASS": _engine_gate(d, "ACTUAL_BACKEND_HOOK_PASS"),
+        "REAL_MODEL_FORWARD_PASS": _combine(_test_status(a), _test_status(b)),
+        "REAL_MULTIMODAL_INFERENCE_PASS": _combine(_test_status(c), _test_status(d)),
+        "SEVEN_ARM_PRETRAINED_PASS": _test_status(d),
+        "MTP_CORRECTNESS_PASS": _engine_gate(d, "MTP_CORRECTNESS_PASS"),
+        "MTP_PROPOSAL_DIAGNOSTIC_PASS": _test_status(e),
+        "CCU_REQUEST_ISOLATION_TEST_PASS": _test_status(g),
+        # This script runs no vLLM scheduler load test and no A100 run.
+        "VLLM_SCHEDULER_CONCURRENCY_PASS": "NOT_TESTED",
+        "A100_GPU_QUALIFIED": "NOT_TESTED" if "A100" in device_name else "BLOCKED_PENDING_OWNER_PAID_AUTH",
+    }
+
+
+def verdict_for(tests: dict[str, dict[str, Any]]) -> str:
+    failed = [name for name in EXPECTED_TESTS if _test_status(tests.get(name)) != "PASS"]
+    return OK_VERDICT if not failed else "INCOMPLETE_OR_FAILED: " + ", ".join(failed)
+
+
+RUNS_DIR = REPO_ROOT / "artifacts" / "runs"
+
+
+def default_receipt_path(stamp: str) -> Path:
+    """A new per-run file. Committed receipts and the supersession notice are never targets."""
+    return RUNS_DIR / f"{stamp}_qwen35_pretrained_qualification.json"
+
+
+def write_receipt(path: Path, receipt: dict[str, Any], force: bool = False) -> None:
+    """Refuse to replace an existing receipt unless the caller explicitly forces it."""
+    if path.exists() and not force:
+        raise FileExistsError(f"Refusing to overwrite existing receipt {path}; pass --force to replace it")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w" if force else "x", encoding="utf8") as f:
+        json.dump(receipt, f, indent=2)
+
+
+def _round_or_none(value: float | None, digits: int = 4) -> float | None:
+    """Null stays null: an unmeasured quantity must never be reported as zero."""
+    return None if value is None else round(float(value), digits)
+
+
+def gate_evidence(tests: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    inv = (tests.get("test_a_architecture") or {}).get("coverage_inventory") or {}
+    parity = inv.get("logits_parity") or {}
+    return {
+        "logits_parity_max_abs_diff": parity.get("max_abs_logits_diff"),
+        "logits_parity_top1_match": parity.get("top1_match"),
+        "checkpoint_total_tensors": inv.get("checkpoint_total_tensors"),
+        "mapped_tensors_count": inv.get("mapped_tensors_count"),
+        "tensor_coverage_ratio": inv.get("tensor_coverage_ratio"),
+        "parameter_coverage_ratio": inv.get("parameter_coverage_ratio"),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Progressive Qualification Harness for Qwen3.5-0.8B Pretrained Model")
     parser.add_argument("--model-dir", type=Path, default=Path("/mnt/ssd/genos2/research_workspace/models/Qwen/Qwen3.5-0.8B"))
     parser.add_argument("--fixture-path", type=Path, default=REPO_ROOT / "tests" / "fixtures" / "000000039769.png")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--receipt-path", type=Path, default=REPO_ROOT / "artifacts" / "qwen35_pretrained_qualification_receipt.json")
+    parser.add_argument("--receipt-path", type=Path, default=None,
+                        help="Receipt file to create. Default: a new timestamped file under artifacts/runs/.")
+    parser.add_argument("--force", action="store_true", help="Allow replacing an existing receipt file.")
     args = parser.parse_args()
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    args.receipt_path = args.receipt_path or default_receipt_path(stamp)
+    if args.receipt_path.exists() and not args.force:
+        parser.error(f"receipt already exists: {args.receipt_path} (pass --force to replace it)")
 
     overall_t0 = time.perf_counter()
     print("================================================================================")
@@ -614,48 +733,30 @@ def main() -> None:
         "tests": {},
     }
 
-    try:
-        receipt["tests"]["test_a_architecture"] = run_test_a_architecture(args.model_dir, device=args.device)
-        receipt["tests"]["test_b_text_forward"] = run_test_b_text_forward(args.model_dir, device=args.device)
-        receipt["tests"]["test_c_multimodal_forward"] = run_test_c_multimodal_forward(args.model_dir, args.fixture_path, device=args.device)
-        receipt["tests"]["test_d_seven_arms"] = run_test_d_seven_arms(args.model_dir, args.fixture_path, device=args.device)
-        receipt["tests"]["test_e_speculative_correctness"] = run_test_e_speculative_correctness(args.model_dir, args.fixture_path, device=args.device)
-        receipt["tests"]["test_f_fixed_output_serving"] = run_test_f_fixed_output_serving(args.model_dir, device=args.device, target_tokens=256)
-        receipt["tests"]["test_g_ccu_concurrency"] = run_test_g_ccu_concurrency(args.model_dir, device=args.device)
+    tests: dict[str, dict[str, Any]] = {
+        "test_a_architecture": guarded(run_test_a_architecture, args.model_dir, device=args.device),
+        "test_b_text_forward": guarded(run_test_b_text_forward, args.model_dir, device=args.device),
+        "test_c_multimodal_forward": guarded(run_test_c_multimodal_forward, args.model_dir, args.fixture_path, device=args.device),
+        "test_d_seven_arms": guarded(run_test_d_seven_arms, args.model_dir, args.fixture_path, device=args.device),
+        "test_e_speculative_correctness": guarded(run_test_e_speculative_correctness, args.model_dir, args.fixture_path, device=args.device),
+        "test_f_fixed_output_serving": guarded(run_test_f_fixed_output_serving, args.model_dir, device=args.device, target_tokens=256),
+        "test_g_ccu_concurrency": guarded(run_test_g_ccu_concurrency, args.model_dir, device=args.device),
+    }
 
-        total_duration = time.perf_counter() - overall_t0
-        receipt["qualification_verdict"] = "PRETRAINED_FORWARD_AND_MTP_PROPOSAL_DIAGNOSTIC_ONLY"
-        receipt["total_duration_s"] = round(total_duration, 3)
+    receipt["tests"] = tests
+    receipt["qualification_verdict"] = verdict_for(tests)
+    receipt["total_duration_s"] = round(time.perf_counter() - overall_t0, 3)
+    receipt["release_gates"] = compute_release_gates(tests, device_name=receipt["cuda_device_name"])
+    receipt["release_gate_evidence"] = gate_evidence(tests)
 
-        receipt["release_gates"] = {
-            "POLICY_HARNESS_PASS": "PASS",
-            "ACTUAL_BACKEND_HOOK_PASS": "GATED_VLLM_BACKEND_ATTACHMENT_REQUIRED (Official Hugging Face Qwen3_5ForConditionalGeneration + 15-tensor Qwen35MTPModule hooked in PyTorch; native vLLM 0.29.0 C++ kernels require sm_75+)",
-            "REAL_MODEL_FORWARD_PASS": "PASS (100% parameter coverage: 488/488 safetensors tensors [473 base VL + 15 MTP], 873,438,784 total parameters, verified one-step logits parity max_abs_diff=0.0)",
-            "REAL_MULTIMODAL_INFERENCE_PASS": "PASS (Real 000000039769.png bytes processed via AutoProcessor [1200x1536 pixel_values] and ViT encoder [300x1024 visual token embeddings] across all 7 arms and 4 canonical tasks)",
-            "SEVEN_ARM_PRETRAINED_PASS": "PASS (100% official Qwen3.5-0.8B model hooking, logits parity, and per-arm ViT execution verified across all 7 method arms)",
-            "MTP_CORRECTNESS_PASS": "GATED_NATIVE_MTP_VERIFIER_REQUIRED (source MTP head is real; PyTorch path only measures target-aligned proposal matches)",
-            "MTP_PROPOSAL_DIAGNOSTIC_PASS": "PASS (no unverified drafts committed; target-greedy output parity in Test E)",
-            "CCU_REQUEST_ISOLATION_TEST_PASS": "PASS (Test G multi-threaded PyTorch request evidence isolation at offered 1,2,4; not scheduler throughput)",
-            "VLLM_SCHEDULER_CONCURRENCY_PASS": "GATED_NATIVE_VLLM_LOAD_TEST_REQUIRED",
-            "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH (SA-01 Truth in Labeling)",
-        }
+    write_receipt(args.receipt_path, receipt, force=args.force)
 
-        args.receipt_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(args.receipt_path, "w", encoding="utf8") as f:
-            json.dump(receipt, f, indent=2)
-
-        print("\n================================================================================")
-        print(f"  QUALIFICATION COMPLETE: ALL 7 TESTS QUALIFIED in {total_duration:.2f}s")
-        print(f"  Execution Receipt written to: {args.receipt_path}")
-        print("================================================================================")
-
-    except Exception as e:
-        receipt["qualification_verdict"] = f"FAILED: {e}"
-        args.receipt_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(args.receipt_path, "w", encoding="utf8") as f:
-            json.dump(receipt, f, indent=2)
-        print(f"\n[FATAL ERROR during Qualification]: {e}")
-        raise
+    print("\n================================================================================")
+    print(f"  VERDICT: {receipt['qualification_verdict']} in {receipt['total_duration_s']:.2f}s")
+    print(f"  Execution Receipt written to: {args.receipt_path}")
+    print("================================================================================")
+    if receipt["qualification_verdict"] != OK_VERDICT:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
