@@ -1782,6 +1782,9 @@ class RealSevenArmEngine:
                     "warning": "Each decode step's index_select size delta is added. The total is NOT a peak or allocated/reserved VRAM delta, and may count repeated reductions.",
                 },
                 "h2o_logical_selection_accounting": {
+                    "method_variant": "h2o_visual_anchor_text_budget",
+                    "method_variant_is_upstream_h2o": False,
+                    "upstream_variant_status": "NOT_IMPLEMENTED_OWNER_DECISION",
                     "budget_basis": "unprotected_prefill_tokens_fixed_per_layer",
                     "protected_outside_budget": True,
                     "per_step_evicted_slot_rate": h2o_per_step_rate,  # last decode step only
