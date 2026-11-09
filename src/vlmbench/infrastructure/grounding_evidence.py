@@ -119,6 +119,14 @@ class EvidencePool:
     def total_items(self) -> int:
         return len(self._items)
 
+    def items(self) -> tuple[EvidenceItem, ...]:
+        """Read-only snapshot of the pool's evidence items (used by STARLIGHT validity checks)."""
+        return tuple(self._items.values())
+
+    def keyword_index(self) -> dict[str, tuple[str, ...]]:
+        """Read-only snapshot of the keyword -> evidence-id index that ECRD also matches on."""
+        return {kw: tuple(sorted(ids)) for kw, ids in self._keyword_map.items()}
+
 
 @dataclass(frozen=True)
 class ECRDConfig:
