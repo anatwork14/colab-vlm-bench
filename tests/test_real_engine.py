@@ -729,6 +729,10 @@ def test_p7_r3_da_constructed_official_case_masks_real_reads_to_exact_zero():
 
     assert res.attention_mask_restriction_ratio > 0.0, "constructed case did not restrict any read"
     assert res.gates["DA_MASKING_EXERCISED"] == "PASS"
+    # R4-3: PASS must come from weights MEASURED in the hooked forward, not from the constructed mask.
+    measured = res.telemetry["da_cost_accounting"]
+    assert measured["measured_masked_entry_count"] > 0
+    assert measured["measured_masked_weight_max"] == 0.0
 
     checked_masked = 0
     for call in calls[1:]:
@@ -819,3 +823,62 @@ def test_r4_engine_module_docstring_makes_no_unverified_mtp_or_concurrency_claim
     assert "bit-exact" not in doc.lower(), "rollback is only in _speculative_mtp_greedy_k1"
     assert "zero state pollution" not in doc.lower()
     assert "_speculative_mtp_greedy_k1" in doc, "docstring must say where verification lives"
+
+
+# --- R4-3 (lead round 4, auditor MEDIUM): DA gate must rest on measured masked weights ---
+
+def test_r4_da_gate_requires_measured_zero_masked_weights():
+    from vlmbench.infrastructure.real_engine import _da_masking_gate
+    assert _da_masking_gate("base", 0.5, 10, 0.0) == "NOT_APPLICABLE"
+    assert _da_masking_gate("da_base", 0.0, 0, None) == "NOT_EXERCISED_NO_RESTRICTED_READS"
+    assert _da_masking_gate("da_base", None, None, None) == "NOT_MEASURED_NO_HOOKED_DECODE_STEP"
+    assert _da_masking_gate("da_base", 0.4, None, None) == "NOT_MEASURED_NO_HOOKED_DECODE_STEP"
+    assert _da_masking_gate("da_base", 0.4, 0, None) == "NOT_MEASURED_NO_HOOKED_DECODE_STEP"
+    assert _da_masking_gate("da_base", 0.4, 7, 1e-9) == "FAIL_MASKED_KEY_RECEIVED_ATTENTION"
+    assert _da_masking_gate("da_base", 0.4, 7, 0.0) == "PASS"
+
+
+def test_r4_da_scaffold_path_never_passes_the_gate():
+    """The scaffold forward has no hook, so no masked weight is measured and the gate cannot pass."""
+    cfg = _p7_small_cfg()
+    engine = RealSevenArmEngine(method_arm="da_base", config=cfg, device="cpu")
+    try:
+        prompt = [cfg.vision_start_token_id] + [cfg.image_token_id] * 8 + [cfg.vision_end_token_id] + list(range(10, 40))
+        res = engine.execute_request("r4_da_scaffold", prompt_token_ids=prompt,
+                                     max_new_tokens=4, image_present=False)
+    finally:
+        engine.close()
+    assert res.attention_mask_restriction_ratio is not None and res.attention_mask_restriction_ratio > 0.0
+    assert res.gates["DA_MASKING_EXERCISED"] != "PASS"
+    assert res.gates["DA_MASKING_EXERCISED"] == "NOT_MEASURED_NO_HOOKED_DECODE_STEP"
+    assert res.telemetry["da_cost_accounting"]["measured_masked_entry_count"] is None
+
+
+def test_r4_max_new_tokens_one_reports_none_not_literal_zero():
+    cfg = _p7_small_cfg()
+    eng_da = RealSevenArmEngine(method_arm="da_base", config=cfg, device="cpu")
+    try:
+        res_da = eng_da.execute_request("r4_one_da", prompt_token_ids=list(range(10, 30)),
+                                        max_new_tokens=1, image_present=True)
+    finally:
+        eng_da.close()
+    assert res_da.attention_read_restriction_ratio is None
+    assert res_da.attention_mask_restriction_ratio is None
+    da = res_da.telemetry["da_cost_accounting"]
+    assert da["attention_mask_restriction_ratio"] is None
+    assert da["decode_last_query_allowed_key_ratio"] is None
+    assert da["full_causal_mask_area_restriction_ratio"] is None
+    assert da["nontrivial_masking_exercised"] is None
+    assert res_da.gates["DA_MASKING_EXERCISED"].startswith("NOT_MEASURED")
+
+    eng_h2o = RealSevenArmEngine(method_arm="h2o_base", config=cfg, device="cpu")
+    try:
+        res_h = eng_h2o.execute_request("r4_one_h2o", prompt_token_ids=list(range(10, 50)),
+                                        max_new_tokens=1, image_present=False)
+    finally:
+        eng_h2o.close()
+    assert res_h.per_step_evicted_slot_rate is None
+    acc = res_h.telemetry["h2o_logical_selection_accounting"]
+    assert acc["per_step_evicted_slot_rate"] is None
+    assert acc["cumulative_evicted_slots"] is None
+    assert acc["final_retained_fraction"] is None
