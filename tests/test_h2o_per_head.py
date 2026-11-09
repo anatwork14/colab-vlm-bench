@@ -60,3 +60,26 @@ def test_per_head_plan_does_not_touch_the_layer_mask_or_budget():
     t.compute_eviction_plan_per_head(0, current_length=12)
     assert np.array_equal(t.layers[0].evicted_mask, before_mask)
     assert t.layers[0].budget == 5
+
+
+def test_per_head_plan_with_unset_budget_computes_it_without_storing_it_or_padding_scores():
+    # ITER2 D10 N-12 (review): the docstring promises no change to the layer's budget, evicted mask
+    # or scores. The budget-None path (not covered by the fixture above) must honour that too.
+    cfg = H2OConfig(budget_ratio=0.5, recent_ratio=0.2, min_budget=1, protect_system_tokens=0,
+                    protect_visual_tokens=False, per_kv_head_selection=True)
+    t = H2OCacheTracker(config=cfg, num_layers=1, num_kv_heads=2)
+    w = np.zeros((2, 1, 12), dtype=np.float32)
+    w[0, 0, 2:7] = [5, 4, 3, 2, 1]
+    w[1, 0, 7:12] = [5, 4, 3, 2, 1]
+    t.update_attention_scores(0, w)
+    assert t.layers[0].budget is None
+    mask_before = t.layers[0].evicted_mask.copy()
+    scores_shape_before = t.layers[0].scores.shape
+    retained, metrics = t.compute_eviction_plan_per_head(0, current_length=14)
+    assert metrics["budget"] == 7  # max(min_budget, int(14 * 0.5))
+    assert retained.shape == (2, 14)
+    assert retained.sum(axis=1).tolist() == [7, 7]
+    assert t.layers[0].budget is None
+    assert np.array_equal(t.layers[0].evicted_mask, mask_before)
+    assert t.layers[0].scores.shape == scores_shape_before
+

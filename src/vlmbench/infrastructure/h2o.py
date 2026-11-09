@@ -248,20 +248,26 @@ class H2OCacheTracker:
         Same budget rule as compute_eviction_plan, applied to each KV head's own scores: protected
         tokens are kept in every head, the recent window is shared (newest unprotected tokens), and
         each head keeps its own top heavy hitters among the remaining candidates. Returns a
-        (num_kv_heads, current_length) bool mask. Does NOT touch the layer's evicted mask or budget.
+        (num_kv_heads, current_length) bool mask.
+
+        Pure with respect to the layer (ITER2 D10 N-12): it writes nothing to the layer. The evicted
+        mask, the stored budget and the stored scores are left unchanged. If the layer's budget is
+        still None it is computed from the current unprotected count for this call only (not stored);
+        scores shorter than current_length are zero-padded in a local copy only.
         """
         layer = self.layers[layer_idx]
         H = self.num_kv_heads
         if layer.is_recurrent:
             retained = np.ones((H, current_length), dtype=bool)
             return retained, {"retained_tokens_per_head": [current_length] * H, "budget": None}
-        if layer.scores.shape[1] < current_length:
-            layer.scores = np.pad(layer.scores, ((0, 0), (0, current_length - layer.scores.shape[1])),
-                                  constant_values=0.0)
+        scores = layer.scores
+        if scores.shape[1] < current_length:
+            scores = np.pad(scores, ((0, 0), (0, current_length - scores.shape[1])), constant_values=0.0)
         protected = self._protected_mask(layer, current_length)
-        if layer.budget is None:
-            layer.budget = self._budget_for_unprotected(current_length - int(protected.sum()))
-        budget = layer.budget
+        if layer.budget is not None:
+            budget = layer.budget
+        else:
+            budget = self._budget_for_unprotected(current_length - int(protected.sum()))
         unprotected_idx = np.where(~protected)[0]
         unprotected_len = len(unprotected_idx)
         retained = np.zeros((H, current_length), dtype=bool)
@@ -276,7 +282,7 @@ class H2OCacheTracker:
             candidate_indices = unprotected_idx[:unprotected_len - recent_size]
             if len(candidate_indices) > 0 and hh_budget > 0:
                 for h in range(H):
-                    cand_scores = layer.scores[h, candidate_indices]
+                    cand_scores = scores[h, candidate_indices]
                     order = np.lexsort((candidate_indices, cand_scores))[::-1]
                     retained[h, candidate_indices[order[:min(len(order), hh_budget)]]] = True
         metrics = {
