@@ -21,6 +21,7 @@ from vlmbench.infrastructure.starlight import (
     da_protection_from_spans,
     evidence_validity,
     grounding_protection_from_pool,
+    grounding_protection_with_report,
     match_token_spans,
 )
 
@@ -142,7 +143,9 @@ def test_grounding_protects_token_positions_of_keyword_spans_only():
     tok = _WordTok()
     pool = EvidencePool("req-1")
     pool.add_evidence(_item("ev_red"), keywords=["red car"])
-    prompt_text = "the photo shows a red car near the gate and a red car again"
+    # ITER3 R2 C-4 RE-DERIVED: 4 protected 'red car' positions in 14 tokens is 0.29 > 0.2 (breadth cap).
+    # Seven filler words are appended after position 13, so positions 0-13 are unchanged and 4/21 = 0.19.
+    prompt_text = "the photo shows a red car near the gate and a red car again one two three four five six seven"
     prompt = tok.encode(prompt_text)
     prot = grounding_protection_from_pool(
         pool, prompt, tok.encode, current_request_id="req-1", image_sha256=None,
@@ -154,14 +157,21 @@ def test_grounding_protects_token_positions_of_keyword_spans_only():
 
 
 def test_irrelevant_evidence_protection_is_measured_not_hidden():
+    # ITER3 R2 C-4 RE-DERIVED: the too-generic keyword 'the' is a stop-word. It protects nothing, and the
+    # rejection is reported, not hidden. The content keyword 'mat' (1 of 9 tokens) is protected and reported.
     tok = _WordTok()
-    pool = EvidencePool("req-1")
-    pool.add_evidence(_item("ev_the"), keywords=["the"])  # a too-generic keyword
     prompt = tok.encode("the cat sat on the mat near the door")
-    prot = grounding_protection_from_pool(pool, prompt, tok.encode, current_request_id="req-1",
-                                          image_sha256=None)
-    assert len(prot) == 3  # every "the" is protected: reported per evidence id, never dropped
-    assert {labels for labels in prot.values()} == {("ev_the",)}
+    pool = EvidencePool("req-1")
+    pool.add_evidence(_item("ev_the"), keywords=["the"])
+    prot, report = grounding_protection_with_report(pool, prompt, tok.encode, current_request_id="req-1",
+                                                    image_sha256=None)
+    assert prot == {}
+    assert report["rejected_stopword"] == ["the"]
+    pool2 = EvidencePool("req-1")
+    pool2.add_evidence(_item("ev_mat"), keywords=["mat"])
+    prot2 = grounding_protection_from_pool(pool2, prompt, tok.encode, current_request_id="req-1",
+                                           image_sha256=None)
+    assert prot2 == {5: ("ev_mat",)}
 
 
 def test_grounding_ignores_evidence_without_a_prompt_span_match():

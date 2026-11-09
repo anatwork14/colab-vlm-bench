@@ -82,6 +82,11 @@ and the text-side budget shrinks by the same amount.
 - Only `valid` evidence protects (see 4.3).
 - Telemetry reports the protected prompt positions per evidence id, so a too-generic keyword is
   visible (`grounding_protected_by_evidence`). It is measured, not hidden.
+- **Keyword breadth policy (ITER3 R2, C-4).** Stop-word-like keywords (`KEYWORD_STOPWORDS`, e.g.
+  `the`) are rejected before any position is protected. A keyword whose protected positions exceed
+  `MAX_KEYWORD_PROMPT_FRACTION = 0.2` of the prompt is rejected. Both rejections are reported in
+  `grounding_keyword_policy` (`accepted_keywords`, `rejected_stopword`, `rejected_breadth` with the fraction).
+  Accepted protection that still exceeds the budget keeps the INFEASIBLE semantics of section 3 (never silent).
 
 ### 4.3 Evidence validity
 

@@ -191,13 +191,21 @@ def test_expired_evidence_protects_nothing_and_is_reported():
 
 
 def test_irrelevant_evidence_protection_is_measured_per_evidence_id():
+    # ITER3 R2 C-4 RE-DERIVED. The original keyword 'the' (three tokens) is a stop-word: it now protects
+    # nothing, and the rejection is REPORTED (it is measured, not hidden). The per-evidence measurement is kept
+    # with a content keyword: 'car' (token 8) occurs once in this 5-token prompt, fraction 1/5 = 0.2, at the cap.
     tok = _WordTok()
-    pool = _pool("req_irr", ["the"], eid="ev_the")
-    result = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False).execute_request(
+    stop = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False).execute_request(
         request_id="req_irr", prompt_token_ids=[7, 9, 7, 8, 7], image_present=False,
-        max_new_tokens=2, evidence_pool=pool)
-    s = result.telemetry["starlight"]
-    assert s["grounding_protected_by_evidence"] == {"ev_the": 3}  # three "the" tokens, all reported
+        max_new_tokens=2, evidence_pool=_pool("req_irr", ["the"], eid="ev_the"))
+    s_stop = stop.telemetry["starlight"]
+    assert s_stop["grounding_protected_by_evidence"] == {}
+    assert s_stop["grounding_keyword_policy"]["rejected_stopword"] == ["the"]
+    content = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False).execute_request(
+        request_id="req_irr2", prompt_token_ids=[7, 9, 7, 8, 7], image_present=False,
+        max_new_tokens=2, evidence_pool=_pool("req_irr2", ["car"], eid="ev_car"))
+    s = content.telemetry["starlight"]
+    assert s["grounding_protected_by_evidence"] == {"ev_car": 1}  # the one 'car' token, reported
     assert s["protected_count_by_source"]["grounding"] > 0
 
 
@@ -227,8 +235,11 @@ def test_multi_request_isolation_second_request_is_unaffected_by_first():
     prompt = [7, 9, 7, 8, 7, 9, 8, 7, 9, 9, 8, 7]
     engine = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False, h2o_min_budget=8,
                      h2o_budget_ratio=0.5)
-    engine.execute_request(request_id="iso_a", prompt_token_ids=prompt, image_present=False,
-                           max_new_tokens=4, evidence_pool=_pool("iso_a", ["the"], eid="ev_a"))
+    # ITER3 R2 C-4 RE-DERIVED: keyword 'the' -> 'car', prompt extended to 36 tokens so car (3 of 36) is under the cap.
+    prompt = prompt + list(range(100, 124))
+    first = engine.execute_request(request_id="iso_a", prompt_token_ids=prompt, image_present=False,
+                                   max_new_tokens=4, evidence_pool=_pool("iso_a", ["car"], eid="ev_a"))
+    assert first.telemetry["starlight"]["grounding_protected_by_evidence"], "first request must protect (non-vacuous)"
     second = engine.execute_request(request_id="iso_b", prompt_token_ids=prompt, image_present=False,
                                     max_new_tokens=4)
     fresh = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False, h2o_min_budget=8,
@@ -245,9 +256,12 @@ def test_multi_turn_continuity_same_request_id_matches_fresh_engine():
     prompt = [7, 9, 7, 8, 7, 9, 8, 7, 9, 9, 8, 7]
     engine = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False, h2o_min_budget=8,
                      h2o_budget_ratio=0.5)
-    pool = _pool("turns", ["the"])
+    # ITER3 R2 C-4 RE-DERIVED: keyword 'the' -> 'car' and prompt extended (car 3 of 36 is under the cap).
+    prompt = prompt + list(range(100, 124))
+    pool = _pool("turns", ["car"])
     turn1 = engine.execute_request(request_id="turns", prompt_token_ids=prompt, image_present=False,
                                    max_new_tokens=3, evidence_pool=pool)
+    assert turn1.telemetry["starlight"]["grounding_protected_by_evidence"], "turn 1 must protect (non-vacuous)"
     turn2 = engine.execute_request(request_id="turns", prompt_token_ids=prompt, image_present=False,
                                    max_new_tokens=3, evidence_pool=pool)
     fresh = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False, h2o_min_budget=8,
@@ -261,7 +275,9 @@ def test_multi_turn_continuity_same_request_id_matches_fresh_engine():
 def test_ablation_no_da_removes_only_the_da_signal_and_does_not_enable_da_masking():
     tok = _WordTok()
     prompt = list(range(100, 140))
-    pool = _pool("abl", ["the"])
+    for i in (5, 20, 33):  # ITER3 R2 C-4 RE-DERIVED: 'car' (token 8) at 3 of 40 positions, under the cap
+        prompt[i] = 8
+    pool = _pool("abl", ["car"])
     full = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False, h2o_min_budget=16,
                    h2o_budget_ratio=0.2).execute_request(
         request_id="abl", prompt_token_ids=prompt, image_present=False, max_new_tokens=4, evidence_pool=pool)
@@ -272,6 +288,7 @@ def test_ablation_no_da_removes_only_the_da_signal_and_does_not_enable_da_maskin
     assert no_da.telemetry["starlight"]["protected_count_by_source"]["da"] == 0
     assert no_da.telemetry["starlight"]["conflicts_by_source"]["da"] == 0
     assert full.telemetry["starlight"]["protected_count_by_source"]["da"] > 0
+    assert full.telemetry["starlight"]["protected_count_by_source"]["grounding"] > 0  # non-vacuous ablation
     assert no_da.telemetry["da_cost_accounting"]["attention_mask_restriction_ratio"] is None
     assert no_da.attention_mask_restriction_ratio is None
 

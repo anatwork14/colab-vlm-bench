@@ -54,7 +54,7 @@ from .grounding_evidence import ECRDConfig, EvidencePool, EvidenceItem, ECRDLogi
 from .starlight import (
     STATUS_INFEASIBLE, StarlightLayerPlan, combine_summaries, compact_orig_positions,
     VISUAL_EVIDENCE_NOTE, da_protection_from_spans, evidence_provenance, evidence_validity,
-    grounding_protection_from_pool, visual_evidence_protection_status,
+    grounding_protection_with_report, visual_evidence_protection_status,
     plan_starlight_layer, summarize_plans,
 )
 from .adapters import HardwareGateError, check_vllm_hardware_compatibility
@@ -2376,6 +2376,7 @@ class RealSevenArmEngine:
         starlight_grounding_status = "NOT_STARTED" if "grounding" in starlight_enabled else "DISABLED_ABLATION"
         starlight_verdicts: dict[str, list[str]] = {}
         starlight_provenance: dict[str, dict[str, str]] = {}
+        starlight_keyword_report: dict[str, Any] = {}
         starlight_summaries: list[dict[str, Any]] = []
         starlight_max_retained = 0
         starlight_text_fraction: float | None = None
@@ -2431,7 +2432,7 @@ class RealSevenArmEngine:
                     elif image_present and image_sha is None:
                         starlight_grounding_status = "NOT_PROTECTED_IMAGE_SOURCE_UNKNOWN"
                     else:
-                        starlight_grounding = grounding_protection_from_pool(
+                        starlight_grounding, starlight_keyword_report = grounding_protection_with_report(
                             evidence_pool, full_prompt, self.tokenizer.encode, request_id, image_sha,
                         )
                         starlight_grounding_status = "ACTIVE"
@@ -2972,6 +2973,8 @@ class RealSevenArmEngine:
                 # ITER3 R2 C-3: `verified` is a caller declaration; source hash is checked only vs image bytes.
                 "grounding_evidence_provenance": starlight_provenance,
                 # ITER3 R2 C-5: image evidence protects no visual tokens. Stated, never silent.
+                # ITER3 R2 C-4: keyword breadth policy and what it rejected (never silent).
+                "grounding_keyword_policy": starlight_keyword_report,
                 "visual_evidence_protection": visual_evidence_protection_status(evidence_pool),
                 "visual_evidence_protection_note": VISUAL_EVIDENCE_NOTE,
                 "grounding_protected_by_evidence": grounding_by_evidence,

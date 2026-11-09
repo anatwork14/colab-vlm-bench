@@ -106,7 +106,7 @@ def _engine_helper():
 # --- I-1, I-2, I-3, I-10: per-entry record checks on a long-context run -------------------
 
 def test_I1_I2_eligibility_formula_and_protection_recomputed_from_records():
-    result = _run("starlight_s1", pool=_pool("oracle_run", ["the"]))
+    result = _run("starlight_s1", pool=_pool("oracle_run", ["car"]))
     checked = 0
     for rec in _records(result):
         for e in rec["entries"]:
@@ -119,7 +119,7 @@ def test_I1_I2_eligibility_formula_and_protection_recomputed_from_records():
 
 
 def test_I3_count_check_and_closed_reason_enum_at_every_step():
-    result = _run("starlight_s1", pool=_pool("oracle_run", ["the"]))
+    result = _run("starlight_s1", pool=_pool("oracle_run", ["car"]))
     for rec in _records(result):
         assert rec["pre"] == rec["retained"] + rec["evicted"]  # |pre| = |R| + |evicted|
         assert rec["n_eligible"] == rec["evicted"]
@@ -130,7 +130,7 @@ def test_I3_count_check_and_closed_reason_enum_at_every_step():
 
 
 def test_I10_decision_records_carry_every_required_field():
-    result = _run("starlight_s1", pool=_pool("oracle_run", ["the"]))
+    result = _run("starlight_s1", pool=_pool("oracle_run", ["car"]))
     required = {"step", "phase", "layer", "budget", "pre", "retained", "evicted", "status", "n_da",
                 "n_grounding", "n_h2o_candidates", "n_eligible", "n_protected",
                 "n_protected_outside_budget", "entries"}
@@ -142,7 +142,7 @@ def test_I10_decision_records_carry_every_required_field():
 
 
 def test_I9_HC15_identical_inputs_give_identical_records_and_tokens():
-    pool = _pool("oracle_run", ["the"])
+    pool = _pool("oracle_run", ["car"])
     a = _run("starlight_s1", pool=pool)
     b = _run("starlight_s1", pool=pool)
     assert a.tokens_generated == b.tokens_generated
@@ -182,7 +182,7 @@ def test_HC11_no_eligible_candidates_reports_zero_eligible_and_no_eviction():
 # --- HC-10, HC-12, HC-13, HC-14, HC-5, HC-4, HC-7 (engine telemetry) -------------------------
 
 def test_HC10_evicted_entry_never_returns_to_a_later_step():
-    result = _run("starlight_s1", pool=_pool("oracle_run", ["the"]), new=12)
+    result = _run("starlight_s1", pool=_pool("oracle_run", ["car"]), new=12)
     by_layer: dict[int, list[dict]] = {}
     for rec in _records(result):
         by_layer.setdefault(rec["layer"], []).append(rec)
@@ -195,7 +195,7 @@ def test_HC10_evicted_entry_never_returns_to_a_later_step():
 
 
 def test_HC12_gdn_layers_are_exempt_and_labelled_and_absent_from_records():
-    result = _run("starlight_s1", pool=_pool("oracle_run", ["the"]))
+    result = _run("starlight_s1", pool=_pool("oracle_run", ["car"]))
     gdn = result.telemetry["starlight"]["gdn_layer_records"]
     assert [g["layer"] for g in gdn] == [0, 1, 2, 4, 5, 6]
     for g in gdn:
@@ -209,7 +209,7 @@ def test_HC13_vision_start_and_end_are_protected_and_never_evicted():
     # at position 21, under budget pressure (22 tokens, budget 16). Both must be protected by the
     # structural source and never evicted; the policy stays labelled as an unratified lead decision.
     prompt = list(range(100, 110)) + [501] + list(range(110, 120)) + [502] + list(range(120, 130))
-    result = _run("starlight_s1", pool=_pool("oracle_run", ["the"]), prompt=prompt)
+    result = _run("starlight_s1", pool=_pool("oracle_run", ["car"]), prompt=prompt)
     s = result.telemetry["starlight"]
     assert s["structural_policy"] == "PROTECTED_LEAD_DECISION_Q2"
     assert s["structural_tokens_evicted"] == 0
@@ -221,17 +221,17 @@ def test_HC13_vision_start_and_end_are_protected_and_never_evicted():
 
 
 def test_HC14_cache_length_counter_matches_retained_count_every_step():
-    result = _run("starlight_s1", pool=_pool("oracle_run", ["the"]), new=12)
+    result = _run("starlight_s1", pool=_pool("oracle_run", ["car"]), new=12)
     assert result.telemetry["starlight"]["cache_length_mismatch_steps"] == 0
 
 
 def test_HC5_irrelevant_protection_metric_is_present_and_marked_unmeasured():
-    result = _run("starlight_s1", pool=_pool("oracle_run", ["the"]))
+    result = _run("starlight_s1", pool=_pool("oracle_run", ["car"]))
     assert result.telemetry["starlight"]["protected_irrelevant_fraction"] == "NOT_MEASURED_NO_RELEVANCE_LABELS"
 
 
 def test_HC4_expired_evidence_carries_the_oracle_reason_code():
-    pool = _pool("some_earlier_request", ["the"])
+    pool = _pool("some_earlier_request", ["car"])
     result = _run("starlight_s1", pool=pool, request_id="oracle_now")
     verdict = result.telemetry["starlight"]["grounding_evidence_verdicts"]["ev_the"]
     assert verdict == ["expired", "pool_request_id_mismatch", "EXPIRED_EVIDENCE"]
@@ -295,7 +295,7 @@ def test_A_GROUND_activates_on_a_grounding_h2o_conflict_and_retains_the_candidat
 
 
 def test_A_NODA_and_A_NOGROUND_report_zero_for_the_removed_signal_on_every_step():
-    pool = _pool("oracle_run", ["the"])
+    pool = _pool("oracle_run", ["car"])
     no_da = _records(_run("starlight_s1_no_da", pool=pool))
     assert all(r["n_da"] == 0 for r in no_da), "A-NODA: DA signal leaked into the no-DA ablation"
     no_gr = _records(_run("starlight_s1_no_grounding", pool=pool))
@@ -303,13 +303,13 @@ def test_A_NODA_and_A_NOGROUND_report_zero_for_the_removed_signal_on_every_step(
 
 
 def test_A_H2O_candidates_exist_on_the_long_context_fixture():
-    recs = _records(_run("starlight_s1", pool=_pool("oracle_run", ["the"])))
+    recs = _records(_run("starlight_s1", pool=_pool("oracle_run", ["car"])))
     assert any(r["n_h2o_candidates"] > 0 for r in recs), "A-H2O: arm never saw an eviction candidate"
 
 
 def test_A_NOT_ACTIVATED_label_is_not_needed_for_grounding_arm_on_this_fixture():
     # The grounding keyword is present in PROMPT, so n_grounding must be > 0 on the pressure run.
-    recs = _records(_run("starlight_s1", pool=_pool("oracle_run", ["the"])))
+    recs = _records(_run("starlight_s1", pool=_pool("oracle_run", ["car"])))
     assert any(r["n_grounding"] > 0 for r in recs)
 
 
@@ -317,7 +317,7 @@ def test_I7_surviving_entries_keep_their_original_position_ids_across_steps():
     # Added after the implementation (coverage of an existing property), not red-first.
     # Records key entries by ORIGINAL position. A renumbering bug would make a survivor's id appear
     # as a smaller or new id in the next step, so every survivor must reappear with the same id.
-    result = _run("starlight_s1", pool=_pool("oracle_run", ["the"]), new=12)
+    result = _run("starlight_s1", pool=_pool("oracle_run", ["car"]), new=12)
     by_layer: dict[int, list[dict]] = {}
     for rec in _records(result):
         by_layer.setdefault(rec["layer"], []).append(rec)
@@ -332,7 +332,7 @@ def test_I7_surviving_entries_keep_their_original_position_ids_across_steps():
 def test_A_MASK_da_attention_mask_is_not_reported_as_kv_saving_on_starlight_arms():
     # Added after the implementation (coverage of an existing property). A logical DA restriction must
     # never appear as a KV-residency or byte saving for the STARLIGHT arms.
-    result = _run("starlight_s1", pool=_pool("oracle_run", ["the"]))
+    result = _run("starlight_s1", pool=_pool("oracle_run", ["car"]))
     cost = result.telemetry["da_cost_accounting"]
     assert cost["attention_mask_restriction_ratio"] is None
     assert result.attention_mask_restriction_ratio is None

@@ -514,19 +514,66 @@ def grounding_protection_from_pool(
     Keyword matching is token-level, so a word split across tokens in a different way can be
     missed (documented limitation).
     """
+    protected, _report = grounding_protection_with_report(
+        pool, prompt_ids, encode, current_request_id, image_sha256)
+    return protected
+
+
+# ITER3 R2 C-4: keyword breadth policy. Reported explicitly in telemetry (grounding_keyword_policy).
+# Stop-word-like keywords are rejected whatever their frequency. A keyword whose protected positions exceed
+# MAX_KEYWORD_PROMPT_FRACTION of the prompt is rejected. Accepted protection that still exceeds the budget is
+# handled by the existing INFEASIBLE semantics in plan_starlight_layer (never silently dropped).
+KEYWORD_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is", "it", "its", "of", "on",
+    "or", "that", "the", "this", "to", "was", "were", "with",
+})
+MAX_KEYWORD_PROMPT_FRACTION = 0.2
+
+
+def grounding_protection_with_report(
+    pool: Any,
+    prompt_ids: Sequence[int],
+    encode: Any,
+    current_request_id: str,
+    image_sha256: str | None,
+) -> tuple[dict[int, tuple[str, ...]], dict[str, Any]]:
+    """Grounding-protected positions AND the keyword policy report (accepted and rejected keywords).
+
+    Same matching as grounding_protection_from_pool. Each keyword is checked against the breadth policy
+    before any of its positions is protected, so a rejected keyword protects nothing.
+    """
+    report: dict[str, Any] = {
+        "max_keyword_prompt_fraction": MAX_KEYWORD_PROMPT_FRACTION,
+        "stopword_list": sorted(KEYWORD_STOPWORDS),
+        "accepted_keywords": [],
+        "rejected_stopword": [],
+        "rejected_breadth": [],
+    }
     if pool is None:
-        return {}
+        return {}, report
     verdicts = evidence_validity(pool, current_request_id, image_sha256)
     valid_ids = {eid for eid, (status, _) in verdicts.items() if status == "valid"}
+    n_prompt = len(prompt_ids)
     protected: dict[int, set[str]] = {}
-    for keyword, evidence_ids in pool.keyword_index().items():
+    for keyword, evidence_ids in sorted(pool.keyword_index().items()):
         supporting = [eid for eid in evidence_ids if eid in valid_ids]
         if not supporting:
             continue
+        if keyword.strip().lower() in KEYWORD_STOPWORDS:
+            report["rejected_stopword"].append(keyword)
+            continue
+        own: dict[int, set[str]] = {}
         variants = {keyword, f" {keyword}", keyword.capitalize(), f" {keyword.capitalize()}"}
         for variant in sorted(variants):
             tokens = list(encode(variant))
             for start in match_token_spans(prompt_ids, tokens):
                 for pos in range(start, start + len(tokens)):
-                    protected.setdefault(pos, set()).update(supporting)
-    return {pos: tuple(sorted(ids)) for pos, ids in sorted(protected.items())}
+                    own.setdefault(pos, set()).update(supporting)
+        fraction = (len(own) / n_prompt) if n_prompt else 0.0
+        if fraction > MAX_KEYWORD_PROMPT_FRACTION:
+            report["rejected_breadth"].append({"keyword": keyword, "protected_fraction": round(fraction, 6)})
+            continue
+        report["accepted_keywords"].append(keyword)
+        for pos, ids in own.items():
+            protected.setdefault(pos, set()).update(ids)
+    return {pos: tuple(sorted(ids)) for pos, ids in sorted(protected.items())}, report
