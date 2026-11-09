@@ -34,13 +34,13 @@ from transformers.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from vlmbench.infrastructure import (
+from vlmbench.infrastructure import (  # noqa: E402 - sys.path must be extended first
     Qwen35ModelConfig,
     RealSevenArmEngine,
     EvidencePool,
     EvidenceItem,
 )
-from vlmbench.multimodal_fixture import (
+from vlmbench.multimodal_fixture import (  # noqa: E402 - sys.path must be extended first
     CanonicalMultimodalFixture,
     CANONICAL_IMAGE_SHA256,
     CANONICAL_PANOPTIC_SHA256,
