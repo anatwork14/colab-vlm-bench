@@ -167190,7 +167190,7 @@
     "present": false
    }
   },
-  "disk_free_gib": 10.17,
+  "disk_free_gib": 10.105,
   "gpu": {
    "compute_cap": 6.1,
    "memory_total_mib": 11264,
@@ -167233,7 +167233,7 @@
   },
   "weights_hashed": true
  },
- "head": "3e7f70e8795e7e4c1cc4c6c82843a08c1f3e3bb1",
+ "head": "e97860d42a88abe300d59ec2b3da82f1265ed193",
  "matrices": {
   "full": {
    "blocker_counts": {
@@ -167317,6 +167317,7 @@
   "required_vram_mib": 39000
  },
  "schema": "harness_inventory/1",
+ "script_sha256": "1a9cda8d0555e471d50ed1d32429d2550519c670659322a203c7f51c14c24c5f",
  "status_vocabulary": [
   "READY",
   "UNSUPPORTED",
