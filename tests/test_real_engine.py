@@ -252,7 +252,7 @@ def test_all_seven_arms_real_neural_forward_and_gates():
         assert res.gates["ACTUAL_BACKEND_HOOK_PASS"] in ("PASS", "GATED_VLLM_BACKEND_ATTACHMENT_REQUIRED")
         assert res.gates["REAL_MODEL_FORWARD_PASS"] in ("PASS", "GATED_PRETRAINED_CHECKPOINT_REQUIRED")
         assert res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] in ("PASS", "GATED_PRETRAINED_CHECKPOINT_REQUIRED")
-        assert res.gates["CCU_ISOLATION_PASS"] == "PASS"
+        assert res.gates["CCU_ISOLATION_PASS"] == "GATED_MULTIREQUEST_ISOLATION_TEST_REQUIRED"
         assert res.gates["A100_GPU_QUALIFIED"] == "BLOCKED_PENDING_OWNER_PAID_AUTH"
 
         if "h2o" in arm:

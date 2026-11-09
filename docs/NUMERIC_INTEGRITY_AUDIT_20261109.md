@@ -28,7 +28,7 @@
 - `mtp_acceptance_rate` = accepted, **committed speculative** tokens / truly proposed tokens. Cannot be reported until a native correct verifier exists. An internal compatibility value of zero when there is **no speculative serving** is a *no-attempt sentinel*, NOT an observation that the pretrained MTP head has 0% acceptance.
 - `attention_mask_restriction_ratio` = disallowed keys / total eligible keys **in the final decode query row**, when all methods use the same logical prompt. This is not bytes read or time saved. `full_causal_mask_area_restriction_ratio` is distinct: excluded cells / all causal cells of a hypothetical prefill-style matrix.
 - `physical_kv_bytes_freed` is a **deprecated legacy field name** currently mapping to a sum of per-step KV tensor payload deltas, not peak/allocated/reserved GPU VRAM. Prefer `kv_memory_accounting.compaction_tensor_byte_deltas_sum`; report `peak_cuda_allocated_saving_bytes=null` and `peak_cuda_reserved_saving_bytes=null` until measured with matched runs.
-- `CCU_REQUEST_ISOLATION_PASS` is a per-request correctness observation. It does not certify actual simultaneous GPU scheduler throughput, queue discipline or 16/32 concurrency feasibility.
+- `CCU_ISOLATION_PASS` is **GATED in every individual engine result**: one request cannot establish multi-request isolation. The separate Test G may report `CCU_REQUEST_ISOLATION_TEST_PASS` only after CCU 1/2/4 ThreadPoolExecutor evidence-pool checks. This does **not** certify vLLM GPU scheduler throughput, queue discipline or CCU 8/16/32 feasibility. The `VLLM_SCHEDULER_CONCURRENCY_PASS` gate remains closed.
 
 ## Remaining blocking GPU evidence
 

@@ -295,7 +295,7 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
         assert res.gates["REAL_MODEL_FORWARD_PASS"] == "PASS"
         assert res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS"
         assert res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS"
-        assert res.gates["CCU_ISOLATION_PASS"] == "PASS"
+        assert res.gates["CCU_ISOLATION_PASS"] == "GATED_MULTIREQUEST_ISOLATION_TEST_REQUIRED"
         assert res.gates["A100_GPU_QUALIFIED"] == "BLOCKED_PENDING_OWNER_PAID_AUTH"
         assert res.telemetry["architectural_status"] == "OFFICIAL_HF_PRETRAINED_HOOKED_MODEL"
         assert res.telemetry["pretrained_weights"]["mapped_tensors_count"] == 488
@@ -560,7 +560,7 @@ def run_test_g_ccu_concurrency(model_dir: Path, device: str = "cpu") -> dict[str
             assert len(out.tokens_generated) == 4
             assert out.gates["REAL_MODEL_FORWARD_PASS"] == "PASS"
             assert out.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS"
-            assert out.gates["CCU_ISOLATION_PASS"] == "PASS"
+            assert out.gates["CCU_ISOLATION_PASS"] == "GATED_MULTIREQUEST_ISOLATION_TEST_REQUIRED"
             assert len(out.grounded_citations) > 0, f"Request {idx} in CCU {ccu} must produce citations"
             for cit in out.grounded_citations:
                 for ev_id in cit["evidence_ids"]:
@@ -635,7 +635,8 @@ def main() -> None:
             "SEVEN_ARM_PRETRAINED_PASS": "PASS (100% official Qwen3.5-0.8B model hooking, logits parity, and per-arm ViT execution verified across all 7 method arms)",
             "MTP_CORRECTNESS_PASS": "GATED_NATIVE_MTP_VERIFIER_REQUIRED (source MTP head is real; PyTorch path only measures target-aligned proposal matches)",
             "MTP_PROPOSAL_DIAGNOSTIC_PASS": "PASS (no unverified drafts committed; target-greedy output parity in Test E)",
-            "CCU_ISOLATION_PASS": "PASS (Pretrained CCU 1, 2, 4 strict isolation with non-empty citations verified in Test G)",
+            "CCU_REQUEST_ISOLATION_TEST_PASS": "PASS (Test G multi-threaded PyTorch request evidence isolation at offered 1,2,4; not scheduler throughput)",
+            "VLLM_SCHEDULER_CONCURRENCY_PASS": "GATED_NATIVE_VLLM_LOAD_TEST_REQUIRED",
             "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH (SA-01 Truth in Labeling)",
         }
 

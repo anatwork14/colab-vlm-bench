@@ -1147,6 +1147,13 @@ class RealSevenArmEngine:
         question: str | None = None,
     ) -> RealExecutionResult:
         """Execute full multimodal inference across any of the 7 arms with real neural passes."""
+        # A zero/negative request must fail before expensive model/image work.
+        # bool is not a valid count even though bool is an int subclass.
+        if type(max_new_tokens) is not int or max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be a positive integer")
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise ValueError("request_id must be a non-empty string")
+
         t0 = time.perf_counter()
         raw_prompt_ids = list(prompt_token_ids) if prompt_token_ids is not None else [100, 101, 102]
 
@@ -1185,7 +1192,9 @@ class RealSevenArmEngine:
             "MTP_CORRECTNESS_PASS": "GATED_NATIVE_MTP_VERIFIER_REQUIRED" if "mtp" in self.method_arm else "NOT_APPLICABLE",
             "MTP_PROPOSAL_DIAGNOSTIC_PASS": "PENDING" if "mtp" in self.method_arm else "NOT_APPLICABLE",
             "MTP_PROPOSAL_RATE_SCIENTIFICALLY_QUALIFIED": "BLOCKED_NO_NATIVE_MTP_KV_HISTORY" if "mtp" in self.method_arm else "NOT_APPLICABLE",
-            "CCU_ISOLATION_PASS": "PASS",
+            # A single request cannot independently certify concurrent isolation.
+            "CCU_ISOLATION_PASS": "GATED_MULTIREQUEST_ISOLATION_TEST_REQUIRED",
+            "VLLM_SCHEDULER_CONCURRENCY_PASS": "GATED_NATIVE_VLLM_LOAD_TEST_REQUIRED",
             "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH",
         }
 
