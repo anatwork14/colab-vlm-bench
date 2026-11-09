@@ -1147,6 +1147,13 @@ class RealSevenArmEngine:
         question: str | None = None,
     ) -> RealExecutionResult:
         """Execute full multimodal inference across any of the 7 arms with real neural passes."""
+        # A zero/negative request must fail before expensive model/image work.
+        # bool is not a valid count even though bool is an int subclass.
+        if type(max_new_tokens) is not int or max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be a positive integer")
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise ValueError("request_id must be a non-empty string")
+
         t0 = time.perf_counter()
         raw_prompt_ids = list(prompt_token_ids) if prompt_token_ids is not None else [100, 101, 102]
 
@@ -1185,7 +1192,9 @@ class RealSevenArmEngine:
             "MTP_CORRECTNESS_PASS": "GATED_NATIVE_MTP_VERIFIER_REQUIRED" if "mtp" in self.method_arm else "NOT_APPLICABLE",
             "MTP_PROPOSAL_DIAGNOSTIC_PASS": "PENDING" if "mtp" in self.method_arm else "NOT_APPLICABLE",
             "MTP_PROPOSAL_RATE_SCIENTIFICALLY_QUALIFIED": "BLOCKED_NO_NATIVE_MTP_KV_HISTORY" if "mtp" in self.method_arm else "NOT_APPLICABLE",
-            "CCU_ISOLATION_PASS": "PASS",
+            # A single request cannot independently certify concurrent isolation.
+            "CCU_ISOLATION_PASS": "GATED_MULTIREQUEST_ISOLATION_TEST_REQUIRED",
+            "VLLM_SCHEDULER_CONCURRENCY_PASS": "GATED_NATIVE_VLLM_LOAD_TEST_REQUIRED",
             "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH",
         }
 
@@ -1217,6 +1226,8 @@ class RealSevenArmEngine:
         total_physical_freed = 0
         final_allocated_bytes = 0
         final_logical_fraction = 0.0
+        h2o_last_step_evicted_slots = 0
+        h2o_last_step_total_slots = 0
         final_da_restriction_ratio = 0.0
         final_da_causal_area_ratio = 0.0
         mtp_proposed_total = 0
@@ -1324,6 +1335,8 @@ class RealSevenArmEngine:
             # 2. H2O physical eviction plans for full-attention layers coordinated with physical KV length
             h2o_eviction_plans: dict[int, torch.Tensor] = {}
             if tracker is not None:
+                h2o_last_step_evicted_slots = 0
+                h2o_last_step_total_slots = 0
                 for l_idx in self.config.full_attention_layers:
                     if self.is_official_hf_hooked and past_kv is not None:
                         k_phys_len = past_kv.layers[l_idx].keys.shape[2] + 1
@@ -1334,7 +1347,14 @@ class RealSevenArmEngine:
                     retained, metrics = tracker.compute_eviction_plan(l_idx, current_length=k_phys_len)
                     retained_indices = torch.where(torch.from_numpy(retained))[0].to(self.device)
                     h2o_eviction_plans[l_idx] = retained_indices
-                    final_logical_fraction = metrics["logical_selection_fraction"]
+                    h2o_last_step_evicted_slots += metrics["evicted_tokens"]
+                    h2o_last_step_total_slots += metrics["total_tokens"]
+                # Report the full-attention-layer token-slot fraction, NOT the
+                # last layer's ratio (layers may have different compacted lengths).
+                final_logical_fraction = (
+                    h2o_last_step_evicted_slots / h2o_last_step_total_slots
+                    if h2o_last_step_total_slots else 0.0
+                )
 
             # Compute 3D RoPE position_ids for decode step when using official HF model
             step_pos_ids: torch.Tensor | None = None
@@ -1465,6 +1485,13 @@ class RealSevenArmEngine:
                     "peak_cuda_reserved_saving_bytes": None,
                     "device_hbm_reduction_measured": False,
                     "warning": "Each decode step's index_select size delta is added. The total is NOT a peak or allocated/reserved VRAM delta, and may count repeated reductions.",
+                },
+                "h2o_logical_selection_accounting": {
+                    "classification": "LAST_STEP_FULL_ATTENTION_LAYER_SLOT_WEIGHTED",
+                    "evicted_token_slots": h2o_last_step_evicted_slots,
+                    "total_token_slots": h2o_last_step_total_slots,
+                    "logical_selection_fraction": final_logical_fraction,
+                    "physical_vram_saving_claimed": False,
                 },
                 "mtp_candidate_diagnostic": {
                     "classification": "REFERENCE_DRAFT_NO_PERSISTENT_MTP_KV_NO_SPECULATIVE_SERVING",

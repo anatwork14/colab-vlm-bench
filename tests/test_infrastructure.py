@@ -424,3 +424,43 @@ def test_seven_arm_engine_all_arms_suite():
         if "ecrd" in arm:
             assert "ecrd_citations" in res.verification_trace
             assert "ecrd_auxiliary_calls" in res.verification_trace
+
+
+def test_h2o_visual_protection_not_miscounted_as_heavy_hitters():
+    """Visual protected keys can exceed target budget; none is HH-selected."""
+    tracker = H2OCacheTracker(
+        H2OConfig(budget_ratio=0.2, recent_ratio=0.25, min_budget=4,
+                  protect_system_tokens=2, protect_visual_tokens=True),
+        num_layers=2,
+        num_kv_heads=1,
+    )
+    visual = [False] * 20
+    visual[5:10] = [True] * 5
+    tracker.set_visual_tokens(visual)
+    tracker.update_attention_scores(
+        0, np.ones((1, 1, 20), dtype=np.float32)
+    )
+    kept, metrics = tracker.compute_eviction_plan(0, current_length=20)
+    assert np.all(kept[5:10]), "Protected visual evidence must stay resident"
+    assert kept[0] and kept[1], "Sink tokens must stay resident"
+    assert metrics["heavy_hitters"] == 0, (
+        "Protected visual tokens cannot be counted as score-selected heavy hitters"
+    )
+    assert metrics["retained_tokens"] > metrics["heavy_hitters"]
+
+
+def test_h2o_heavy_hitters_report_only_actual_score_selected_candidates():
+    tracker = H2OCacheTracker(
+        H2OConfig(budget_ratio=0.5, recent_ratio=0.2, min_budget=4,
+                  protect_system_tokens=2, protect_visual_tokens=False),
+        num_layers=1,
+        num_kv_heads=1,
+    )
+    tracker.update_attention_scores(
+        0, np.arange(10, dtype=np.float32)[None, None, :]
+    )
+    kept, metrics = tracker.compute_eviction_plan(0, current_length=10)
+    # 5 total capacity: 2 sink + 1 recent + 2 score-selected heavy hitters.
+    assert metrics["retained_tokens"] == 5
+    assert metrics["heavy_hitters"] == 2
+    assert int(kept.sum()) == 5

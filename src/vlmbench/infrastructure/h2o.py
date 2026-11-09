@@ -176,6 +176,7 @@ class H2OCacheTracker:
         current_retained_count = int(np.sum(retained))
         hh_budget = max(0, target_budget - current_retained_count)
         candidate_indices = np.where(~retained)[0]
+        selected_count = 0  # Only newly selected scored candidates are heavy hitters.
         if len(candidate_indices) > 0 and hh_budget > 0:
             # Defensive check: ensure layer.scores covers current_length
             if layer.scores.shape[1] < current_length:
@@ -200,7 +201,7 @@ class H2OCacheTracker:
 
         evicted_count = int(np.sum(~retained))
         retained_count = int(np.sum(retained))
-        hh_count = retained_count - (recent_size + sys_protected)
+        hh_count = selected_count  # Protected visual tokens are NOT heavy hitters.
 
         layer.evicted_mask[:current_length] = ~retained
 
@@ -208,7 +209,7 @@ class H2OCacheTracker:
             "total_tokens": current_length,
             "retained_tokens": retained_count,
             "evicted_tokens": evicted_count,
-            "heavy_hitters": max(0, hh_count),
+            "heavy_hitters": hh_count,
             "recent_tokens": recent_size,
             "logical_selection_fraction": float(evicted_count / max(1, current_length)),
             "kv_bytes_freed": "NOT_MEASURED_LOGICAL_MASK_ONLY",
