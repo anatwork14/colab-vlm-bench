@@ -548,3 +548,10 @@ def test_score_amber_generative_all_hallucinated_edge_case():
 
 
 
+
+
+def test_empty_generative_ground_truth_reports_no_coverage_rate_not_zero():
+    # R3-C: with no ground truth the rate is undefined. 0.0 would read as "measured, none covered".
+    out = score_amber_generative([], [])
+    assert out["status"] == "NOT_MEASURED"
+    assert out["coverage_rate"] is None

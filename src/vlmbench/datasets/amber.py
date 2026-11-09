@@ -584,7 +584,7 @@ def score_amber_generative(
             "recall": None,
             "f1": None,
             "missing_count": 0,
-            "coverage_rate": 0.0,
+            "coverage_rate": None,
             "total_mentioned_objects": 0,
             "total_hallucinated_objects": 0,
         }
