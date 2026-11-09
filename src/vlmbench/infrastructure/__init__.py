@@ -40,6 +40,7 @@ from .real_engine import (
     RealExecutionResult,
     DeltaNetRecurrentLayer,
     QwenFullAttentionLayer,
+    Qwen35MTPModule,
     Qwen35NeuralModel,
 )
 
@@ -68,5 +69,6 @@ __all__ = [
     "RealExecutionResult",
     "DeltaNetRecurrentLayer",
     "QwenFullAttentionLayer",
+    "Qwen35MTPModule",
     "Qwen35NeuralModel",
 ]

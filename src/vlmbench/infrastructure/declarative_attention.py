@@ -219,18 +219,28 @@ class DAMaskGenerator:
         return read_mask
 
     def mask_statistics(self, mask: np.ndarray) -> dict[str, Any]:
-        """Compute read attention reduction statistics."""
+        """Compute logical attention mask restriction statistics (P1-03 compliant)."""
         seq_len = mask.shape[0]
         total_causal_cells = int(seq_len * (seq_len + 1) // 2)
         active_read_cells = int(np.sum(mask))
-        sparsity = float(1.0 - (active_read_cells / max(1, total_causal_cells)))
+        sparsity = max(0.0, float(1.0 - (active_read_cells / max(1, total_causal_cells))))
         return {
             "seq_len": seq_len,
             "total_causal_reads": total_causal_cells,
             "active_da_reads": active_read_cells,
-            "read_reduction_estimate": max(0.0, sparsity),
+            "attention_mask_restriction_ratio": sparsity,
+            "read_reduction_estimate": sparsity,
+            "physical_kv_bytes_freed": 0,
             "kv_cache_preserved_ratio": 1.0,  # DA preserves 100% of KV residency
-            "note": "Logical read reduction estimate from mask density. Hardware FLOP reduction requires kernel-level hooks.",
+            "kv_residency_preserved_pct": 100.0,
+            "physical_kv_read_saving_claimed": False,
+            "hbm_traffic_reduction_claimed": False,
+            "cost_accounting_classification": "LOGICAL_ATTENTION_MASK_RESTRICTION_ONLY_NO_PHYSICAL_KV_SAVING",
+            "note": (
+                "Logical attention_mask_restriction_ratio from mask density only. "
+                "Does NOT represent physical KV-read saving or HBM traffic reduction "
+                "(physical_kv_bytes_freed=0, 100% KV residency preserved)."
+            ),
         }
 
 

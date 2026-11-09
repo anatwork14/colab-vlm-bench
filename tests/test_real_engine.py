@@ -258,6 +258,12 @@ def test_all_seven_arms_real_neural_forward_and_gates():
             assert res.logical_selection_fraction >= 0.0
         if "da" in arm:
             assert res.attention_read_restriction_ratio > 0.0
+            assert res.attention_mask_restriction_ratio > 0.0
+            assert res.physical_kv_bytes_freed == 0
+            assert res.telemetry["da_cost_accounting"]["physical_kv_bytes_freed"] == 0
+            assert res.telemetry["da_cost_accounting"]["kv_residency_preserved_pct"] == 100.0
+            assert res.telemetry["da_cost_accounting"]["physical_kv_read_saving_claimed"] is False
+            assert res.telemetry["da_cost_accounting"]["hbm_traffic_reduction_claimed"] is False
         if "mtp" in arm:
             assert res.gates["MTP_CORRECTNESS_PASS"] == "PASS"
 
@@ -265,7 +271,7 @@ def test_all_seven_arms_real_neural_forward_and_gates():
 
 
 def test_real_engine_pretrained_checkpoint_loading(tmp_path):
-    """Verify RealSevenArmEngine loads safetensors weights and sets is_pretrained=True."""
+    """Verify partial reference safetensors sets PARTIALLY_WEIGHTED_PYTORCH_REFERENCE and gates SEVEN_ARM_PRETRAINED_PASS."""
     from safetensors.torch import save_file
 
     small_cfg = Qwen35ModelConfig(
@@ -304,6 +310,7 @@ def test_real_engine_pretrained_checkpoint_loading(tmp_path):
         "model.language_model.layers.3.self_attn.k_proj.weight": torch.randn(32, 64),
         "model.language_model.layers.3.self_attn.v_proj.weight": torch.randn(32, 64),
         "model.language_model.layers.3.self_attn.o_proj.weight": torch.randn(64, 64),
+        "model.language_model.layers.3.mlp.gate_proj.weight": torch.randn(128, 64),
     }
     save_file(tensors, str(tmp_path / "model.safetensors"))
 
@@ -314,11 +321,56 @@ def test_real_engine_pretrained_checkpoint_loading(tmp_path):
         checkpoint_dir=tmp_path,
     )
     assert engine.is_pretrained is True
+    assert engine.is_official_hf_hooked is False
     assert engine.has_vision_encoder is True
 
     res = engine.execute_request("req_pretrained_tiny", prompt_token_ids=[10, 11, 12], max_new_tokens=4)
     assert res.gates["REAL_MODEL_FORWARD_PASS"] == "PASS"
     assert res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS"
-    assert res.telemetry["architectural_status"] == "PRETRAINED_WEIGHTED_MODEL"
-    assert res.telemetry["pretrained_weights"]["loaded_tensors_count"] > 0
+    assert res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "GATED_OFFICIAL_HF_HOOK_REQUIRED"
+    assert res.telemetry["architectural_status"] == "PARTIALLY_WEIGHTED_PYTORCH_REFERENCE"
+    assert res.telemetry["pretrained_weights"]["mapped_tensors_count"] == 13
+    assert res.telemetry["pretrained_weights"]["unmapped_tensors_count"] == 1
+    assert res.telemetry["pretrained_weights"]["parameter_coverage_ratio"] < 1.0
+    engine.close()
+
+
+def test_official_hf_hooking_coverage_and_logits_parity():
+    """Verify 100% official HF hooking (488/488 tensors), logits parity, and per-arm ViT execution when checkpoint exists."""
+    from pathlib import Path
+
+    ckpt = Path("/mnt/ssd/genos2/research_workspace/models/Qwen/Qwen3.5-0.8B")
+    if not ckpt.is_dir() or not (ckpt / "config.json").is_file():
+        pytest.skip(f"Official Qwen3.5-0.8B checkpoint not present at {ckpt}")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    engine = RealSevenArmEngine(method_arm="da_base", device=device, checkpoint_dir=ckpt)
+    assert engine.is_pretrained is True
+    assert engine.is_official_hf_hooked is True
+
+    inv = engine.pretrained_weight_summary
+    assert inv["checkpoint_total_tensors"] == 488
+    assert inv["mapped_tensors_count"] == 488
+    assert inv["unmapped_tensors_count"] == 0
+    assert inv["base_vl_parameters"] == 852985920
+    assert inv["mtp_parameters"] == 20452864
+    assert inv["total_checkpoint_parameters"] == 873438784
+    assert inv["parameter_coverage_ratio"] == 1.0
+    assert inv["logits_parity"]["verified"] is True
+    assert inv["logits_parity"]["max_abs_logits_diff"] <= 1e-5
+
+    res = engine.execute_request(
+        request_id="req_official_da",
+        max_new_tokens=4,
+        image_present=True,
+        question="Are there cats lying on the couch in the living room?",
+    )
+    assert res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS"
+    assert res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS"
+    assert res.telemetry["architectural_status"] == "OFFICIAL_HF_PRETRAINED_HOOKED_MODEL"
+    assert res.telemetry["visual_encoder_trace"]["invoked"] is True
+    assert res.telemetry["visual_encoder_trace"]["pixel_values_shape"] == [1200, 1536]
+    assert res.telemetry["visual_encoder_trace"]["visual_token_embeddings_count"] == 300
+    assert res.attention_mask_restriction_ratio > 0.0
+    assert res.physical_kv_bytes_freed == 0
     engine.close()

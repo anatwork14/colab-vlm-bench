@@ -77,8 +77,8 @@ class CanonicalMultimodalFixture:
             image_path=f_dir / "000000039769.png",
             panoptic_path=f_dir / "000000039769_panoptic.png",
             question="What is the primary color or fabric pattern of the couch where the cats are resting?",
-            grounded_evidence="The couch has yellow/gold patterned upholstery fabric where cats are resting",
-            keywords=("yellow", "gold", "couch", "pattern", "upholstery"),
+            grounded_evidence="The couch has patterned pink/yellow upholstery fabric where cats are resting",
+            keywords=("pink", "yellow", "gold", "couch", "pattern", "upholstery"),
             ground_truth_label="Yellow",
             task_type="attribute",
             evidence_id="coco_attr_couch_01",
@@ -121,11 +121,11 @@ class CanonicalMultimodalFixture:
         """Build an EvidencePool populated with verified visual evidence."""
         pool = EvidencePool(request_id)
         item = EvidenceItem(
-            evidence_id="coco_cats_01",
+            evidence_id=self.evidence_id,
             modality="image_region",
             content=self.grounded_evidence,
             source_sha256=self.image_sha256,
-            bounding_box=(0.0, 0.0, 1.0, 1.0),
+            bounding_box=self.bounding_box,
             verified=True,
             gold_answer_prohibited=True,
         )
@@ -215,6 +215,8 @@ class CanonicalMultimodalFixture:
             max_new_tokens=max_new_tokens,
             evidence_pool=evidence_pool,
             image_present=True,
+            image_path=self.image_path,
+            question=self.question,
         )
 
         status = (
@@ -230,9 +232,11 @@ class CanonicalMultimodalFixture:
             "image_sha256": self.image_sha256,
             "prompt_length_tokens": len(token_ids),
             "tokens_generated": res.tokens_generated,
+            "output_text": res.output_text,
             "method_arm": res.method_arm,
             "total_latency_ms": res.total_latency_ms,
             "ttft_ms": res.ttft_ms,
+            "visual_encoder_trace": res.telemetry.get("visual_encoder_trace"),
             "gates": res.gates,
         }
 

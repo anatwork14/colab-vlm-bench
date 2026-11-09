@@ -67,9 +67,13 @@ def test_progressive_qualification_test_b_tokenizer(model_dir, canonical_fixture
 
 def test_progressive_qualification_test_c_multimodal_execution(model_dir, canonical_fixture):
     """Progressive Qualification Test C: Multimodal Execution on Real Pretrained Neural Engine."""
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     tok = get_qualification_tokenizer(model_dir, require_real=True)
-    engine = RealSevenArmEngine(method_arm="base", device="cpu", checkpoint_dir=model_dir)
+    engine = RealSevenArmEngine(method_arm="base", device=device, checkpoint_dir=model_dir)
     assert engine.is_pretrained is True
+    assert engine.is_official_hf_hooked is True
     assert engine.has_vision_encoder is True
 
     report = canonical_fixture.run_test_c_qualification(
@@ -85,9 +89,13 @@ def test_progressive_qualification_test_c_multimodal_execution(model_dir, canoni
     assert len(report["tokens_generated"]) == 4
     assert report["total_latency_ms"] > 0.0
     assert report["ttft_ms"] > 0.0
+    assert report["visual_encoder_trace"]["invoked"] is True
+    assert report["visual_encoder_trace"]["pixel_values_shape"] == [1200, 1536]
+    assert report["visual_encoder_trace"]["visual_token_embeddings_count"] == 300
     assert report["gates"]["POLICY_HARNESS_PASS"] == "PASS"
     assert report["gates"]["REAL_MODEL_FORWARD_PASS"] == "PASS"
     assert report["gates"]["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS"
+    assert report["gates"]["SEVEN_ARM_PRETRAINED_PASS"] == "PASS"
     assert report["gates"]["CCU_ISOLATION_PASS"] == "PASS"
 
     engine.close()

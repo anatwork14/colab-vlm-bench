@@ -129,14 +129,22 @@ class H2OCacheTracker:
         sys_protected = min(self.config.protect_system_tokens, current_length)
         retained[:sys_protected] = True
 
-        # 2. Retain most recent local window
-        recent_start = max(0, current_length - recent_size)
-        retained[recent_start:] = True
-
-        # 3. Protect visual tokens if configured
+        # 2. Protect visual tokens if configured (before computing recent window budget)
         if self.config.protect_visual_tokens and len(self.visual_token_mask) > 0:
             active_len = min(current_length, len(self.visual_token_mask))
             retained[:active_len] |= self.visual_token_mask[:active_len]
+
+        protected_count = int(np.sum(retained))
+        unprotected_count = current_length - protected_count
+        if protected_count + recent_size >= current_length and unprotected_count > 2:
+            # When protected visual/system tokens dominate the sequence, budget the non-protected text tail
+            text_budget = max(2, int(unprotected_count * self.config.budget_ratio))
+            recent_size = max(1, int(text_budget * self.config.recent_ratio))
+            target_budget = protected_count + text_budget
+
+        # 3. Retain most recent local window
+        recent_start = max(0, current_length - recent_size)
+        retained[recent_start:] = True
 
         # 4. Fill remaining budget with top-scoring heavy hitters from eviction candidates
         current_retained_count = int(np.sum(retained))
