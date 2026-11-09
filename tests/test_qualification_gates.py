@@ -302,13 +302,12 @@ def test_old_ccu_gate_name_is_gone_from_the_script():
 def test_seven_arm_gate_is_named_for_what_it_measures():
     gates = qual.compute_release_gates(_all_passing_tests(), device_name=GPU)
     assert gates["SEVEN_ARM_HOOK_COVERAGE_PASS"] == "PASS"
-    assert "SEVEN_ARM_PRETRAINED_PASS" not in gates
+    assert not any("PRETRAINED" in key for key in gates)
 
 
 def test_seven_arm_hook_coverage_is_not_a_correctness_claim():
     source = SCRIPT.read_text(encoding="utf8")
     assert "SEVEN_ARM_HOOK_COVERAGE_PASS" in source
-    assert "SEVEN_ARM_PRETRAINED_PASS\": _test_status" not in source
 
 
 # ITER2 N-9 (REVIEW_ITER2B §3): a gate is derived from the arms it applies to. An arm that reports

@@ -292,7 +292,7 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
         require(res.gates["ACTUAL_BACKEND_HOOK_PASS"] in ("PASS", "GATED_VLLM_BACKEND_ATTACHMENT_REQUIRED"))
         require(res.gates["REAL_MODEL_FORWARD_PASS"] == "PASS")
         require(res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS")
-        require(res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS")
+        require(res.gates["SEVEN_ARM_HOOK_COVERAGE_PASS"] == "PASS")
         require(res.gates["CCU_ISOLATION_PASS"] == "GATED_MULTIREQUEST_ISOLATION_TEST_REQUIRED")
         require(res.gates["A100_GPU_QUALIFIED"] == "BLOCKED_PENDING_OWNER_PAID_AUTH")
         require(res.telemetry["architectural_status"] == "OFFICIAL_HF_PRETRAINED_HOOKED_MODEL")
@@ -446,7 +446,7 @@ def run_test_e_speculative_correctness(model_dir: Path, fixture_path: Path, devi
     require(len(res.tokens_generated) == 16)
     require(res.gates["REAL_MODEL_FORWARD_PASS"] == "PASS")
     require(res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS")
-    require(res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS")
+    require(res.gates["SEVEN_ARM_HOOK_COVERAGE_PASS"] == "PASS")
     require(res.gates["MTP_CORRECTNESS_PASS"] == "GATED_NATIVE_MTP_VERIFIER_REQUIRED")
     require(res.gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS")
     # Acceptance is NOT verified on this path (no native MTP verifier): it is null, never zero.
@@ -504,7 +504,7 @@ def run_test_f_fixed_output_serving(model_dir: Path, device: str = "cpu", target
 
     require(len(res.tokens_generated) == target_tokens, f"Expected {target_tokens} tokens, got {len(res.tokens_generated)}")
     require(res.gates["REAL_MODEL_FORWARD_PASS"] == "PASS")
-    require(res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS")
+    require(res.gates["SEVEN_ARM_HOOK_COVERAGE_PASS"] == "PASS")
     engine.close()
 
     dt = time.perf_counter() - t0
@@ -606,7 +606,7 @@ def run_test_g_ccu_concurrency(model_dir: Path, device: str = "cpu") -> dict[str
         for req_id, out in outputs.items():
             require(len(out.tokens_generated) == 4)
             require(out.gates["REAL_MODEL_FORWARD_PASS"] == "PASS")
-            require(out.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS")
+            require(out.gates["SEVEN_ARM_HOOK_COVERAGE_PASS"] == "PASS")
             require(out.gates["CCU_ISOLATION_PASS"] == "GATED_MULTIREQUEST_ISOLATION_TEST_REQUIRED")
 
         token_check = token_isolation_check(
