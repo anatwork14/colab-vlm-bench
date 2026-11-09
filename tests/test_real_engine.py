@@ -925,3 +925,78 @@ def test_r4_forward_path_telemetry_on_scaffold_reference():
     finally:
         engine.close()
     assert res.telemetry["forward_path_executed"] == "scaffold_reference"
+
+
+# --- R5-1 (auditor R4 §2): no-eviction oracle. With the budget covering the whole sequence,
+# h2o_base must be token-identical to base on the same official prompt. ---
+
+_R5_TEXT = ("The capital of France is Paris. The capital of Germany is Berlin. "
+            "The capital of Italy is")
+
+
+def _r5_official_ckpt():
+    from pathlib import Path
+    ckpt = Path("/mnt/ssd/genos2/research_workspace/models/Qwen/Qwen3.5-0.8B")
+    if not (ckpt / "config.json").is_file():
+        pytest.skip(f"Official Qwen3.5-0.8B checkpoint not present at {ckpt}")
+    return ckpt
+
+
+def test_r5_no_eviction_oracle_text_official_checkpoint():
+    ckpt = _r5_official_ckpt()
+    base = RealSevenArmEngine(method_arm="base", device="cpu", checkpoint_dir=ckpt)
+    try:
+        prompt = list(base.tokenizer.encode(_R5_TEXT))
+        res_base = base.execute_request("r5_base_text", prompt_token_ids=prompt,
+                                        max_new_tokens=8, image_present=False)
+    finally:
+        base.close()
+    # min_budget covers prompt + output, so nothing may be evicted.
+    h2o = RealSevenArmEngine(method_arm="h2o_base", device="cpu", checkpoint_dir=ckpt,
+                             h2o_budget_ratio=1.0, h2o_min_budget=len(prompt) + 16)
+    try:
+        res_h2o = h2o.execute_request("r5_h2o_text", prompt_token_ids=prompt,
+                                      max_new_tokens=8, image_present=False)
+    finally:
+        h2o.close()
+    acc = res_h2o.telemetry["h2o_logical_selection_accounting"]
+    assert acc["cumulative_evicted_slots"] == 0, "oracle is vacuous unless nothing is evicted"
+    assert res_h2o.tokens_generated == res_base.tokens_generated
+
+
+def test_r5_no_eviction_oracle_image_official_checkpoint():
+    ckpt = _r5_official_ckpt()
+    long_q = " ".join(["Describe the living room in detail."] * 3)
+    base = RealSevenArmEngine(method_arm="base", device="cpu", checkpoint_dir=ckpt)
+    try:
+        res_base = base.execute_request("r5_base_img", max_new_tokens=8, image_present=True,
+                                        question=long_q)
+    finally:
+        base.close()
+    h2o = RealSevenArmEngine(method_arm="h2o_base", device="cpu", checkpoint_dir=ckpt,
+                             h2o_budget_ratio=1.0, h2o_min_budget=4096)
+    try:
+        res_h2o = h2o.execute_request("r5_h2o_img", max_new_tokens=8, image_present=True,
+                                      question=long_q)
+    finally:
+        h2o.close()
+    acc = res_h2o.telemetry["h2o_logical_selection_accounting"]
+    assert acc["cumulative_evicted_slots"] == 0, "oracle is vacuous unless nothing is evicted"
+    assert res_h2o.tokens_generated == res_base.tokens_generated
+
+
+def test_r5_ratio_one_alone_still_evicts_generated_tokens():
+    """Documents the semantics behind the oracle: the budget is fixed from the PREFILL length, so
+    ratio 1.0 alone is NOT no-eviction. Generated tokens overflow the budget at the first decode step."""
+    ckpt = _r5_official_ckpt()
+    h2o = RealSevenArmEngine(method_arm="h2o_base", device="cpu", checkpoint_dir=ckpt,
+                             h2o_budget_ratio=1.0)
+    try:
+        # Long enough that max(min_budget=32, prefill) is the prefill length, not the 32 floor.
+        prompt = list(h2o.tokenizer.encode(_R5_TEXT * 3))
+        assert len(prompt) > 40
+        res = h2o.execute_request("r5_ratio_one", prompt_token_ids=prompt,
+                                  max_new_tokens=8, image_present=False)
+    finally:
+        h2o.close()
+    assert res.telemetry["h2o_logical_selection_accounting"]["cumulative_evicted_slots"] > 0
