@@ -56,7 +56,7 @@ def run_test_a_architecture(model_dir: Path, device: str = "cpu") -> dict[str, A
 
     # 1. Config verification
     config_file = model_dir / "config.json"
-    assert config_file.is_file(), f"Missing config.json in {model_dir}"
+    require(config_file.is_file(), f"Missing config.json in {model_dir}")
     with open(config_file, "r", encoding="utf8") as f:
         cfg_dict = json.load(f)
 
@@ -65,23 +65,23 @@ def run_test_a_architecture(model_dir: Path, device: str = "cpu") -> dict[str, A
     num_layers = tc.get("num_hidden_layers", cfg_dict.get("num_hidden_layers"))
     layer_types = tc.get("layer_types", [])
 
-    assert cfg_dict.get("model_type") == "qwen3_5", f"Expected qwen3_5, got {cfg_dict.get('model_type')}"
-    assert vocab_size == 248320, f"Expected 248320, got {vocab_size}"
-    assert num_layers == 24, f"Expected 24 layers, got {num_layers}"
-    assert cfg_dict.get("image_token_id") == 248056
-    assert cfg_dict.get("vision_start_token_id") == 248053
-    assert cfg_dict.get("vision_end_token_id") == 248054
+    require(cfg_dict.get("model_type") == "qwen3_5", f"Expected qwen3_5, got {cfg_dict.get('model_type')}")
+    require(vocab_size == 248320, f"Expected 248320, got {vocab_size}")
+    require(num_layers == 24, f"Expected 24 layers, got {num_layers}")
+    require(cfg_dict.get("image_token_id") == 248056)
+    require(cfg_dict.get("vision_start_token_id") == 248053)
+    require(cfg_dict.get("vision_end_token_id") == 248054)
 
     full_attn = [i for i, lt in enumerate(layer_types) if lt == "full_attention"] if layer_types else [3, 7, 11, 15, 19, 23]
-    assert len(full_attn) == 6, f"Expected 6 full attention layers, got {len(full_attn)}"
+    require(len(full_attn) == 6, f"Expected 6 full attention layers, got {len(full_attn)}")
     recurrent_count = num_layers - len(full_attn)
-    assert recurrent_count == 18, f"Expected 18 linear recurrent layers, got {recurrent_count}"
+    require(recurrent_count == 18, f"Expected 18 linear recurrent layers, got {recurrent_count}")
 
     # 2. Safetensors weights verification
     weight_file = model_dir / "model.safetensors-00001-of-00001.safetensors"
-    assert weight_file.is_file(), f"Missing safetensors file in {model_dir}"
+    require(weight_file.is_file(), f"Missing safetensors file in {model_dir}")
     weight_size = weight_file.stat().st_size
-    assert weight_size == 1746942600, f"Unexpected weight file size: {weight_size}"
+    require(weight_size == 1746942600, f"Unexpected weight file size: {weight_size}")
 
     with safe_open(str(weight_file), framework="pt") as sf:
         keys = list(sf.keys())
@@ -89,33 +89,33 @@ def run_test_a_architecture(model_dir: Path, device: str = "cpu") -> dict[str, A
         visual_keys = [k for k in keys if "visual" in k]
         lm_keys = [k for k in keys if "language_model" in k]
 
-    assert len(keys) == 488, f"Expected 488 total safetensors keys, found {len(keys)}"
-    assert len(mtp_keys) == 15, f"Expected 15 MTP keys, found {len(mtp_keys)}"
-    assert len(visual_keys) == 153, f"Expected 153 vision keys, found {len(visual_keys)}"
-    assert len(lm_keys) == 320, f"Expected 320 language keys, found {len(lm_keys)}"
+    require(len(keys) == 488, f"Expected 488 total safetensors keys, found {len(keys)}")
+    require(len(mtp_keys) == 15, f"Expected 15 MTP keys, found {len(mtp_keys)}")
+    require(len(visual_keys) == 153, f"Expected 153 vision keys, found {len(visual_keys)}")
+    require(len(lm_keys) == 320, f"Expected 320 language keys, found {len(lm_keys)}")
 
     # 3. Verify 100% official hooking coverage & one-step logits parity via RealSevenArmEngine
     engine = RealSevenArmEngine(method_arm="base", device=device, checkpoint_dir=model_dir)
-    assert engine.is_pretrained is True
-    assert engine.is_official_hf_hooked is True
+    require(engine.is_pretrained is True)
+    require(engine.is_official_hf_hooked is True)
     inv = engine.pretrained_weight_summary
-    assert inv is not None
-    assert inv["checkpoint_total_tensors"] == 488
-    assert inv["mapped_tensors_count"] == 488
-    assert inv["unmapped_tensors_count"] == 0
-    assert inv["unmapped_tensor_keys"] == []
-    assert inv["base_vl_tensors_loaded"] == 473
-    assert inv["mtp_tensors_loaded"] == 15
-    assert inv["base_vl_parameters"] == 852985920
-    assert inv["mtp_parameters"] == 20452864
-    assert inv["total_checkpoint_parameters"] == 873438784
-    assert inv["mapped_parameters"] == 873438784
-    assert inv["unmapped_parameters"] == 0
-    assert inv["tensor_coverage_ratio"] == 1.0
-    assert inv["parameter_coverage_ratio"] == 1.0
-    assert inv["logits_parity"]["verified"] is True
-    assert logits_parity_passes(inv["logits_parity"]["max_abs_logits_diff"]), "logits parity exceeds LOGITS_PARITY_TOLERANCE"
-    assert inv["logits_parity"]["top1_match"] is True
+    require(inv is not None)
+    require(inv["checkpoint_total_tensors"] == 488)
+    require(inv["mapped_tensors_count"] == 488)
+    require(inv["unmapped_tensors_count"] == 0)
+    require(inv["unmapped_tensor_keys"] == [])
+    require(inv["base_vl_tensors_loaded"] == 473)
+    require(inv["mtp_tensors_loaded"] == 15)
+    require(inv["base_vl_parameters"] == 852985920)
+    require(inv["mtp_parameters"] == 20452864)
+    require(inv["total_checkpoint_parameters"] == 873438784)
+    require(inv["mapped_parameters"] == 873438784)
+    require(inv["unmapped_parameters"] == 0)
+    require(inv["tensor_coverage_ratio"] == 1.0)
+    require(inv["parameter_coverage_ratio"] == 1.0)
+    require(inv["logits_parity"]["verified"] is True)
+    require(logits_parity_passes(inv["logits_parity"]["max_abs_logits_diff"]), "logits parity exceeds LOGITS_PARITY_TOLERANCE")
+    require(inv["logits_parity"]["top1_match"] is True)
     engine.close()
 
     dt = time.perf_counter() - t0
@@ -161,12 +161,12 @@ def run_test_b_text_forward(model_dir: Path, device: str = "cpu") -> dict[str, A
     with torch.no_grad():
         out = model(**inputs)
         logits = out.logits
-        assert logits.ndim == 3
-        assert logits.shape[-1] == 248320
-        assert not torch.isnan(logits).any(), "Logits contain NaN!"
+        require(logits.ndim == 3)
+        require(logits.shape[-1] == 248320)
+        require(not torch.isnan(logits).any(), "Logits contain NaN!")
         next_tok = int(torch.argmax(logits[:, -1, :], dim=-1).item())
         decoded = proc.decode([next_tok]).strip()
-        assert len(decoded) > 0, "Decoded token is empty!"
+        require(len(decoded) > 0, "Decoded token is empty!")
 
     engine.close()
 
@@ -188,10 +188,10 @@ def run_test_c_multimodal_forward(model_dir: Path, fixture_path: Path, device: s
     print(f"=== [Test C] Real Multimodal Forward (Image + Vision Encoder on {device}) ===")
     t0 = time.perf_counter()
 
-    assert fixture_path.is_file(), f"Missing fixture image: {fixture_path}"
+    require(fixture_path.is_file(), f"Missing fixture image: {fixture_path}")
     with open(fixture_path, "rb") as f:
         img_sha = hashlib.sha256(f.read()).hexdigest()
-    assert img_sha == CANONICAL_IMAGE_SHA256, f"Cryptographic mismatch: {img_sha} != {CANONICAL_IMAGE_SHA256}"
+    require(img_sha == CANONICAL_IMAGE_SHA256, f"Cryptographic mismatch: {img_sha} != {CANONICAL_IMAGE_SHA256}")
 
     engine = RealSevenArmEngine(method_arm="base", device=device, checkpoint_dir=model_dir)
     proc = engine.processor
@@ -215,8 +215,8 @@ def run_test_c_multimodal_forward(model_dir: Path, fixture_path: Path, device: s
     with torch.no_grad():
         out = model(**inputs)
         logits = out.logits
-        assert logits.ndim == 3
-        assert logits.shape[-1] == 248320
+        require(logits.ndim == 3)
+        require(logits.shape[-1] == 248320)
         next_tok = int(torch.argmax(logits[:, -1, :], dim=-1).item())
         decoded = proc.decode([next_tok]).strip()
 
@@ -256,7 +256,7 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
 
     raw_image_bytes = fixture_path.read_bytes()
     img_sha = hashlib.sha256(raw_image_bytes).hexdigest()
-    assert img_sha == CANONICAL_IMAGE_SHA256
+    require(img_sha == CANONICAL_IMAGE_SHA256)
 
     evidence_pool = EvidencePool("test_d_arm_pool")
     evidence_pool.add_evidence(
@@ -269,9 +269,9 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
 
     for arm in expected_arms:
         engine = RealSevenArmEngine(method_arm=arm, device=device, checkpoint_dir=model_dir)
-        assert engine.is_pretrained is True, f"{arm}: expected is_pretrained=True"
-        assert engine.is_official_hf_hooked is True, f"{arm}: expected is_official_hf_hooked=True"
-        assert engine.has_vision_encoder is True, f"{arm}: expected has_vision_encoder=True"
+        require(engine.is_pretrained is True, f"{arm}: expected is_pretrained=True")
+        require(engine.is_official_hf_hooked is True, f"{arm}: expected is_official_hf_hooked=True")
+        require(engine.has_vision_encoder is True, f"{arm}: expected has_vision_encoder=True")
 
         res = engine.execute_request(
             request_id=f"test_d_{arm}",
@@ -283,52 +283,50 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
             question=question,
         )
 
-        assert res.method_arm == arm
-        assert len(res.tokens_generated) == 8
-        assert res.total_latency_ms > 0.0
+        require(res.method_arm == arm)
+        require(len(res.tokens_generated) == 8)
+        require(res.total_latency_ms > 0.0)
 
         # Verify P0-01 official hooking & SA-01 gates
-        assert res.gates["POLICY_HARNESS_PASS"] == "PASS"
-        assert res.gates["ACTUAL_BACKEND_HOOK_PASS"] in ("PASS", "GATED_VLLM_BACKEND_ATTACHMENT_REQUIRED")
-        assert res.gates["REAL_MODEL_FORWARD_PASS"] == "PASS"
-        assert res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS"
-        assert res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS"
-        assert res.gates["CCU_ISOLATION_PASS"] == "GATED_MULTIREQUEST_ISOLATION_TEST_REQUIRED"
-        assert res.gates["A100_GPU_QUALIFIED"] == "BLOCKED_PENDING_OWNER_PAID_AUTH"
-        assert res.telemetry["architectural_status"] == "OFFICIAL_HF_PRETRAINED_HOOKED_MODEL"
-        assert res.telemetry["pretrained_weights"]["mapped_tensors_count"] == 488
-        assert res.telemetry["pretrained_weights"]["unmapped_tensors_count"] == 0
-        assert res.telemetry["pretrained_weights"]["parameter_coverage_ratio"] == 1.0
+        require(res.gates["POLICY_HARNESS_PASS"] == "PASS")
+        require(res.gates["ACTUAL_BACKEND_HOOK_PASS"] in ("PASS", "GATED_VLLM_BACKEND_ATTACHMENT_REQUIRED"))
+        require(res.gates["REAL_MODEL_FORWARD_PASS"] == "PASS")
+        require(res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS")
+        require(res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS")
+        require(res.gates["CCU_ISOLATION_PASS"] == "GATED_MULTIREQUEST_ISOLATION_TEST_REQUIRED")
+        require(res.gates["A100_GPU_QUALIFIED"] == "BLOCKED_PENDING_OWNER_PAID_AUTH")
+        require(res.telemetry["architectural_status"] == "OFFICIAL_HF_PRETRAINED_HOOKED_MODEL")
+        require(res.telemetry["pretrained_weights"]["mapped_tensors_count"] == 488)
+        require(res.telemetry["pretrained_weights"]["unmapped_tensors_count"] == 0)
+        require(res.telemetry["pretrained_weights"]["parameter_coverage_ratio"] == 1.0)
 
         # Verify P0-02 visual encoder invocation trace per arm
         vis_trace = res.telemetry["visual_encoder_trace"]
-        assert vis_trace["invoked"] is True, f"{arm}: ViT encoder was not invoked"
-        assert vis_trace["image_sha256"] == CANONICAL_IMAGE_SHA256
-        assert vis_trace["pixel_values_shape"] == [1200, 1536]
-        assert vis_trace["image_grid_thw"] == [[1, 30, 40]]
-        assert vis_trace["visual_token_embeddings_count"] == 300
-        assert vis_trace["visual_embeddings_shape"] == [300, 1024]
+        require(vis_trace["invoked"] is True, f"{arm}: ViT encoder was not invoked")
+        require(vis_trace["image_sha256"] == CANONICAL_IMAGE_SHA256)
+        require(vis_trace["pixel_values_shape"] == [1200, 1536])
+        require(vis_trace["image_grid_thw"] == [[1, 30, 40]])
+        require(vis_trace["visual_token_embeddings_count"] == 300)
+        require(vis_trace["visual_embeddings_shape"] == [300, 1024])
 
         # Verify arm-specific interventions & P1-03 cost accounting
         if "h2o" in arm:
-            assert res.physical_kv_bytes_freed > 0, f"{arm}: expected nonzero per-step KV tensor footprint deltas"
+            require(res.physical_kv_bytes_freed > 0, f"{arm}: expected nonzero per-step KV tensor footprint deltas")
             h2o_acc = res.telemetry["h2o_logical_selection_accounting"]
-            assert h2o_acc["final_retained_fraction"] is not None and h2o_acc["final_retained_fraction"] > 0.0, (
-                f"{arm} must retain a nonzero logical selection after decoding"
-            )
+            require(h2o_acc["final_retained_fraction"] is not None and h2o_acc["final_retained_fraction"] > 0.0, f"{arm} must retain a nonzero logical selection after decoding")
         if "da" in arm:
-            assert res.attention_mask_restriction_ratio > 0.0
-            assert res.physical_kv_bytes_freed == 0, f"{arm} (P1-03) must report physical_kv_bytes_freed == 0"
+            require(res.attention_mask_restriction_ratio > 0.0)
+            require(res.physical_kv_bytes_freed == 0, f"{arm} (P1-03) must report physical_kv_bytes_freed == 0")
             da_acc = res.telemetry["da_cost_accounting"]
-            assert da_acc["physical_kv_bytes_freed"] == 0
-            assert da_acc["kv_residency_preserved_pct"] == 100.0
-            assert da_acc["physical_kv_read_saving_claimed"] is False
-            assert da_acc["hbm_traffic_reduction_claimed"] is False
+            require(da_acc["physical_kv_bytes_freed"] == 0)
+            require(da_acc["kv_residency_preserved_pct"] == 100.0)
+            require(da_acc["physical_kv_read_saving_claimed"] is False)
+            require(da_acc["hbm_traffic_reduction_claimed"] is False)
         if "ecrd" in arm:
-            assert len(res.grounded_citations) > 0, f"{arm} must produce grounded citations"
+            require(len(res.grounded_citations) > 0, f"{arm} must produce grounded citations")
         if "mtp" in arm:
-            assert res.gates["MTP_CORRECTNESS_PASS"] == "GATED_NATIVE_MTP_VERIFIER_REQUIRED"
-            assert res.gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS"
+            require(res.gates["MTP_CORRECTNESS_PASS"] == "GATED_NATIVE_MTP_VERIFIER_REQUIRED")
+            require(res.gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS")
 
         arm_info = {
             "tokens_generated": res.tokens_generated,
@@ -382,10 +380,10 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
             question=fix.question,
         )
         v_trace = task_res.telemetry["visual_encoder_trace"]
-        assert v_trace["invoked"] is True
-        assert v_trace["pixel_values_shape"] == [1200, 1536]
-        assert v_trace["visual_token_embeddings_count"] == 300
-        assert len(task_res.output_text) > 0
+        require(v_trace["invoked"] is True)
+        require(v_trace["pixel_values_shape"] == [1200, 1536])
+        require(v_trace["visual_token_embeddings_count"] == 300)
+        require(len(task_res.output_text) > 0)
 
         # The four questions are only neural/ViT smoke fixtures. A substring
         # match is NOT accuracy: e.g. the attribute gold says Yellow but the
@@ -396,7 +394,7 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
             and len(task_res.tokens_generated) == max_toks
             and bool(task_res.output_text)
         )
-        assert inference_smoke_pass
+        require(inference_smoke_pass)
 
         task_results[fix.evidence_id] = {
             "task_type": fix.task_type,
@@ -435,8 +433,8 @@ def run_test_e_speculative_correctness(model_dir: Path, fixture_path: Path, devi
     t0 = time.perf_counter()
 
     engine = RealSevenArmEngine(method_arm="h2o_mtp", device=device, checkpoint_dir=model_dir)
-    assert engine.is_pretrained is True
-    assert engine.is_official_hf_hooked is True
+    require(engine.is_pretrained is True)
+    require(engine.is_official_hf_hooked is True)
     res = engine.execute_request(
         request_id="test_e_spec_tx",
         max_new_tokens=16,
@@ -445,17 +443,17 @@ def run_test_e_speculative_correctness(model_dir: Path, fixture_path: Path, devi
         question="Are there cats lying on the couch in the living room?",
     )
 
-    assert len(res.tokens_generated) == 16
-    assert res.gates["REAL_MODEL_FORWARD_PASS"] == "PASS"
-    assert res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS"
-    assert res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS"
-    assert res.gates["MTP_CORRECTNESS_PASS"] == "GATED_NATIVE_MTP_VERIFIER_REQUIRED"
-    assert res.gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS"
+    require(len(res.tokens_generated) == 16)
+    require(res.gates["REAL_MODEL_FORWARD_PASS"] == "PASS")
+    require(res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS")
+    require(res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS")
+    require(res.gates["MTP_CORRECTNESS_PASS"] == "GATED_NATIVE_MTP_VERIFIER_REQUIRED")
+    require(res.gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS")
     # Acceptance is NOT verified on this path (no native MTP verifier): it is null, never zero.
-    assert res.mtp_acceptance_rate is None, "unverified acceptance must be null, not a measured rate"
-    assert res.physical_kv_bytes_freed > 0, "H2O diagnostic must show KV tensor footprint compaction"
+    require(res.mtp_acceptance_rate is None, "unverified acceptance must be null, not a measured rate")
+    require(res.physical_kv_bytes_freed > 0, "H2O diagnostic must show KV tensor footprint compaction")
     if res.mtp_acceptance_rate is not None:
-        assert 0.0 <= res.mtp_acceptance_rate <= 1.0
+        require(0.0 <= res.mtp_acceptance_rate <= 1.0)
 
     engine.close()
     # Paired greedy-equivalence: the MTP diagnostic must NEVER change target
@@ -467,12 +465,10 @@ def run_test_e_speculative_correctness(model_dir: Path, fixture_path: Path, devi
         question="Are there cats lying on the couch in the living room?",
     )
     baseline.close()
-    assert res.tokens_generated == baseline_res.tokens_generated, (
-        "MTP diagnostic changed the H2O target's greedy output tokens"
-    )
+    require(res.tokens_generated == baseline_res.tokens_generated, "MTP diagnostic changed the H2O target's greedy output tokens")
     mtp_diag = res.telemetry["mtp_candidate_diagnostic"]
-    assert mtp_diag["committed_draft_tokens"] == 0
-    assert mtp_diag["proposals_verified"] > 0
+    require(mtp_diag["committed_draft_tokens"] == 0)
+    require(mtp_diag["proposals_verified"] > 0)
     dt = time.perf_counter() - t0
     result = {
         "claim_scope": "DIAGNOSTIC_ONLY",
@@ -497,8 +493,8 @@ def run_test_f_fixed_output_serving(model_dir: Path, device: str = "cpu", target
     t0 = time.perf_counter()
 
     engine = RealSevenArmEngine(method_arm="base", device=device, checkpoint_dir=model_dir)
-    assert engine.is_pretrained is True
-    assert engine.is_official_hf_hooked is True
+    require(engine.is_pretrained is True)
+    require(engine.is_official_hf_hooked is True)
     res = engine.execute_request(
         request_id="test_f_fixed_256",
         prompt_token_ids=[100, 101, 102],
@@ -506,9 +502,9 @@ def run_test_f_fixed_output_serving(model_dir: Path, device: str = "cpu", target
         image_present=False,
     )
 
-    assert len(res.tokens_generated) == target_tokens, f"Expected {target_tokens} tokens, got {len(res.tokens_generated)}"
-    assert res.gates["REAL_MODEL_FORWARD_PASS"] == "PASS"
-    assert res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS"
+    require(len(res.tokens_generated) == target_tokens, f"Expected {target_tokens} tokens, got {len(res.tokens_generated)}")
+    require(res.gates["REAL_MODEL_FORWARD_PASS"] == "PASS")
+    require(res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS")
     engine.close()
 
     dt = time.perf_counter() - t0
@@ -580,8 +576,8 @@ def run_test_g_ccu_concurrency(model_dir: Path, device: str = "cpu") -> dict[str
     for ccu in (1, 2, 4):
         ccu_t0 = time.perf_counter()
         engine = RealSevenArmEngine(method_arm="ecrd_base", device=device, checkpoint_dir=model_dir)
-        assert engine.is_pretrained is True
-        assert engine.is_official_hf_hooked is True
+        require(engine.is_pretrained is True)
+        require(engine.is_official_hf_hooked is True)
 
         requests = []
         expected_evidence: dict[str, set[str]] = {}
@@ -606,12 +602,12 @@ def run_test_g_ccu_concurrency(model_dir: Path, device: str = "cpu") -> dict[str
             }
             outputs = {req_id: f.result() for req_id, f in futures.items()}
 
-        assert len(outputs) == ccu
+        require(len(outputs) == ccu)
         for req_id, out in outputs.items():
-            assert len(out.tokens_generated) == 4
-            assert out.gates["REAL_MODEL_FORWARD_PASS"] == "PASS"
-            assert out.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS"
-            assert out.gates["CCU_ISOLATION_PASS"] == "GATED_MULTIREQUEST_ISOLATION_TEST_REQUIRED"
+            require(len(out.tokens_generated) == 4)
+            require(out.gates["REAL_MODEL_FORWARD_PASS"] == "PASS")
+            require(out.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS")
+            require(out.gates["CCU_ISOLATION_PASS"] == "GATED_MULTIREQUEST_ISOLATION_TEST_REQUIRED")
 
         token_check = token_isolation_check(
             {rid: list(o.tokens_generated) for rid, o in solo_outputs.items()},
@@ -620,8 +616,8 @@ def run_test_g_ccu_concurrency(model_dir: Path, device: str = "cpu") -> dict[str
         leaks = citation_leak_violations(
             {rid: o.grounded_citations for rid, o in outputs.items()}, expected_evidence
         )
-        assert token_check["pass"], f"CCU {ccu} concurrent tokens differ from solo: {token_check['mismatches']}"
-        assert not leaks, f"CCU {ccu} citation leak: {leaks}"
+        require(token_check["pass"], f"CCU {ccu} concurrent tokens differ from solo: {token_check['mismatches']}")
+        require(not leaks, f"CCU {ccu} citation leak: {leaks}")
 
         engine.close()
         ccu_dt = time.perf_counter() - ccu_t0
@@ -661,6 +657,15 @@ OK_VERDICT = "PRETRAINED_FORWARD_AND_MTP_PROPOSAL_DIAGNOSTIC_ONLY"
 # (PASS, FAIL, NOT_TESTED, GATED_*, BLOCKED_*); evidence numbers live separately
 # in release_gate_evidence and are never embedded in a gate string.
 # ---------------------------------------------------------------------------
+
+class OracleFailure(RuntimeError):
+    """An oracle check did not hold. Raised explicitly, so it survives `python -O`."""
+
+
+def require(condition: Any, message: str = "oracle check failed") -> None:
+    if not condition:
+        raise OracleFailure(message)
+
 
 def guarded(fn, *args: Any, **kwargs: Any) -> dict[str, Any]:
     """Run one qualification test and record its outcome. A failure is recorded, not dropped."""
