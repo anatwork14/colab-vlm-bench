@@ -60,6 +60,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip computing SHA-256 for large safetensors weight shards.",
     )
+    parser.add_argument(
+        "--require-real-tokenizer",
+        action="store_true",
+        help="Require a real model tokenizer for MemLens; fail if unavailable or synthetic.",
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--amber-only",
@@ -101,7 +106,10 @@ def main(argv: list[str] | None = None) -> int:
             result = qualify_amber_assets(drive_root, sample_limit=args.sample_limit)
         elif args.memlens_only:
             result = qualify_memlens_assets(
-                drive_root, sample_limit=args.sample_limit, tolerance=args.tolerance
+                drive_root,
+                sample_limit=args.sample_limit,
+                tolerance=args.tolerance,
+                require_real_tokenizer=args.require_real_tokenizer,
             )
         elif args.models_only:
             result = qualify_qwen_models(
@@ -113,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
                 tolerance=args.tolerance,
                 compute_shards_sha=compute_shards_sha,
                 sample_limit=args.sample_limit,
+                require_real_tokenizer=args.require_real_tokenizer,
             )
     except (ValueError, TypeError, OSError, RuntimeError, PermissionError) as exc:
         print(f"Qualification execution error: {exc}", file=sys.stderr)

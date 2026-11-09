@@ -275,11 +275,13 @@ def build_memlens_context_bins(
             bin_counts[target] += 1
 
     atomic_jsonl(output_path, candidates)
+    emitted_lengths = [k for k in canonical_targets if bin_counts[k] > 0]
     return {
         "dataset": "memlens",
         "track": "derived_serving",
         "derivation_id": "memlens_7bin_builder_v2",
         "canonical_lengths": list(canonical_targets),
+        "lengths_emitted": emitted_lengths,
         "tolerance": tolerance,
         "source_sha256": sha256(native_path),
         "derived_sha256": sha256(output_path),
