@@ -14,13 +14,14 @@ from vlmbench.infrastructure.real_engine import RealSevenArmEngine
 
 SHA = hashlib.sha256(b"no-image").hexdigest()
 VS, VE = 501, 502  # vision_start / vision_end in the tiny config
-# 3 is vision_start, 20 is vision_end; 'the' (7) appears at 10 and 12 for grounding
+# 3 is vision_start, 20 is vision_end; 'tower' (7) appears at 10 and 12 for grounding
+# (ITER3 R2 C-4: 'the' is a stop-word and is rejected, so the grounding keyword is 'tower', same id 7)
 PROMPT = [100, 101, 102, VS, 103, 104, 105, 106, 107, 108, 7, 109, 7, 110, 111, 112, 113, 114, 115,
           116, VE, 117, 118, 119, 120, 121, 122, 123, 124, 125]
 
 
 class _WordTok:
-    VOCAB = {"the": 7}
+    VOCAB = {"tower": 7}
 
     def encode(self, text):
         return [self.VOCAB[w] for w in text.lower().split() if w in self.VOCAB]
@@ -43,8 +44,8 @@ def _cfg():
 
 def _pool(request_id):
     pool = EvidencePool(request_id)
-    pool.add_evidence(EvidenceItem(evidence_id="ev_the", modality="text_span", content="the",
-                                   source_sha256=SHA, verified=True), keywords=["the"])
+    pool.add_evidence(EvidenceItem(evidence_id="ev_the", modality="text_span", content="tower",
+                                   source_sha256=SHA, verified=True), keywords=["tower"])
     return pool
 
 

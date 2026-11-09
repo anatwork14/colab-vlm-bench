@@ -82,7 +82,8 @@ def test_s6_unverified_evidence_protects_nothing_and_verified_control_protects()
     def _encode(text):
         return list(table.get(text, []))
 
-    prompt = [7, 9, 1]
+    # ITER3 R2 C-4 RE-DERIVED: 'paris' once in 3 tokens is 1/3 > 0.2 (breadth cap); five filler tokens make it 1/8.
+    prompt = [7, 9, 1, 2, 3, 4, 5, 6]
     unverified = grounding_protection_from_pool(
         _StubPool("paris", verified=False), prompt, _encode, "req_s6", None)
     assert unverified == {}, "unverified evidence must not protect any prompt position"
@@ -106,7 +107,9 @@ def test_s7_bare_space_prefixed_and_capitalised_keyword_forms_are_all_protected(
     def _encode(text):
         return list(table.get(text, []))
 
-    prompt = [7, 9, 1, 42, 2, 43, 3, 44, 5]
+    # ITER3 R2 C-4 RE-DERIVED: four protected forms in 9 tokens is 4/9 > 0.2 (breadth cap). Twelve filler
+    # tokens (ids outside the table) are appended, so the four positions 1,3,5,7 are unchanged and 4/21 = 0.19.
+    prompt = [7, 9, 1, 42, 2, 43, 3, 44, 5] + list(range(100, 112))
     protected = grounding_protection_from_pool(
         _pool("paris"), prompt, _encode, "req_s6", None)
     # Positions of 9 (bare), 42 (space), 43 (capitalised), 44 (space+capitalised).

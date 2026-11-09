@@ -60,7 +60,7 @@ backend ports) has not been met. No row claims speed.
 | mtp | diagnostic only (no MTP head) | **verifier-backed k=1 speculation** on text-only requests, label `cpu_greedy_k1_reference_not_vllm_mtp`; image or evidence requests use the diagnostic path | yes (text-only) | `speculation` block (`proposed`, `accepted`, `rejected`, `verifier_calls`), `memory_field_scopes` | BLOCKED | `test_mtp_speculative_serving.py`, `test_mtp_speculative_official.py` |
 | h2o_mtp | diagnostic: H2O active, speculation **not** executed (`arm_label` says so) | policy-state speculation on text-only, no-evidence requests (eviction-free 2-row blocks only; rejects roll back KV, GDN and tracker); otherwise H2O stays active on the diagnostic path | yes (text-only, no evidence) | `policy` block (`kind`, `budget_total`), `speculation`, `memory_field_scopes` | BLOCKED | `test_policy_mtp_speculative.py`, `test_iter3_b2_*`, `test_iter3_b1_policy_invariants.py` |
 | da_mtp | DA masks active, speculation **not** executed | never speculative (no route); DA accounting reported | none | `da_cost_accounting`, `arm_label` | BLOCKED | `test_iter3_b1_policy_invariants.py` |
-| starlight_s1 | supported (decision records per step and layer) | supported; **see F-1** (crash when a protected entry is evicted on some full-attention layers only) | none | `starlight` block, `decision_records`, invariant counters | BLOCKED | `test_starlight_*.py`, `test_iter3_b1_*.py` |
+| starlight_s1 | supported (decision records per step and layer) | supported; F-1 closed in ITER3 R2 (one shared retained set across full-attention layers; labelled deviation from per-layer H2O) | none | `starlight` block, `decision_records`, invariant counters | BLOCKED | `test_starlight_*.py`, `test_iter3_b1_*.py` |
 | starlight_s1_no_da | supported (DA signal removed, grounding kept) | as starlight_s1 | none | as starlight_s1 | BLOCKED | `test_starlight_engine.py`, `test_starlight_policy.py` (ablation) |
 | starlight_s1_no_grounding | supported (grounding signal removed, DA kept) | as starlight_s1 | none | as starlight_s1 | BLOCKED | `test_starlight_engine.py`, `test_starlight_policy.py` (ablation) |
 | starlight_s1_mtp | diagnostic | policy-state speculation on text-only, no-evidence requests; `degraded_to_h2o_plus_da` when declarations are missing (explicit, not silent) | yes (text-only, no evidence) | `starlight` block, `policy`, `speculation` | BLOCKED | `test_policy_mtp_speculative.py`, `test_iter3_b2_*` |
@@ -71,26 +71,29 @@ checkpoint, 7 teacher-forced decode steps, max |logit diff| 8.1e-6, tolerance 1e
 
 ## 4. Known limitations and findings
 
-**F-1 — Per-layer KV length desynchronisation under protection (defect, open).**
-- Symptom: `ValueError: Layer 7: attention mask width 28 does not match KV length 27; refusing a silent slice`.
-  The engine raises; it does not silently corrupt. The run is lost.
-- Mechanism: the STARLIGHT candidate set comes from H2O's keep choice over all positions, computed without
-  protection (`keep_mask_without_protection`, `h2o.py`). Protected entries among those candidates are
-  vetoed (`starlight.py:213-221`). Different layers have different scores, so one layer can veto an entry
-  that another layer evicts. Retained counts then differ per full-attention layer (measured: layer 3 kept
-  22 entries, layer 7 kept 21, same step). The hooked forward builds one attention mask from one layer's
-  length and checks it against every layer (`real_engine.py:202`), so it refuses.
-- Reproduction (official checkpoint, CPU, 19-token prompt, text TEXT in `test_iter3_b2_mtp_rollback.py`):
-  inject a DA focus span `("focus:mid", 16, 17)` into the protected spans. The speculative path
-  (`_speculative_policy_mtp_greedy("starlight", ...)`) and the **normal** path
-  (`execute_request` with `_speculation_enabled=False`) both raise the ValueError above. So this is not a
-  speculation-only defect.
-- Scope of the evidence: reproduced with an injected span. Not yet measured with the real DA scopes on
-  longer prompts. The default scripted spans did not trigger it in any run.
-- Test: `test_iter3_b2_mtp_rollback.py::test_F1_protected_veto_that_differs_across_layers_completes`
-  is a **strict xfail** (`raises=ValueError`). It flips to a failure when the defect is fixed.
-- Fix direction (not applied, needs a lead ruling): build the candidate set so protected entries are
-  forced into the keep set on every full-attention layer, or give all layers one shared retained set.
+**F-1 — Per-layer KV length desynchronisation under protection (CLOSED in ITER3 R2, lead ruling).**
+- Original symptom (ITER3 B2): `ValueError: Layer 7: attention mask width 28 does not match KV length 27; refusing a silent slice`.
+  The engine raised; it did not silently corrupt. The run was lost.
+- Original mechanism: the STARLIGHT candidate set came from per-layer H2O keep choices. Protected entries among
+  those candidates were vetoed (`starlight.py`). Different layers have different scores, so one layer could veto an
+  entry that another layer evicted. Retained counts then differed per full-attention layer, and the hooked forward
+  refused (`real_engine.py`, mask-width check).
+- **Fix (ITER3 R2): one shared retained set for all full-attention layers.** `H2OCacheTracker.keep_mask_shared`
+  (`h2o.py`) computes the candidate set from the MEAN over full-attention layers of the head-mean scores, at
+  budget minus protected. Protection is layer-independent, so every full-attention layer receives the same retained
+  slots. `_starlight_build_step_plans` raises `RuntimeError` instead of planning if full-attention cache lengths or
+  protected slots differ across layers, so the defect cannot recur silently.
+- **LABELLED DEVIATION from per-layer H2O.** STARLIGHT candidate generation (`starlight_s1*`, `starlight_s1_mtp`)
+  differs from `h2o_base` / `h2o_mtp`, which keep per-layer H2O. Ablations (`starlight_s1_no_da`,
+  `starlight_s1_no_grounding`) use the same shared rule, so they stay matched to each other. Documented in
+  `STARLIGHT_STAGE1_DESIGN.md` and in the `candidate_basis` telemetry field.
+- Test status: `test_iter3_b2_mtp_rollback.py::test_F1_protected_veto_that_differs_across_layers_completes`
+  was a **strict xfail** (`raises=ValueError`) in ITER3 B2. The xfail marker was removed in ITER3 R2: the test now
+  PASSES (official checkpoint, 40 committed tokens). Unit guards: `test_r2_shared_candidates.py` (4 tests, no checkpoint).
+- Expectations re-derived because the shared rule changes decisions: M4 in `test_iter3_b2_mutation.py` (span moved
+  from 16 to 23, since 16 is now evicted on every full-attention layer and the mutant's only eviction is position 23;
+  an unmutated baseline was added). Other existing STARLIGHT expectations (`test_starlight_*.py`,
+  `test_matched_retention.py`) passed unchanged.
   Either changes decisions in the normal path too, so existing STARLIGHT expectations must be re-derived.
 
 **F-2 — The scaffold cannot evidence RoPE.** `QwenFullAttentionLayer` applies no rotary embedding

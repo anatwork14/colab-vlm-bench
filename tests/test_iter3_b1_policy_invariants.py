@@ -22,7 +22,9 @@ PROMPT_30 = list(range(100, 120)) + [7, 9, 7, 8, 7] + list(range(120, 130))
 PROMPT_40 = list(range(100, 140))
 
 
-def _pool(request_id, keywords=("the",), eid="ev_1"):
+# ITER3 R2 C-4 RE-DERIVED: default keyword "the" -> "car" (a stop-word now protects nothing). Token 8 occurs once
+# in PROMPT_30 (1/30, under the cap) and never in PROMPT_40, so PROMPT_40 runs are unchanged.
+def _pool(request_id, keywords=("car",), eid="ev_1"):
     pool = EvidencePool(request_id)
     pool.add_evidence(EvidenceItem(evidence_id=eid, modality="text_span", content=" ".join(keywords),
                                    source_sha256=SHA, verified=True), keywords=list(keywords))
@@ -136,12 +138,12 @@ def test_pinv_interleaved_requests_do_not_leak_policy_or_evidence_state():
     # by A's evidence pool.
     budget = 16
     engine = _engine("starlight_s1", budget, ratio=0.2)
-    pool_a = _pool("iter_a", ("the",), eid="ev_a")
+    pool_a = _pool("iter_a", ("car",), eid="ev_a")
     kw_a = dict(prompt_token_ids=PROMPT_40, image_present=False, max_new_tokens=8)
     kw_b = dict(prompt_token_ids=PROMPT_30, image_present=False, max_new_tokens=8, evidence_pool=None)
     a1 = engine.execute_request(request_id="iter_a", evidence_pool=pool_a, **kw_a)
     b1 = engine.execute_request(request_id="iter_b", **kw_b)
-    a2 = engine.execute_request(request_id="iter_a", evidence_pool=_pool("iter_a", ("the",), eid="ev_a"), **kw_a)
+    a2 = engine.execute_request(request_id="iter_a", evidence_pool=_pool("iter_a", ("car",), eid="ev_a"), **kw_a)
     b2 = engine.execute_request(request_id="iter_b", **kw_b)
     assert a2.tokens_generated == a1.tokens_generated
     assert b2.tokens_generated == b1.tokens_generated

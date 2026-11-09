@@ -17,8 +17,9 @@ external eviction   = H2O-proposed candidates only
 - When protected count > budget, the plan is `INFEASIBLE_PROTECTED_EXCEEDS_BUDGET`. Protected
   entries stay, unprotected candidates are evicted, and the overflow is reported. It is never
   silently dropped.
-- A candidate set that would leave more than `budget` entries retained is rejected with
-  `ValueError`. The policy does not accept an inconsistent caller.
+- A candidate set that would leave more than `budget` entries retained is reported as
+  `INFEASIBLE_UNMET_AFTER_ELIGIBLE`, never silently. Caller errors (candidates supplied when nothing
+  needs eviction) raise `ValueError`.
 
 ## 2. Components
 
@@ -36,10 +37,20 @@ Tests: `tests/test_starlight_policy.py` (14), `tests/test_starlight_signals.py` 
 
 - Total budget per full-attention layer: `B = max(min_budget, int(prefill_len * budget_ratio))`,
   fixed from the prefill length, as H2O fixes its budget.
-- Protection is computed per layer for the current physical cache, including the new token.
+- Protection is computed per layer for the current physical cache, including the new token. Protected
+  original positions are layer-independent, so the protected slots agree across full-attention layers.
 - If `length <= B`, there are no candidates and nothing is evicted. This is the no-eviction case.
 - Otherwise, the H2O keep set is computed at `B_eff = B - |protected|` over ALL entries with no
-  H2O-internal protection (`keep_mask_without_protection`). Candidates are its complement.
+  H2O-internal protection. Candidates are its complement.
+- **ITER3 R2 — LABELLED DEVIATION FROM PER-LAYER H2O (lead ruling F-1).** The keep set is ONE set shared by
+  all full-attention layers: `H2OCacheTracker.keep_mask_shared` ranks positions by the MEAN over full-attention
+  layers of each layer's head-mean score. It is not per-layer H2O (`h2o_base`, `h2o_mtp` keep per-layer
+  selection and are unchanged). Reason: with per-layer candidates, one layer could veto an entry another layer
+  evicted, giving different retained lengths per layer and a crash (BACKEND_INTERFACE.md, F-1). With one shared
+  retained set, the mask and KV lengths cannot desynchronise. The engine raises if full-attention lengths or
+  protected slots differ across layers. Ablations use the same rule, so they stay matched to each other.
+  Consequence: STARLIGHT decisions differ from per-layer H2O decisions on the same prompt, and the comparison
+  between STARLIGHT and H2O arms measures this shared-set rule as well as protection.
 - The controller then vetoes the candidates that are protected. Retained = keep ∪ protected, so
   `|retained| = B_eff + |protected ∩ H2O_keep_complement| <= B`.
 - H2O's own sink and visual protection are disabled under STARLIGHT. The controller owns it.
@@ -72,6 +83,11 @@ and the text-side budget shrinks by the same amount.
 - Only `valid` evidence protects (see 4.3).
 - Telemetry reports the protected prompt positions per evidence id, so a too-generic keyword is
   visible (`grounding_protected_by_evidence`). It is measured, not hidden.
+- **Keyword breadth policy (ITER3 R2, C-4).** Stop-word-like keywords (`KEYWORD_STOPWORDS`, e.g.
+  `the`) are rejected before any position is protected. A keyword whose protected positions exceed
+  `MAX_KEYWORD_PROMPT_FRACTION = 0.2` of the prompt is rejected. Both rejections are reported in
+  `grounding_keyword_policy` (`accepted_keywords`, `rejected_stopword`, `rejected_breadth` with the fraction).
+  Accepted protection that still exceeds the budget keeps the INFEASIBLE semantics of section 3 (never silent).
 
 ### 4.3 Evidence validity
 
@@ -79,7 +95,7 @@ and the text-side budget shrinks by the same amount.
 
 | Status | Reason | Protects |
 |---|---|---|
-| `unverified` | `verified_false` | no |
+| `unverified` | `caller_declared_verified_false` (caller flag; never checked by the controller) | no |
 | `expired` | `pool_request_id_mismatch` (pool built for another request) | no |
 | `stale` | `source_sha256_mismatch` (image hash differs from the declared source) | no |
 | `valid` | `source_sha256_match` | yes |
@@ -193,7 +209,7 @@ Decision records are opt-in (`starlight_record_decisions=True`).
 | I-5 budget when feasible | covered | pure random consistent plans; engine `max_retained_per_layer_step` |
 | I-6 GDN exempt and labelled | partial | exempt and labelled (`test_HC12_*`). The byte-identity hash of GDN state is NOT tested. |
 | I-7 position preservation | partial | survivors keep original ids (`test_I7_*`). RoPE tensor values are NOT compared. |
-| I-8 vision_start/end never evicted | NOT satisfied (open A-4) | measured as `structural_tokens_evicted` and marked `NOT_RATIFIED_A4_POLICY_DEPENDENT`. Not protected. |
+| I-8 vision_start/end never evicted | protected through the structural source (lead decision Q2, `PROTECTED_LEAD_DECISION_Q2`); owner ratification of A-4 open | measured as `structural_tokens_evicted` and marked `NOT_RATIFIED_A4_POLICY_DEPENDENT`. |
 | I-9 determinism | covered | `test_I9_HC15_*` |
 | I-10 complete decision records | covered | `test_I10_*`; records are keyed by original position |
 | A-DA | covered | `test_A_DA_*` on the conflict fixture |
@@ -214,19 +230,19 @@ Decision records are opt-in (`starlight_record_decisions=True`).
 | HC-8 malformed declaration | covered for spans and sha | `test_HC8_*` raises. No score declarations exist, so NaN scores are not applicable. |
 | HC-9 multi-request isolation | partial | sequential isolation test. Interleaved batches are not possible: `execute_request` is synchronous. |
 | HC-10 multi-turn / evicted never returns | partial | `test_HC10_*` covers evicted-not-returning within a request. The engine carries no KV across calls, so cross-turn KV is not applicable. |
-| HC-11 no eligible candidates | covered | `test_HC11_*`. Unmet budget with no candidates raises ValueError (open A-2). |
+| HC-11 no eligible candidates | covered | `test_HC11_*`. Unmet budget after all eligible candidates returns `INFEASIBLE_UNMET_AFTER_ELIGIBLE` (open A-2 ruling). |
 | HC-12 GDN exemption | partial | label and exemption covered. Hash identity NOT tested. |
-| HC-13 vision span integrity | partial, open A-4 | structural tokens measured; not protected |
+| HC-13 vision span integrity | partial, open A-4 | structural tokens protected (Q2) and measured; A-4 ratification open |
 | HC-14 cache consistency | partial | length counter checked every step (`test_HC14_*`). Logit recomputation NOT done. |
 | HC-15 determinism | covered | `test_I9_HC15_*` |
 
 Auditor ambiguities (A-1..A-6) and the choices made:
 
 - A-1 budget granularity: per (request, FA layer), applied to both KV heads (oracle default).
-- A-2 budget unmet with no eligible candidates: NOT a status. The policy raises ValueError. Open.
+- A-2 budget unmet with no eligible candidates: a status, `STATUS_INFEASIBLE` with `INFEASIBLE_UNMET_AFTER_ELIGIBLE` (code behaviour, 133d5c5). Owner ruling still open.
 - A-3 per-head protection: a protected position is protected in all KV heads of the layer
   (conservative oracle default). Positions are shared across heads.
-- A-4 structural tokens: not ratified. Measured, not protected. Open.
+- A-4 structural tokens: protected through the structural source (lead decision Q2) and measured. Owner ratification still open.
 - A-5 missing declarations: explicit status, no protection. Not fail-closed. Open.
 - A-6 eviction timing: decode only. Prefill is never evicted. Each record states `phase: "decode"`.
 

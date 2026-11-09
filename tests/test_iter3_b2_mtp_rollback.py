@@ -216,16 +216,12 @@ def test_inferc_speculative_route_reports_its_starlight_policy_and_budget(star_e
     assert res.tokens_generated == ref
 
 
-@pytest.mark.xfail(
-    strict=True, raises=ValueError,
-    reason=("F-1 (docs/harness/BACKEND_INTERFACE.md): a protected entry that H2O evicts on some full-attention "
-            "layers but not others gives per-layer KV lengths that differ; the hooked forward then refuses with "
-            "'attention mask width ... does not match KV length'. Known defect, NOT fixed in ITER3 B2: the fix "
-            "changes candidate generation (a policy decision). strict=True: this flips to a failure when fixed."),
-)
+# ITER3 R2 (lead ruling F-1): the shared retained set makes the per-layer lengths identical, so this
+# must now COMPLETE. It was a strict xfail in ITER3 B2 (the defect); the xfail is removed.
 def test_F1_protected_veto_that_differs_across_layers_completes(star_engine, prompt, monkeypatch):
-    # A DA focus span over prompt position 16. Position 16 is evicted by H2O on layer 3 only (measured),
-    # so protection vetoes that candidate on one layer and not on the others.
+    # A DA focus span over prompt position 16. ITER3 R2: under the SHARED retained set, position 16 is a
+    # candidate on every full-attention layer (measured), so the veto is applied identically on all of them.
+    # The earlier per-layer defect (veto on layer 3 only) can no longer occur; this test checks completion.
     real_new_state = star_engine._pol_new_state
 
     def with_focus_span_on_16(kind, prompt_len):

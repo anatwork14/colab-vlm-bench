@@ -53,7 +53,8 @@ from .declarative_attention import DAConfig, DAFSM, DAMaskGenerator, DATag, DATa
 from .grounding_evidence import ECRDConfig, EvidencePool, EvidenceItem, ECRDLogitsProcessor
 from .starlight import (
     STATUS_INFEASIBLE, StarlightLayerPlan, combine_summaries, compact_orig_positions,
-    da_protection_from_spans, evidence_validity, grounding_protection_from_pool,
+    VISUAL_EVIDENCE_NOTE, da_protection_from_spans, evidence_provenance, evidence_validity,
+    grounding_protection_with_report, visual_evidence_protection_status,
     plan_starlight_layer, summarize_plans,
 )
 from .adapters import HardwareGateError, check_vllm_hardware_compatibility
@@ -1668,7 +1669,12 @@ class RealSevenArmEngine:
                 "arm_status": arm_status,
                 "grounding_declaration_missing": starlight,
                 "kv_memory_accounting": {
-                    "scope": "per decode step, prefill cache unbounded",
+                    "scope": "MIXED_PER_FIELD_SEE_memory_field_scopes",
+                        "scope_note": (
+                            "This block mixes per-step sums and a final-state snapshot "
+                            "(final_retained_kv_payload_bytes). No single scope applies to the block; "
+                            "each field's coverage is in memory_field_scopes."
+                        ),
                     "classification": "PHYSICAL_KV_ALLOCATED_NOT_FREED_NOT_MEASURED_IN_POLICY_DRIVER",
                     "final_retained_kv_payload_bytes": spec["kv_bytes_allocated"],
                 },
@@ -1759,7 +1765,12 @@ class RealSevenArmEngine:
                 "is_official_hf_hooked": self.is_official_hf_hooked,
                 "measurement_label": "cpu_pytorch_reference_not_vllm",
                 "kv_memory_accounting": {
-                    "scope": "per decode step, prefill cache unbounded",
+                    "scope": "MIXED_PER_FIELD_SEE_memory_field_scopes",
+                        "scope_note": (
+                            "This block mixes per-step sums and a final-state snapshot "
+                            "(final_retained_kv_payload_bytes). No single scope applies to the block; "
+                            "each field's coverage is in memory_field_scopes."
+                        ),
                     "classification": "NO_EVICTION_PHYSICAL_LENGTH_ONLY",
                     "final_retained_kv_payload_bytes": spec["kv_bytes_allocated"],
                 },
@@ -2107,44 +2118,73 @@ class RealSevenArmEngine:
     ) -> tuple[dict[int, torch.Tensor], dict[int, np.ndarray], list[StarlightLayerPlan]]:
         """One decode step of STARLIGHT Stage 1 over every full-attention layer (CPU reference).
 
-        Candidate set: H2O's keep choice with NO internal protection, computed at
-        budget - |protected| over all physical entries. The controller then vetoes candidates
-        that are protected. Recurrent layers are not in full_attention_layers and are never planned.
+        SHARED RETAINED SET (ITER3 R2, lead ruling F-1; labelled deviation from per-layer H2O).
+        One candidate set is computed for the whole step from the layer-AGGREGATED H2O scores
+        (`tracker.keep_mask_shared`, mean over the full-attention layers), at budget - |protected|.
+        Protection is layer-independent, so every full-attention layer then receives the same
+        retained slots. This keeps mask and KV lengths identical across full-attention layers.
+        The controller vetoes protected candidates (below). Recurrent layers are not in
+        full_attention_layers and are never planned.
         `orig_positions[l]` holds each physical slot's ORIGINAL token position, so protection
         follows the token through compaction.
         """
         enabled_t = tuple(enabled)
-        plans_tensor: dict[int, torch.Tensor] = {}
-        next_orig: dict[int, np.ndarray] = {}
-        step_plans: list[StarlightLayerPlan] = []
-        for l_idx in self.config.full_attention_layers:
-            k_len = int(k_lens[l_idx])
+        full_layers = list(self.config.full_attention_layers)
+        if not full_layers:
+            return {}, {}, []
+        # Every full-attention layer must hold the same number of entries; a shared set is only defined then.
+        k_by_layer = {l_idx: int(k_lens[l_idx]) for l_idx in full_layers}
+        if len(set(k_by_layer.values())) != 1:
+            raise RuntimeError(
+                f"STARLIGHT shared retained set requires equal cache lengths on all full-attention layers, "
+                f"got {k_by_layer}"
+            )
+        k_len = next(iter(k_by_layer.values()))
+        # Bookkeeping: each layer's tracked original positions must match its cache length before this append.
+        origs: dict[int, np.ndarray] = {}
+        for l_idx in full_layers:
             prev = np.asarray(orig_positions[l_idx], dtype=np.int64)
             if prev.shape[0] != k_len - 1:
                 raise RuntimeError(
                     f"STARLIGHT position bookkeeping out of sync on layer {l_idx}: "
                     f"{prev.shape[0]} tracked vs {k_len - 1} cached entries"
                 )
-            orig = np.asarray(compact_orig_positions(prev, None, appended=appended_position), dtype=np.int64)
-            # S-1 (auditor HIGH): ALL signals are computed on every arm. The candidate set must not
-            # depend on the ablation; an ablation only removes protection as a veto (below).
-            da_slots = da_protection_from_spans(da_spans, orig)
-            grounding_spans = [
-                (label, pos, pos + 1) for pos, labels in grounding_positions.items() for label in labels
-            ]
-            gr_slots = da_protection_from_spans(grounding_spans, orig)
-            structural_spans = [
-                (label, pos, pos + 1) for pos, labels in (structural or {}).items() for label in labels
-            ]
-            st_slots = da_protection_from_spans(structural_spans, orig)
-            if k_len <= budget_total:
-                candidates: list[int] = []  # within budget: nothing to evict
-            else:
-                # Effective H2O budget from the FULL protected union (all sources, ablation-independent).
-                n_protected = len(set(da_slots) | set(gr_slots) | set(st_slots))
-                effective = budget_total - n_protected if n_protected <= budget_total else 0
-                keep = tracker.keep_mask_without_protection(l_idx, k_len, effective)
-                candidates = np.flatnonzero(~keep).tolist()
+            origs[l_idx] = np.asarray(compact_orig_positions(prev, None, appended=appended_position), dtype=np.int64)
+        # Protection signals are computed per layer from that layer's original-position map (ablation-independent).
+        slots_by_layer: dict[int, tuple[list[int], list[int], list[int]]] = {}
+        grounding_spans = [
+            (label, pos, pos + 1) for pos, labels in grounding_positions.items() for label in labels
+        ]
+        structural_spans = [
+            (label, pos, pos + 1) for pos, labels in (structural or {}).items() for label in labels
+        ]
+        for l_idx in full_layers:
+            orig = origs[l_idx]
+            slots_by_layer[l_idx] = (
+                da_protection_from_spans(da_spans, orig),
+                da_protection_from_spans(grounding_spans, orig),
+                da_protection_from_spans(structural_spans, orig),
+            )
+        # The protected union must be layer-independent so the shared candidate budget is well defined.
+        union_by_layer = {l: set(d) | set(g) | set(s) for l, (d, g, s) in slots_by_layer.items()}
+        if len({frozenset(u) for u in union_by_layer.values()}) != 1:
+            raise RuntimeError(
+                "STARLIGHT shared retained set requires identical protected slots on all full-attention layers"
+            )
+        first = full_layers[0]
+        if k_len <= budget_total:
+            candidates: list[int] = []  # within budget: nothing to evict
+        else:
+            # Effective H2O budget from the FULL protected union (all sources, ablation-independent).
+            n_protected = len(union_by_layer[first])
+            effective = budget_total - n_protected if n_protected <= budget_total else 0
+            keep = tracker.keep_mask_shared(full_layers, k_len, effective)
+            candidates = np.flatnonzero(~keep).tolist()
+        plans_tensor: dict[int, torch.Tensor] = {}
+        next_orig: dict[int, np.ndarray] = {}
+        step_plans: list[StarlightLayerPlan] = []
+        for l_idx in full_layers:
+            da_slots, gr_slots, st_slots = slots_by_layer[l_idx]
             plan = plan_starlight_layer(
                 layer=l_idx, length=k_len, budget=budget_total, h2o_candidates=candidates,
                 signals={"da": da_slots, "grounding": gr_slots, "structural": st_slots},
@@ -2152,8 +2192,11 @@ class RealSevenArmEngine:
             )
             retained = np.asarray(plan.retained, dtype=np.int64)
             plans_tensor[l_idx] = torch.as_tensor(retained, dtype=torch.long, device=self.device)
-            next_orig[l_idx] = orig[retained]
+            next_orig[l_idx] = origs[l_idx][retained]
             step_plans.append(plan)
+        retained_sets = {tuple(int(x) for x in plans_tensor[l].tolist()) for l in full_layers}
+        if len(retained_sets) != 1:
+            raise RuntimeError("STARLIGHT shared retained set diverged across full-attention layers")
         return plans_tensor, next_orig, step_plans
 
     def _starlight_step_records(
@@ -2342,6 +2385,8 @@ class RealSevenArmEngine:
         starlight_grounding: dict[int, tuple[str, ...]] = {}
         starlight_grounding_status = "NOT_STARTED" if "grounding" in starlight_enabled else "DISABLED_ABLATION"
         starlight_verdicts: dict[str, list[str]] = {}
+        starlight_provenance: dict[str, dict[str, str]] = {}
+        starlight_keyword_report: dict[str, Any] = {}
         starlight_summaries: list[dict[str, Any]] = []
         starlight_max_retained = 0
         starlight_text_fraction: float | None = None
@@ -2391,12 +2436,13 @@ class RealSevenArmEngine:
                         eid: [status, reason, EVIDENCE_REASON_CODES[status]] for eid, (status, reason) in
                         evidence_validity(evidence_pool, request_id, image_sha).items()
                     }
+                    starlight_provenance = evidence_provenance(evidence_pool, image_sha)
                     if self.tokenizer is None:
                         starlight_grounding_status = "UNAVAILABLE_NO_TOKENIZER"
                     elif image_present and image_sha is None:
                         starlight_grounding_status = "NOT_PROTECTED_IMAGE_SOURCE_UNKNOWN"
                     else:
-                        starlight_grounding = grounding_protection_from_pool(
+                        starlight_grounding, starlight_keyword_report = grounding_protection_with_report(
                             evidence_pool, full_prompt, self.tokenizer.encode, request_id, image_sha,
                         )
                         starlight_grounding_status = "ACTIVE"
@@ -2783,7 +2829,12 @@ class RealSevenArmEngine:
                 "pretrained_weights": self.pretrained_weight_summary,
                 "kv_memory_accounting": {
                     # S-8 (lead ruling): every memory field states its coverage.
-                    "scope": "per decode step, prefill cache unbounded",
+                    "scope": "MIXED_PER_FIELD_SEE_memory_field_scopes",
+                        "scope_note": (
+                            "This block mixes per-step sums and a final-state snapshot "
+                            "(final_retained_kv_payload_bytes). No single scope applies to the block; "
+                            "each field's coverage is in memory_field_scopes."
+                        ),
                     "legacy_field": "physical_kv_bytes_freed",
                     "classification": "SUM_OF_KV_TENSOR_FOOTPRINT_DELTAS_NOT_GPU_VRAM_SAVING",
                     "compaction_tensor_byte_deltas_sum": total_physical_freed,
@@ -2934,8 +2985,19 @@ class RealSevenArmEngine:
                 "grounding_declaration_missing": grounding_missing,
                 "arm_status": arm_status,
                 "grounding_evidence_verdicts": starlight_verdicts,
+                # ITER3 R2 C-3: `verified` is a caller declaration; source hash is checked only vs image bytes.
+                "grounding_evidence_provenance": starlight_provenance,
+                # ITER3 R2 C-5: image evidence protects no visual tokens. Stated, never silent.
+                # ITER3 R2 C-4: keyword breadth policy and what it rejected (never silent).
+                "grounding_keyword_policy": starlight_keyword_report,
+                "visual_evidence_protection": visual_evidence_protection_status(evidence_pool),
+                "visual_evidence_protection_note": VISUAL_EVIDENCE_NOTE,
                 "grounding_protected_by_evidence": grounding_by_evidence,
-                "candidate_basis": "H2O keep set over all positions with NO internal protection, at budget - protected",
+                "candidate_basis": (
+                    "SHARED H2O keep set (mean of head-mean scores over all full-attention layers) over all "
+                    "positions with NO internal protection, at budget - protected. LABELLED DEVIATION from "
+                    "per-layer H2O (ITER3 R2 F-1): one retained set serves every full-attention layer."
+                ),
                 "budget_total": starlight_budget,
                 "budget_basis": (
                     "max(min_budget, int(prefill_len * budget_ratio)) total retained entries per full-attention "

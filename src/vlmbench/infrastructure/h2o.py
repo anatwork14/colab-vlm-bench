@@ -30,7 +30,7 @@ class H2OConfig:
     tie_breaking: str = "recent"       # Deterministic tie-breaking: 'recent' prefers later tokens
     # ITER2 Stage 2(c), upstream fidelity A4-02. Opt-in. False (default) keeps the layer-mean
     # selection. True selects heavy hitters PER KV HEAD via compute_eviction_plan_per_head; the
-    # shared compute_eviction_plan and the STARLIGHT keep_mask_without_protection both refuse it
+    # shared compute_eviction_plan, keep_mask_without_protection and keep_mask_shared all refuse it
     # (ITER2 D10 N-13). Not wired into the engine (needs per-head KV gather).
     per_kv_head_selection: bool = False
 
@@ -294,7 +294,11 @@ class H2OCacheTracker:
         return retained, metrics
 
     def keep_mask_without_protection(self, layer_idx: int, length: int, keep_budget: int) -> np.ndarray:
-        """STARLIGHT candidate set: H2O's keep choice over ALL positions, with NO internal protection.
+        """PER-LAYER H2O keep choice over ALL positions, with NO internal protection.
+
+        ITER3 R2 (F-1): STARLIGHT no longer uses this per-layer method for its candidate set; it uses
+        keep_mask_shared (one set for all full-attention layers). This method is kept for per-layer
+        analysis and unit tests, and for the equivalence check in tests/test_r2_shared_candidates.py.
 
         The same recent-window + heavy-hitter rule as compute_eviction_plan, but sinks and visual
         tokens are not protected here. Under STARLIGHT the controller owns protection: it vetoes
@@ -312,23 +316,61 @@ class H2OCacheTracker:
             )
         if length < 0 or keep_budget < 0:
             raise ValueError("length and keep_budget must be non-negative")
+        if length == 0 or keep_budget == 0 or length <= keep_budget:
+            return self._keep_from_position_scores(np.zeros(length, dtype=np.float32), length, keep_budget)
+        layer = self.layers[layer_idx]
+        scores = np.zeros((self.num_kv_heads, length), dtype=np.float32)
+        usable = min(length, layer.scores.shape[1])
+        scores[:, :usable] = layer.scores[:, :usable]
+        return self._keep_from_position_scores(scores.mean(axis=0), length, keep_budget)
+
+    def keep_mask_shared(self, layer_indices: Sequence[int], length: int, keep_budget: int) -> np.ndarray:
+        """STARLIGHT SHARED candidate set (ITER3 R2, lead ruling F-1). LABELLED DEVIATION from per-layer H2O.
+
+        One keep mask for every full-attention layer in `layer_indices`. Position scores are the MEAN over
+        those layers of each layer's head-mean score, so the candidate set does not depend on which layer
+        is asked. Protection is layer-independent (original-position spans), so with one shared candidate
+        set every full-attention layer vetoes the same entries and keeps the same number of entries.
+        Per-layer H2O (h2o_base, h2o_mtp) is unchanged and does not use this method.
+        Returns a bool keep mask of length `length` with exactly min(keep_budget, length) True.
+        """
+        if length < 0 or keep_budget < 0:
+            raise ValueError("length and keep_budget must be non-negative")
+        layers = [int(l) for l in layer_indices]
+        if not layers:
+            raise ValueError("keep_mask_shared needs at least one layer")
+        if self.config.per_kv_head_selection:
+            raise NotImplementedError(
+                "per_kv_head_selection is not supported on the STARLIGHT candidate path (shared mask)"
+            )
+        per_layer = []
+        for l_idx in layers:
+            layer = self.layers[l_idx]
+            scores = np.zeros((self.num_kv_heads, length), dtype=np.float32)
+            usable = min(length, layer.scores.shape[1])
+            scores[:, :usable] = layer.scores[:, :usable]
+            per_layer.append(scores.mean(axis=0))
+        aggregated = np.mean(np.stack(per_layer, axis=0), axis=0).astype(np.float32)
+        return self._keep_from_position_scores(aggregated, length, keep_budget)
+
+    def _keep_from_position_scores(self, pos_scores: np.ndarray, length: int, keep_budget: int) -> np.ndarray:
+        """The H2O keep rule on one score per position: recent window, then heavy hitters by score.
+
+        Ties break toward later positions, matching compute_eviction_plan. Exactly
+        min(keep_budget, length) True entries.
+        """
         keep = np.zeros(length, dtype=bool)
         if length == 0 or keep_budget == 0:
             return keep
         if length <= keep_budget:
             keep[:] = True
             return keep
-        layer = self.layers[layer_idx]
-        scores = np.zeros((self.num_kv_heads, length), dtype=np.float32)
-        usable = min(length, layer.scores.shape[1])
-        scores[:, :usable] = layer.scores[:, :usable]
         recent = min(keep_budget, max(1, int(keep_budget * self.config.recent_ratio)))
         keep[length - recent:] = True
         heavy_budget = keep_budget - recent
         older = np.arange(length - recent)
         if heavy_budget > 0 and older.size > 0:
-            older_scores = scores[:, :older.size].mean(axis=0)
-            # Score descending; ties toward later positions, matching compute_eviction_plan.
+            older_scores = np.asarray(pos_scores, dtype=np.float32)[:older.size]
             order = np.lexsort((older, older_scores))[::-1]
             keep[older[order[:min(heavy_budget, older.size)]]] = True
         return keep

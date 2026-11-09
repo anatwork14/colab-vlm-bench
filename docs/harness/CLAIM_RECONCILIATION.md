@@ -75,7 +75,7 @@ The report has a supersession banner at line 6 ("SUPERSEDED FOR MTP/DA RESEARCH 
 | D-12 | `docs/RESOURCE_BUDGET.md:7` | "approximately **88–228 A100 GPU-hours**" | Labelled as a proportional extrapolation. | OK | Keep (the label must stay). |
 | D-13 | `docs/PROTOCOL.md:25` | "~75–185 A100-GPU-hours ... (wide, **unverified estimate**)" | Labelled unverified. | OK | Keep. |
 | D-14 | `docs/RESOURCE_BUDGET.md:16` | "Provisional GPU budget (unverified)" | Labelled. | OK | Keep. |
-| D-15 | `docs/MTP_DA_UPSTREAM_CONTRACT_AUDIT.md:34` | "`SEVEN_ARM_PRETRAINED_PASS` is pretrained model/ViT forward coverage only; it does NOT imply MTP speculative verifier or paper-faithful DA" | Correct statement; consistent with the supersession notice. | OK | Keep. |
+| D-15 | `docs/MTP_DA_UPSTREAM_CONTRACT_AUDIT.md:34` | "The retired label `SEVEN_ARM_PRETRAINED_PASS` (replaced by `SEVEN_ARM_HOOK_COVERAGE_PASS`, N-11) meant pretrained model/ViT forward coverage only; it did NOT imply MTP speculative verifier or paper-faithful DA" | Correct statement about the retired label; consistent with the supersession notice. | OK | Keep. |
 | D-16 | `docs/MTP_DA_UPSTREAM_CONTRACT_AUDIT.md:28` | "current custom DAFSM ... is **not** paper-faithful `<focus magic_chunks>` model-declared DA" | Consistent with `DA_PAPER_FAITHFUL_MODEL_DECLARED: GATED`. | OK | Keep. |
 | D-17 | `docs/COLAB_STEPWISE_AUDIT.md:34` | "GPU model-load/MTP ... cannot be certified by GitHub CPU tests alone" | Accurate. | OK | Keep. |
 | D-18 | `docs/AGENT_EXECUTION.md:20` | "Native dataset prompt rendering has not been certified identical" | Accurate. | OK | Keep. |
@@ -136,7 +136,7 @@ Interpretation: the official hooked coverage and the one-step prediction reprodu
 ### 3.2 Progressive qualification suite (`scripts/run_progressive_qualification.py --device cpu`)
 
 - Tests A, B, C: PASSED on CPU (log lines 13, 15, 17). Test A printed `Logits Parity max_diff=0.00e+00`, which differs from the generator's 6.20e-06 on the same device (both are "one-step parity" but on different code paths). Unreconciled; record it.
-- Test D: **crashed** with `AttributeError: 'RealExecutionResult' object has no attribute 'logical_selection_fraction'` at `scripts/run_progressive_qualification.py:343`, exit code 1. At 7d209f5 the suite therefore cannot produce a complete receipt, and the release gates `SEVEN_ARM_PRETRAINED_PASS`, `MTP_PROPOSAL_DIAGNOSTIC_PASS` and `CCU_REQUEST_ISOLATION_TEST_PASS` have no reproducing run.
+- Test D: **crashed** with `AttributeError: 'RealExecutionResult' object has no attribute 'logical_selection_fraction'` at `scripts/run_progressive_qualification.py:343`, exit code 1. At 7d209f5 the suite therefore cannot produce a complete receipt, and the release gates `SEVEN_ARM_PRETRAINED_PASS` (retired label, N-11), `MTP_PROPOSAL_DIAGNOSTIC_PASS` and `CCU_REQUEST_ISOLATION_TEST_PASS` have no reproducing run.
 - Tests E, F, G: not reached. Test E's expected-failure status (G-05) could not be confirmed by running it.
 - No receipt was written to the repo.
 

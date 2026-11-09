@@ -30,7 +30,8 @@ Test counts: policy 14, signals 16, engine 17, oracle 23 → 70 STARLIGHT tests,
 eligible_to_evict = h2o_candidate AND NOT (DA_protected OR grounding_protected). Protected never evicted.
 Candidates = H2O keep complement computed at budget − |protected| over all entries (no H2O internal protection),
 so retained = keep ∪ protected ≤ budget. protected > budget → `INFEASIBLE_PROTECTED_EXCEEDS_BUDGET`,
-protected kept, overflow reported. A candidate set that would overflow the budget raises ValueError.
+protected kept, overflow reported. A candidate set that leaves more than the budget retained is reported as
+`INFEASIBLE_UNMET_AFTER_ELIGIBLE`; caller errors raise ValueError.
 Recurrent (GDN) layers exempt, labelled `GDN_EXEMPT_NOT_TOKEN_ADDRESSABLE`. Full-attention layers only.
 Protection follows original token positions through compaction (`compact_orig_positions`).
 
@@ -63,15 +64,15 @@ Full matrix in design doc section 12. Summary:
   HC-4b (no turn IDs in this engine), HC-7, HC-9 (sequential only; engine is synchronous), HC-10 (within-request;
   no cross-call KV exists), HC-12 (no hash), HC-13, HC-14 (length counter only; no logit recomputation).
 - **Not covered:** HC-5 (no relevance labels; metric reported as NOT_MEASURED), I-8 (structural vision tokens are
-  measured, not protected; A-4 open).
+  protected through the structural source, lead decision Q2, and measured; A-4 ratification open).
 - Two coverage tests (I-7, A-MASK) were added after the implementation, not red-first. Disclosed in the doc.
 
 ## Open questions for the owner / lead
 1. **Budget basis (A-1/brief):** STARLIGHT uses total budget with protection reserved inside it; H2O keeps its R4-1
    outside-budget semantics. Side-by-side tables must state the difference (oracle §5.6).
-2. **I-8 / A-4:** vision_start/vision_end are NOT protected. In the tests, structural tokens are measured
+2. **I-8 / A-4:** vision_start/vision_end are protected through the structural source (lead decision Q2). Structural tokens are measured
    (`structural_tokens_evicted`); the oracle wants them never evicted. Ratify or drop.
-3. **A-2:** unmet budget with no eligible candidates raises ValueError in the policy instead of a status.
+3. **A-2:** unmet budget with no eligible candidates returns `STATUS_INFEASIBLE` / `INFEASIBLE_UNMET_AFTER_ELIGIBLE` (code). Owner ruling still open.
    Not reachable through the engine (candidates always exist when length > budget). Confirm.
 4. **A-5 / HC-7:** missing evidence declaration gives explicit status `NO_EVIDENCE_DECLARED` and protects nothing.
    The oracle asks for fail-closed or an error. Owner decision.

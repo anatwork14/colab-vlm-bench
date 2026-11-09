@@ -31,7 +31,7 @@ Official references:
 
 ## Status and downstream benchmark policy
 
-`SEVEN_ARM_PRETRAINED_PASS` is **pretrained model/ViT forward coverage only**; it does NOT imply MTP speculative verifier or paper-faithful DA. Any earlier readiness receipt with MTP acceptance 20–25%, 18.95% asserted as externally observed, or MTP rollback PASS derived from parity-forced acceptance is historical and **superseded**.
+The retired label `SEVEN_ARM_PRETRAINED_PASS` (replaced by `SEVEN_ARM_HOOK_COVERAGE_PASS`, N-11) meant **pretrained model/ViT forward coverage only**; it did NOT imply MTP speculative verifier or paper-faithful DA. Any earlier readiness receipt with MTP acceptance 20–25%, 18.95% asserted as externally observed, or MTP rollback PASS derived from parity-forced acceptance is historical and **superseded**.
 
 - Base/H2O/ECRD: retain only their validated scope; do not infer vLLM correctness.
 - MTP/H2O+MTP/DA+MTP: proposal diagnostic only; keep speculative serving and benchmarking gated.

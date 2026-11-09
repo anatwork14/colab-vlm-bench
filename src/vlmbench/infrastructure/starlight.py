@@ -434,7 +434,8 @@ def evidence_validity(pool: Any, current_request_id: str, image_sha256: str | No
         return verdicts
     for item in pool.items():
         if not item.verified:
-            verdicts[item.evidence_id] = ("unverified", "verified_false")
+            # The flag is the caller's declaration; the controller does not verify content (C-3).
+            verdicts[item.evidence_id] = ("unverified", "caller_declared_verified_false")
         elif pool.request_id != current_request_id:
             verdicts[item.evidence_id] = ("expired", "pool_request_id_mismatch")
         elif image_sha256 is None:
@@ -444,6 +445,57 @@ def evidence_validity(pool: Any, current_request_id: str, image_sha256: str | No
         else:
             verdicts[item.evidence_id] = ("valid", "source_sha256_match")
     return verdicts
+
+
+# ITER3 R2 C-3: provenance labels. The `verified` flag is never checked by this controller, so it is always
+# reported as a caller declaration. `source_sha256` is labelled as checked only when it was compared with
+# the request's image bytes; text-only requests have nothing to compare against.
+VERIFIED_FLAG_LABEL = "CALLER_DECLARED_NOT_VERIFIED"
+SOURCE_UNCHECKED_LABEL = "CALLER_DECLARED_NOT_VERIFIED"
+SOURCE_CHECKED_MATCH_LABEL = "CHECKED_IMAGE_BYTES_MATCH"
+SOURCE_CHECKED_MISMATCH_LABEL = "CHECKED_IMAGE_BYTES_MISMATCH"
+
+
+def evidence_provenance(pool: Any, image_sha256: str | None) -> dict[str, dict[str, str]]:
+    """Per evidence id: the provenance label of its `verified` flag and of its `source_sha256`.
+
+    `verified_flag` is always CALLER_DECLARED_NOT_VERIFIED. `source_sha256` is CHECKED_IMAGE_BYTES_MATCH or
+    CHECKED_IMAGE_BYTES_MISMATCH only when an image hash exists to compare, else CALLER_DECLARED_NOT_VERIFIED.
+    """
+    out: dict[str, dict[str, str]] = {}
+    if pool is None:
+        return out
+    for item in pool.items():
+        if image_sha256 is None:
+            source = SOURCE_UNCHECKED_LABEL
+        elif item.source_sha256.lower() == image_sha256.lower():
+            source = SOURCE_CHECKED_MATCH_LABEL
+        else:
+            source = SOURCE_CHECKED_MISMATCH_LABEL
+        out[item.evidence_id] = {"verified_flag": VERIFIED_FLAG_LABEL, "source_sha256": source}
+    return out
+
+
+VISUAL_EVIDENCE_NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
+VISUAL_EVIDENCE_NOTE = (
+    "Grounding protects token spans of evidence KEYWORDS in the text prompt only. image_region evidence "
+    "protects NO visual tokens (no bounding-box-to-vision-token mapping exists). Visual evidence coverage is "
+    "not claimed."
+)
+
+
+def visual_evidence_protection_status(pool: Any) -> str:
+    """ITER3 R2 C-5: explicit status of protection for image evidence. Never a silent pass.
+
+    NOT_IMPLEMENTED when the pool declares any image_region evidence (the controller protects none of its
+    visual tokens); NO_IMAGE_EVIDENCE_DECLARED when the pool has only text evidence; NO_EVIDENCE_DECLARED
+    without a pool.
+    """
+    if pool is None:
+        return "NO_EVIDENCE_DECLARED"
+    if any(item.modality == "image_region" for item in pool.items()):
+        return VISUAL_EVIDENCE_NOT_IMPLEMENTED
+    return "NO_IMAGE_EVIDENCE_DECLARED"
 
 
 def grounding_protection_from_pool(
@@ -462,19 +514,66 @@ def grounding_protection_from_pool(
     Keyword matching is token-level, so a word split across tokens in a different way can be
     missed (documented limitation).
     """
+    protected, _report = grounding_protection_with_report(
+        pool, prompt_ids, encode, current_request_id, image_sha256)
+    return protected
+
+
+# ITER3 R2 C-4: keyword breadth policy. Reported explicitly in telemetry (grounding_keyword_policy).
+# Stop-word-like keywords are rejected whatever their frequency. A keyword whose protected positions exceed
+# MAX_KEYWORD_PROMPT_FRACTION of the prompt is rejected. Accepted protection that still exceeds the budget is
+# handled by the existing INFEASIBLE semantics in plan_starlight_layer (never silently dropped).
+KEYWORD_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is", "it", "its", "of", "on",
+    "or", "that", "the", "this", "to", "was", "were", "with",
+})
+MAX_KEYWORD_PROMPT_FRACTION = 0.2
+
+
+def grounding_protection_with_report(
+    pool: Any,
+    prompt_ids: Sequence[int],
+    encode: Any,
+    current_request_id: str,
+    image_sha256: str | None,
+) -> tuple[dict[int, tuple[str, ...]], dict[str, Any]]:
+    """Grounding-protected positions AND the keyword policy report (accepted and rejected keywords).
+
+    Same matching as grounding_protection_from_pool. Each keyword is checked against the breadth policy
+    before any of its positions is protected, so a rejected keyword protects nothing.
+    """
+    report: dict[str, Any] = {
+        "max_keyword_prompt_fraction": MAX_KEYWORD_PROMPT_FRACTION,
+        "stopword_list": sorted(KEYWORD_STOPWORDS),
+        "accepted_keywords": [],
+        "rejected_stopword": [],
+        "rejected_breadth": [],
+    }
     if pool is None:
-        return {}
+        return {}, report
     verdicts = evidence_validity(pool, current_request_id, image_sha256)
     valid_ids = {eid for eid, (status, _) in verdicts.items() if status == "valid"}
+    n_prompt = len(prompt_ids)
     protected: dict[int, set[str]] = {}
-    for keyword, evidence_ids in pool.keyword_index().items():
+    for keyword, evidence_ids in sorted(pool.keyword_index().items()):
         supporting = [eid for eid in evidence_ids if eid in valid_ids]
         if not supporting:
             continue
+        if keyword.strip().lower() in KEYWORD_STOPWORDS:
+            report["rejected_stopword"].append(keyword)
+            continue
+        own: dict[int, set[str]] = {}
         variants = {keyword, f" {keyword}", keyword.capitalize(), f" {keyword.capitalize()}"}
         for variant in sorted(variants):
             tokens = list(encode(variant))
             for start in match_token_spans(prompt_ids, tokens):
                 for pos in range(start, start + len(tokens)):
-                    protected.setdefault(pos, set()).update(supporting)
-    return {pos: tuple(sorted(ids)) for pos, ids in sorted(protected.items())}
+                    own.setdefault(pos, set()).update(supporting)
+        fraction = (len(own) / n_prompt) if n_prompt else 0.0
+        if fraction > MAX_KEYWORD_PROMPT_FRACTION:
+            report["rejected_breadth"].append({"keyword": keyword, "protected_fraction": round(fraction, 6)})
+            continue
+        report["accepted_keywords"].append(keyword)
+        for pos, ids in own.items():
+            protected.setdefault(pos, set()).update(ids)
+    return {pos: tuple(sorted(ids)) for pos, ids in sorted(protected.items())}, report
