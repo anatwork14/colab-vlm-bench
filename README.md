@@ -2,6 +2,15 @@
 
 ## Current workflow (November 2026): **Agent-operated Colab CLI**
 
+**Before HF downloads:** read [verified existing Drive layout](docs/EXISTING_DRIVE_LAYOUT.md).
+Previous STARLIGHT datasets reside under
+`MyDrive/Research/Topic/Speculative Decoding/STARLIGHT`; Qwen3.5 weights are
+under `MyDrive/LLM_Weights/models/Qwen`. After mounting a CPU Colab session,
+run `python scripts/colab_agent.py drive-inventory --session vlmb-cpu`.
+The new controller's `Colab-VLM-Bench-Agent/hf/` paths do not automatically
+reuse these roots, so `prepare` can redownload previously staged assets.
+
+
 **No more notebook uploads required.** Agents use the official [Google Colab CLI](https://github.com/googlecolab/google-colab-cli) from their local macOS/Linux terminals, with a CPU Colab session for direct Hugging Face downloads and normalization, then a specifically approved A100 session for Base/MTP annotation and benchmarks. The old two `.ipynb` files are retained under notebook/ only for legacy reference.
 
 [Full agent runbook](docs/AGENT_COLAB_CLI.md) · [Agent entrypoint](scripts/colab_agent.py) · [Pinned HF source module](src/vlmbench/hf_sources.py)

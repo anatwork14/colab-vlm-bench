@@ -140,7 +140,7 @@ def main(argv=None) -> int:
     bootstrap.add_argument("--approve-paid", action="store_true")
     bootstrap.add_argument("--dry-run", action="store_true")
 
-    for name in ("prepare", "status", "annotate", "benchmark", "report"):
+    for name in ("drive-inventory", "prepare", "status", "annotate", "benchmark", "report"):
         sp = sub.add_parser(name, help="Execute one auditable remote job")
         sp.add_argument("--session", required=True)
         sp.add_argument("--drive-root", default=DRIVE_DEFAULT)
@@ -193,7 +193,7 @@ def main(argv=None) -> int:
         command(["colab", "install", "-s", verify_session(args.session),
                  "-r", "requirements-agent-" + args.kind + ".txt"],
                 dry_run=args.dry_run)
-    elif args.action in {"prepare", "status", "annotate", "benchmark", "report"}:
+    elif args.action in {"drive-inventory", "prepare", "status", "annotate", "benchmark", "report"}:
         remote_job(args)
     elif args.action == "pull":
         command(["colab", "download", "-s", verify_session(args.session),

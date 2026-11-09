@@ -9,6 +9,7 @@ from .config import load_config
 from .datasets import normalize_memlens, normalize_mmlong
 from .engine import a100_inventory, server_argv, start_server, stop_server, wait_ready
 from .hf_sources import DATASETS, MODELS, _qa_file, fetch_dataset, fetch_model
+from .drive_inventory import inspect_existing_drive
 from .notebook_bridge import build_serving_candidates, write_local_campaign
 from .preflight import assess_resources, checkpoint_inventory, host_resources
 
@@ -274,6 +275,9 @@ def report(job: dict) -> dict:
 
 def execute(job: dict) -> dict:
     action = job["action"]
+    if action == "drive-inventory":
+        # A read-only, CPU-only source discovery action: no downloads or vLLM.
+        return inspect_existing_drive()
     if action == "prepare":
         return prepare(job)
     if action == "annotate":

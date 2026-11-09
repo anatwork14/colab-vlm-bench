@@ -2,6 +2,32 @@
 
 **Status: CODE_READY_FOR_CPU_TESTS; NOT GPU QUALIFIED.** This workflow supersedes the two uploadable notebooks for new work. The notebooks are retained as legacy references, not deleted. Agents must use the official Google Colab CLI documented at https://github.com/googlecolab/google-colab-cli and this repository's source-pinned controller.
 
+## Existing STARLIGHT Drive sources — inspect before downloading
+
+Historical dataset root from the previous Colab notebook and CPU runbook:
+`/content/drive/MyDrive/Research/Topic/Speculative Decoding/STARLIGHT`.
+Qwen model checkpoints live in a **different** tree:
+`/content/drive/MyDrive/LLM_Weights/models/Qwen/Qwen3.5-{0.8B,4B}`.
+The folders were found in live Drive metadata; source-file completeness
+remains unqualified until Colab checks SHA/revision, tokenizer and media.
+
+**Mandatory first command after mounting Drive on a CPU session:**
+
+~~~bash
+python scripts/colab_agent.py drive-inventory --session vlmb-cpu
+~~~
+
+This read-only action inspects historical sources and audit folders without
+downloading or writing anything. Review the returned JSON before any
+`prepare` command. The current CLI's
+`/content/drive/MyDrive/Colab-VLM-Bench-Agent` namespace is separate
+and does not yet automatically reuse the STARLIGHT/Qwen legacy roots.
+**Do not run `prepare` assuming cross-root cache reuse.**
+Have Haiku1 validate SHA256, provenance, schema and files first; only
+then implement a non-destructive reuse mapping after Opus review.
+
+Evidence and folder links: [EXISTING_DRIVE_LAYOUT.md](EXISTING_DRIVE_LAYOUT.md).
+
 ## Goals and constraints
 
 - Priority only Qwen3.5-0.8B and Qwen3.5-4B, **Base then native MTP**, on MemLens and MMLongBench-Doc. All five external H2O/DA/ECRD arms remain **BACKEND_UNQUALIFIED**, never simulated.
