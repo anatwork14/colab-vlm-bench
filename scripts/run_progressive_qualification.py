@@ -720,7 +720,8 @@ def compute_release_gates(tests: dict[str, dict[str, Any]], device_name: str) ->
         "ACTUAL_BACKEND_HOOK_PASS": _engine_gate(d, "ACTUAL_BACKEND_HOOK_PASS"),
         "REAL_MODEL_FORWARD_PASS": _combine(_test_status(a), _test_status(b)),
         "REAL_MULTIMODAL_INFERENCE_PASS": _combine(_test_status(c), _test_status(d)),
-        "SEVEN_ARM_PRETRAINED_PASS": _test_status(d),
+        # Hook attachment and tensor coverage over the seven arms. Not inference correctness.
+        "SEVEN_ARM_HOOK_COVERAGE_PASS": _test_status(d),
         "MTP_CORRECTNESS_PASS": _engine_gate(d, "MTP_CORRECTNESS_PASS", arms=MTP_ARMS),
         "MTP_PROPOSAL_DIAGNOSTIC_PASS": _test_status(e),
         "PYTORCH_THREAD_CITATION_LEAK_CHECK": _test_status(g),

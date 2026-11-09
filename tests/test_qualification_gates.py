@@ -58,7 +58,7 @@ def test_all_passing_tests_give_measured_labels():
     assert gates["POLICY_HARNESS_PASS"] == "PASS"
     assert gates["REAL_MODEL_FORWARD_PASS"] == "PASS"
     assert gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS"
-    assert gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS"
+    assert gates["SEVEN_ARM_HOOK_COVERAGE_PASS"] == "PASS"
     assert gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS"
     assert gates["PYTORCH_THREAD_CITATION_LEAK_CHECK"] == "PASS"
     assert "CCU_REQUEST_ISOLATION_TEST_PASS" not in gates
@@ -96,7 +96,7 @@ def test_failed_seven_arm_test_fails_engine_gates():
     tests = _all_passing_tests()
     tests["test_d_seven_arms"] = {"status": "FAIL", "error": "arm mtp broke"}
     gates = qual.compute_release_gates(tests, device_name=GPU)
-    assert gates["SEVEN_ARM_PRETRAINED_PASS"] == "FAIL"
+    assert gates["SEVEN_ARM_HOOK_COVERAGE_PASS"] == "FAIL"
     assert gates["ACTUAL_BACKEND_HOOK_PASS"] == "FAIL"
     assert gates["MTP_CORRECTNESS_PASS"] == "FAIL"
 
@@ -294,3 +294,18 @@ def test_old_ccu_gate_name_is_gone_from_the_script():
     source = SCRIPT.read_text(encoding="utf8")
     assert "CCU_REQUEST_ISOLATION_TEST_PASS" not in source
     assert "PYTORCH_THREAD_CITATION_LEAK_CHECK" in source
+
+
+# ITER2 G-3 (REVIEW_ITER2 §4): the seven-arm release gate records hook attachment and tensor coverage
+# across the seven arms. It does not measure inference correctness; that is the MTP and Test G gates.
+
+def test_seven_arm_gate_is_named_for_what_it_measures():
+    gates = qual.compute_release_gates(_all_passing_tests(), device_name=GPU)
+    assert gates["SEVEN_ARM_HOOK_COVERAGE_PASS"] == "PASS"
+    assert "SEVEN_ARM_PRETRAINED_PASS" not in gates
+
+
+def test_seven_arm_hook_coverage_is_not_a_correctness_claim():
+    source = SCRIPT.read_text(encoding="utf8")
+    assert "SEVEN_ARM_HOOK_COVERAGE_PASS" in source
+    assert "SEVEN_ARM_PRETRAINED_PASS\": _test_status" not in source

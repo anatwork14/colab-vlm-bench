@@ -1625,6 +1625,8 @@ class RealSevenArmEngine:
                 else "GATED_PRETRAINED_CHECKPOINT_REQUIRED"
             ),
             "REAL_MULTIMODAL_INFERENCE_PASS": mm_gate,
+            # Records that the official hooked checkpoint was attached. Hook attachment only, not inference
+            # correctness. The qualification release gate is SEVEN_ARM_HOOK_COVERAGE_PASS.
             "SEVEN_ARM_PRETRAINED_PASS": seven_arm_gate,
             "MTP_CORRECTNESS_PASS": "GATED_NATIVE_MTP_VERIFIER_REQUIRED" if "mtp" in self.method_arm else "NOT_APPLICABLE",
             "MTP_PROPOSAL_DIAGNOSTIC_PASS": "PENDING" if "mtp" in self.method_arm else "NOT_APPLICABLE",
