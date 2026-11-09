@@ -1150,3 +1150,32 @@ def test_r5_official_checkpoint_eos_comes_from_pinned_config():
         assert engine.eos_token_ids == (248044,)
     finally:
         engine.close()
+
+
+# --- R5-5 (auditor R4 §4): label the serving-style mtp arms as diagnostics, no speculation ---
+
+@pytest.mark.parametrize("arm", ["mtp", "h2o_mtp", "da_mtp"])
+def test_r5_serving_mtp_arms_are_labelled_diagnostic_without_speculation(arm):
+    cfg = _p7_small_cfg()
+    engine = RealSevenArmEngine(method_arm=arm, config=cfg, device="cpu")
+    try:
+        res = engine.execute_request(f"r5_label_{arm}", prompt_token_ids=list(range(10, 30)),
+                                     max_new_tokens=3, image_present=False)
+    finally:
+        engine.close()
+    assert res.method_arm == arm, "arm IDs are unchanged"
+    assert res.telemetry["speculation_executed"] is False
+    assert res.telemetry["arm_label"] == "mtp_serving_arm_diagnostic_no_speculation"
+    assert res.mtp_acceptance_rate is None
+
+
+def test_r5_non_mtp_arm_reports_no_speculation_without_mtp_label():
+    cfg = _p7_small_cfg()
+    engine = RealSevenArmEngine(method_arm="base", config=cfg, device="cpu")
+    try:
+        res = engine.execute_request("r5_label_base", prompt_token_ids=list(range(10, 30)),
+                                     max_new_tokens=3, image_present=False)
+    finally:
+        engine.close()
+    assert res.telemetry["speculation_executed"] is False
+    assert res.telemetry["arm_label"] == "non_speculative_arm"
