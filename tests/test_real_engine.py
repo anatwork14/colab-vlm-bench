@@ -268,7 +268,7 @@ def test_all_seven_arms_real_neural_forward_and_gates():
             assert res.telemetry["da_cost_accounting"]["hbm_traffic_reduction_claimed"] is False
         if "mtp" in arm:
             assert res.gates["MTP_CORRECTNESS_PASS"] == "GATED_NATIVE_MTP_VERIFIER_REQUIRED"
-    assert res.gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS"
+            assert res.gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS"
 
         engine.close()
 

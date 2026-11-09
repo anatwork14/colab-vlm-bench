@@ -610,7 +610,7 @@ def main() -> None:
         receipt["tests"]["test_g_ccu_concurrency"] = run_test_g_ccu_concurrency(args.model_dir, device=args.device)
 
         total_duration = time.perf_counter() - overall_t0
-        receipt["qualification_verdict"] = "ALL_TESTS_QUALIFIED"
+        receipt["qualification_verdict"] = "PRETRAINED_FORWARD_AND_MTP_PROPOSAL_DIAGNOSTIC_ONLY"
         receipt["total_duration_s"] = round(total_duration, 3)
 
         receipt["release_gates"] = {
