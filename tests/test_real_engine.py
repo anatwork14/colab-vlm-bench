@@ -687,3 +687,56 @@ def test_p7_r3_low_coverage_partial_checkpoint_never_passes_real_forward_gates(t
     assert res.gates["REAL_MODEL_FORWARD_PASS"] == "PARTIAL_COVERAGE_NOT_QUALIFIED"
     assert engine.pretrained_weight_summary["parameter_coverage_ratio"] < 0.15
     engine.close()
+
+
+def test_p7_r3_da_constructed_official_case_masks_real_reads_to_exact_zero():
+    """R3-3 / D1: a constructed official-checkpoint case where scripted DA restricts reads
+    OUTSIDE the readable sink and question span, and every masked key receives exactly zero
+    attention weight in the real hooked forward. Decode-only scripted DA diagnostic."""
+    from pathlib import Path
+
+    ckpt = Path("/mnt/ssd/genos2/research_workspace/models/Qwen/Qwen3.5-0.8B")
+    if not (ckpt / "config.json").is_file():
+        pytest.skip(f"Official Qwen3.5-0.8B checkpoint not present at {ckpt}")
+
+    engine = RealSevenArmEngine(method_arm="da_base", device="cpu", checkpoint_dir=ckpt)
+    calls: list[dict] = []
+    orig_forward = engine.model.forward
+
+    def _spy(input_ids, *args, **kwargs):
+        out = orig_forward(input_ids, *args, **kwargs)
+        calls.append({
+            "input_ids": input_ids.detach().clone(),
+            "q": input_ids.shape[1],
+            "da_masks": kwargs.get("da_masks"),
+            "attn": out["attention_matrices"],
+        })
+        return out
+
+    engine.model.forward = _spy
+    res = engine.execute_request("p7_r3_da_constructed", max_new_tokens=14, image_present=True)
+    cfg = engine.config
+    ids = calls[0]["input_ids"][0].tolist()
+    ve_last = len(ids) - 1 - ids[::-1].index(cfg.vision_end_token_id)
+    question_start = ve_last + 1
+    sink_end = min(16, max(1, len(ids) // 4))
+
+    assert res.attention_mask_restriction_ratio > 0.0, "constructed case did not restrict any read"
+    assert res.gates["DA_MASKING_EXERCISED"] == "PASS"
+
+    checked_masked = 0
+    for call in calls[1:]:
+        if not call["da_masks"]:
+            continue
+        for l_idx, mask in call["da_masks"].items():
+            row = mask[-1].cpu().numpy()  # decode-step query row
+            weights = call["attn"][l_idx][0, :, -1, :].float().cpu().numpy()
+            masked = np.where(~row)[0]
+            for k in masked:
+                assert k >= sink_end and k >= question_start, (
+                    f"masked key {k} lies inside the sink or readable question span")
+                assert np.all(weights[:, k] == 0.0), (
+                    f"masked key {k} received nonzero attention {weights[:, k]}")
+                checked_masked += 1
+    assert checked_masked > 0, "no masked key was verified against real attention weights"
+    engine.close()
