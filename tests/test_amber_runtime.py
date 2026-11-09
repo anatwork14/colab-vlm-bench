@@ -95,6 +95,41 @@ def test_historical_prepare_preserves_originals_and_never_downloads(tmp_path, mo
         agent_pipeline.prepare(job)
 
 
+@pytest.mark.parametrize("extra,allowed", [
+    ("starlight_checkpoint_inventory.json", True),
+    ("nested/starlight_checkpoint_inventory.json", False),
+    ("starlight_extra.safetensors", False), ("starlight_extra.bin", False),
+    ("starlight_extra.pt", False), ("starlight_tokenizer.json", False),
+    ("starlight_processor.json", False), ("starlight_extra.py", False),
+    (".hidden.safetensors", False), (".hidden.json", False),
+])
+def test_only_exact_reviewed_model_metadata_may_be_unhashed(tmp_path, monkeypatch, extra, allowed):
+    monkeypatch.setattr(source_mapping, "DRIVE", tmp_path)
+    model, dataset = tmp_path / "model", tmp_path / "dataset"
+    model.mkdir()
+    dataset.mkdir()
+    for name in ("config.json", "tokenizer.json", "model.safetensors"):
+        (model / name).write_bytes(b"source")
+    model_files = {p.name: sha256(p) for p in model.iterdir()}
+    additional = model / extra
+    additional.parent.mkdir(parents=True, exist_ok=True)
+    additional.write_bytes(b"unhashed")
+    (dataset / "query.json").write_text("[]")
+    data = {"model_root": str(model), "dataset_root": str(dataset), "images_root": str(dataset),
+            "query_path": str(dataset / "query.json"), "model_revision": "a" * 40,
+            "model_files": model_files, "dataset_files": {"query.json": sha256(dataset / "query.json")}}
+    if allowed:
+        assert source_mapping.verify_mapping(data)["revision"] == "a" * 40
+        # A weight-index reference makes even this exact name a runtime asset.
+        index = model / "model.safetensors.index.json"
+        index.write_text(json.dumps({"weight_map": {"weight": extra}}))
+        model_files[index.name] = sha256(index)
+    with pytest.raises(ValueError, match="cover every checkpoint file"):
+        source_mapping.verify_mapping(data)
+    model_files[extra] = sha256(additional)
+    assert source_mapping.verify_mapping(data)["revision"] == "a" * 40
+
+
 def test_total_deadline_includes_warmup_and_preserves_cancelled_requests(tmp_path, monkeypatch):
     rows = [{"id": str(i), "messages": [{"role": "user", "content": "Q"}]} for i in range(2)]
     monkeypatch.setattr(bench, "exact_bin_pool", lambda *a, **kw: rows)

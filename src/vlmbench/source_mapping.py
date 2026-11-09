@@ -13,6 +13,8 @@ from .preflight import checkpoint_inventory
 DRIVE = Path("/content/drive/MyDrive")
 MODEL_ROOT = DRIVE / "LLM_Weights/models/Qwen"
 DATASET_ROOT = DRIVE / "Research/Topic/Speculative Decoding/STARLIGHT"
+# Owner-confirmed metadata only, matched against the exact root-relative path.
+MODEL_METADATA_ALLOWLIST = frozenset({"starlight_checkpoint_inventory.json"})
 
 
 def drive_path(value: str) -> Path:
@@ -59,13 +61,25 @@ def verify_mapping(data: dict) -> dict:
         if not isinstance(files, dict) or not files:
             raise ValueError(f"Source map requires nonempty {key} SHA256 inventory")
         if key == "model_files":
+            referenced_shards = set()
+            for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+                index = root / index_name
+                if index.is_file():
+                    index_data = json.loads(index.read_text(encoding="utf8"))
+                    weight_map = index_data.get("weight_map") if isinstance(index_data, dict) else None
+                    if not isinstance(weight_map, dict) or not all(
+                        isinstance(name, str) and name for name in weight_map.values()
+                    ):
+                        raise ValueError("Invalid checkpoint weight index")
+                    referenced_shards.update(weight_map.values())
+            exemptions = MODEL_METADATA_ALLOWLIST - referenced_shards
             actual = {
                 str(p.relative_to(root))
                 for p in root.rglob("*")
-                if p.is_file() and not p.name.startswith("starlight_") and not p.name.startswith(".")
+                if p.is_file() and str(p.relative_to(root)) not in exemptions
             }
-            expected_set = {k for k in files if not k.startswith("starlight_") and not k.startswith(".")}
-            if actual != expected_set:
+            expected_set = set(files) - exemptions
+            if actual != expected_set or not referenced_shards.issubset(files):
                 raise ValueError("Model source map must cover every checkpoint file")
         else:
             image_files = {str(p.relative_to(root)) for p in images_root.rglob("*") if p.is_file()}

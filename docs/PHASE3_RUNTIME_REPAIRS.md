@@ -13,10 +13,13 @@ shell controller, and both remote dispatchers. The flag is not authentication
 or proof that a human personally entered it. Agents must never manufacture paid
 approval when the owner has not granted the particular execution scope.
 
-HF intake refuses detected GPUs, failed/timed-out probes, and unavailable
-`nvidia-smi`. A successful empty probe permits intake. **A CPU session without a
-working hardware probe remains blocked**; registry labels alone do not override
-unknown accelerator state. Read-only Drive inventory remains available.
+HF intake refuses detected GPUs and failed/timed-out probes. A successful empty
+probe permits intake only without contradictory NVIDIA driver/device evidence.
+Without `nvidia-smi`, intake requires no NVIDIA/Tegra driver or device indicators
+and an explicit `torch.cuda.is_available() is False`. Missing torch, probe errors,
+unreadable device indicators or non-boolean CUDA results remain blocked. Registry
+labels alone do not override unknown accelerator state. Read-only Drive inventory
+remains available.
 
 Host invocations carry unique IDs and download artifacts into
 `agent_artifacts/<session>/<invocation_id>/`. Completion requires a fresh
@@ -42,6 +45,12 @@ Required manifest fields:
 | images_root | Inside dataset_root; default MemLens root or AMBER images/ |
 | model_files | Relative file -> SHA256 map covering every checkpoint file |
 | dataset_files | Relative file -> SHA256 map covering query and all image-source files |
+
+The sole owner-confirmed model metadata exemption is the exact root-relative
+`starlight_checkpoint_inventory.json`. Hidden files, other `starlight_*` names,
+nested copies, weights, tokenizer/processor assets and code require hashes. If a
+standard checkpoint index references even the allowlisted filename as weights,
+it loses its exemption and must be covered by the hash inventory.
 
 Paths must stay inside MyDrive. Output namespaces must be separate from original
 sources. Model and dataset originals are read and hashed; receipts, normalized

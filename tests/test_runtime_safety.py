@@ -3,6 +3,7 @@ import asyncio
 import importlib.util
 import json
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -93,6 +94,63 @@ def test_host_rejects_failed_or_stale_result(tmp_path, monkeypatch, bad_result):
 def test_cpu_probe_absence_is_unknown(monkeypatch):
     monkeypatch.setattr("shutil.which", lambda cmd: None)
     with pytest.raises(RuntimeError, match="ACCELERATOR_STATE_UNKNOWN"):
+        pipeline.require_cpu_for_hf_intake()
+
+
+@pytest.mark.parametrize("node", ["nvidia0", "nvidia7", "nvidiactl", "nvidia-uvm",
+                                  "nvidia-uvm-tools", "nvidia-modeset", "nvidia-caps",
+                                  "nvhost-ctrl", "nvhost-gpu"])
+def test_cpu_intake_refuses_nvidia_devices_without_probe_or_torch(monkeypatch, node):
+    monkeypatch.setattr("shutil.which", lambda cmd: None)
+    monkeypatch.setitem(sys.modules, "torch", None)
+    original_lstat = Path.lstat
+    def lstat(path, *args, **kwargs):
+        if str(path) == "/proc/driver/nvidia":
+            raise FileNotFoundError(str(path))
+        return original_lstat(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "lstat", lstat)
+    original_iterdir = Path.iterdir
+    monkeypatch.setattr(Path, "iterdir", lambda path: iter([Path("/dev") / node])
+                        if str(path) == "/dev" else original_iterdir(path))
+    assert str(Path("/dev") / node) in pipeline._accelerator_indicators()
+    with pytest.raises(RuntimeError, match="ACCELERATOR_STATE_UNKNOWN"):
+        pipeline.require_cpu_for_hf_intake()
+
+
+@pytest.mark.parametrize("cuda", [None, False, True, "error", "unknown", 1])
+def test_no_probe_requires_verified_cuda_state(monkeypatch, cuda):
+    monkeypatch.setattr("shutil.which", lambda cmd: None)
+    monkeypatch.setattr(pipeline, "_accelerator_indicators", lambda: [])
+    def cuda_available():
+        if cuda == "error": raise RuntimeError("driver error")
+        if cuda == "unknown": return None
+        return cuda
+    monkeypatch.setitem(sys.modules, "torch", None if cuda is None else
+                        SimpleNamespace(cuda=SimpleNamespace(is_available=cuda_available)))
+    if cuda is False:
+        pipeline.require_cpu_for_hf_intake()
+    else:
+        with pytest.raises(RuntimeError, match="ACCELERATOR_STATE_UNKNOWN|GPU_SESSION_REFUSED"):
+            pipeline.require_cpu_for_hf_intake()
+
+
+def test_unreadable_device_scan_is_unknown(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda cmd: None)
+    def unreadable(path): raise PermissionError("device scan denied")
+    monkeypatch.setattr(Path, "iterdir", unreadable)
+    with pytest.raises(RuntimeError, match="ACCELERATOR_STATE_UNKNOWN"):
+        pipeline.require_cpu_for_hf_intake()
+
+
+@pytest.mark.parametrize("indicators", [[], ["/dev/nvidiactl"]])
+def test_empty_successful_gpu_probe_must_not_contradict_devices(monkeypatch, indicators):
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=0, stdout=""))
+    monkeypatch.setattr(pipeline, "_accelerator_indicators", lambda: indicators)
+    if indicators:
+        with pytest.raises(RuntimeError, match="ACCELERATOR_STATE_UNKNOWN"):
+            pipeline.require_cpu_for_hf_intake()
+    else:
         pipeline.require_cpu_for_hf_intake()
 
 

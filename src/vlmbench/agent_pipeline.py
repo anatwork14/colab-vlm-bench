@@ -86,11 +86,29 @@ def require_prepared(job: dict, paths: dict) -> dict:
     return manifest
 
 
+def _accelerator_indicators() -> list[str]:
+    """Inspect driver and device names without opening accelerator devices."""
+    indicators = []
+    driver = Path("/proc/driver/nvidia")
+    try:
+        try:
+            driver.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            indicators.append(str(driver))
+        # Covers numbered devices, control/UVM nodes, capabilities and Tegra.
+        indicators.extend(str(p) for p in Path("/dev").iterdir()
+                          if p.name.startswith(("nvidia", "nvhost")))
+    except OSError as exc:
+        raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: cannot inspect accelerator devices") from exc
+    return indicators
+
+
 def require_cpu_for_hf_intake() -> None:
     """Block expensive downloads/rendering if an accelerator is attached."""
     import shutil
     import subprocess
-    from pathlib import Path
     if shutil.which("nvidia-smi"):
         try:
             probe = subprocess.run(
@@ -103,18 +121,23 @@ def require_cpu_for_hf_intake() -> None:
             raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: GPU probe failed")
         if probe.stdout.strip():
             raise RuntimeError("GPU_SESSION_REFUSED_FOR_PREPARE: download and render on CPU Colab")
+        if _accelerator_indicators():
+            raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: driver/device evidence contradicts empty probe")
         return
 
     # When nvidia-smi binary is not installed (e.g. standard CPU container):
     # Verify no NVIDIA driver, character devices, or CUDA runtime are present.
-    if Path("/proc/driver/nvidia").exists() or Path("/dev/nvhost-ctrl").exists():
-        raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: NVIDIA driver present but nvidia-smi missing")
+    if _accelerator_indicators():
+        raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: NVIDIA driver/device present but nvidia-smi missing")
     try:
         import torch
-        if torch.cuda.is_available():
-            raise RuntimeError("GPU_SESSION_REFUSED_FOR_PREPARE: download and render on CPU Colab")
-    except ImportError:
-        pass
+        cuda_available = torch.cuda.is_available()
+    except Exception as exc:
+        raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: CUDA state cannot be verified") from exc
+    if cuda_available is True:
+        raise RuntimeError("GPU_SESSION_REFUSED_FOR_PREPARE: download and render on CPU Colab")
+    if cuda_available is not False:
+        raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: CUDA probe did not return a boolean")
 
 
 def prepare(job: dict) -> dict:
