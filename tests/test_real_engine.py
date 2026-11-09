@@ -1060,3 +1060,93 @@ def test_r5_h2o_arm_reports_method_variant_and_keeps_arm_ids():
     for required in ("h2o_visual_anchor_text_budget", "min_budget", "per KV head",
                      "NOT_IMPLEMENTED_OWNER_DECISION", "sinks", "protected", "ratio"):
         assert required in doc, f"H2O_DEVIATIONS.md must mention {required!r}"
+
+
+# --- R5-4 (auditor A2-11): natural EOS stop, identical across ALL arms (protocol methods.py:
+# quality track native_full_context, natural_eos True). ---
+
+_R5_ALL_ARMS = ["base", "h2o_base", "da_base", "ecrd_base", "mtp", "h2o_mtp", "da_mtp"]
+
+
+def _r5_force_eos_at_call(engine, call_index, eos_id):
+    """Add a large bias to the EOS logit on forward call `call_index` (0 = prefill, k = decode step k)."""
+    orig_forward = engine.model.forward
+    counter = {"n": 0}
+
+    def _forced(*args, **kwargs):
+        out = orig_forward(*args, **kwargs)
+        if counter["n"] == call_index:
+            logits = out["logits"].clone()
+            logits[:, eos_id] += 1e4
+            out["logits"] = logits
+        counter["n"] += 1
+        return out
+
+    engine.model.forward = _forced
+
+
+@pytest.mark.parametrize("arm", _R5_ALL_ARMS)
+def test_r5_forced_eos_stops_every_arm_with_the_unforced_prefix(arm):
+    cfg = _p7_small_cfg()
+    prompt = list(range(10, 30))
+    eos = cfg.eos_token_id
+    torch.manual_seed(1234)
+    unforced_engine = RealSevenArmEngine(method_arm=arm, config=cfg, device="cpu")
+    try:
+        unforced = unforced_engine.execute_request(f"r5_unforced_{arm}", prompt_token_ids=prompt,
+                                                   max_new_tokens=8, image_present=False).tokens_generated
+    finally:
+        unforced_engine.close()
+    assert len(unforced) == 8 and eos not in unforced, "precondition: EOS must not occur naturally"
+
+    torch.manual_seed(1234)
+    engine = RealSevenArmEngine(method_arm=arm, config=cfg, device="cpu")
+    _r5_force_eos_at_call(engine, call_index=3, eos_id=eos)
+    try:
+        res = engine.execute_request(f"r5_forced_{arm}", prompt_token_ids=prompt,
+                                     max_new_tokens=8, image_present=False)
+    finally:
+        engine.close()
+    assert res.tokens_generated == unforced[:3], "EOS must stop the stream after the prefix, EOS excluded"
+    gen = res.telemetry["generation"]
+    assert gen["stop_reason"] == "eos"
+    assert gen["eos_token_ids"] == [eos]
+    assert gen["eos_token_excluded_from_output"] is True
+
+
+def test_r5_forced_eos_on_prefill_token_gives_empty_output():
+    cfg = _p7_small_cfg()
+    torch.manual_seed(1234)
+    engine = RealSevenArmEngine(method_arm="base", config=cfg, device="cpu")
+    _r5_force_eos_at_call(engine, call_index=0, eos_id=cfg.eos_token_id)
+    try:
+        res = engine.execute_request("r5_eos_prefill", prompt_token_ids=list(range(10, 30)),
+                                     max_new_tokens=8, image_present=False)
+    finally:
+        engine.close()
+    assert res.tokens_generated == []
+    assert res.telemetry["generation"]["stop_reason"] == "eos"
+
+
+def test_r5_stop_at_eos_false_keeps_fixed_length_for_latency_runs():
+    cfg = _p7_small_cfg()
+    torch.manual_seed(1234)
+    engine = RealSevenArmEngine(method_arm="base", config=cfg, device="cpu", stop_at_eos=False)
+    _r5_force_eos_at_call(engine, call_index=3, eos_id=cfg.eos_token_id)
+    try:
+        res = engine.execute_request("r5_fixed_len", prompt_token_ids=list(range(10, 30)),
+                                     max_new_tokens=8, image_present=False)
+    finally:
+        engine.close()
+    assert len(res.tokens_generated) == 8
+    assert res.telemetry["generation"]["stop_at_eos"] is False
+    assert res.telemetry["generation"]["stop_reason"] == "max_new_tokens"
+
+
+def test_r5_official_checkpoint_eos_comes_from_pinned_config():
+    ckpt = _r5_official_ckpt()
+    engine = RealSevenArmEngine(method_arm="base", device="cpu", checkpoint_dir=ckpt)
+    try:
+        assert engine.eos_token_ids == (248044,)
+    finally:
+        engine.close()
