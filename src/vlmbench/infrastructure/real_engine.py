@@ -51,6 +51,11 @@ from .model_config import Qwen35ModelConfig, load_model_config
 from .h2o import H2OConfig, H2OCacheTracker, H2OMTPTransaction
 from .declarative_attention import DAConfig, DAFSM, DAMaskGenerator, DATag, DATagType
 from .grounding_evidence import ECRDConfig, EvidencePool, EvidenceItem, ECRDLogitsProcessor
+from .starlight import (
+    STATUS_INFEASIBLE, StarlightLayerPlan, combine_summaries, compact_orig_positions,
+    da_protection_from_spans, evidence_validity, grounding_protection_from_pool,
+    plan_starlight_layer, summarize_plans,
+)
 from .adapters import HardwareGateError, check_vllm_hardware_compatibility
 
 
@@ -941,7 +946,7 @@ def _da_masking_gate(
     PASS needs all three: a constructed restriction (> 0), masked entries MEASURED in the hooked
     forward, and every measured masked weight exactly 0.0. A constructed mask alone never passes.
     """
-    if "da" not in method_arm:
+    if method_arm not in DA_MASKING_ARMS:
         return "NOT_APPLICABLE"
     if restriction_ratio is not None and restriction_ratio == 0.0:
         return "NOT_EXERCISED_NO_RESTRICTED_READS"
@@ -984,6 +989,28 @@ def _da_scripted_tags(
     return tags
 
 
+# STARLIGHT Stage 1 (cpu_pytorch_reference_not_vllm): arm -> enabled controller signals.
+# The seven original arms are not in this map; their behaviour is unchanged.
+STARLIGHT_ARM_SIGNALS: dict[str, tuple[str, ...]] = {
+    "starlight_s1": ("da", "grounding"),
+    "starlight_s1_no_da": ("grounding",),
+    "starlight_s1_no_grounding": ("da",),
+}
+STARLIGHT_MEASUREMENT_LABEL = "cpu_pytorch_reference_not_vllm"
+# Arms that run the DA attention mask. Exact membership, never a substring test: the name
+# "starlight_s1_no_da" contains "da" but is a protection-only ablation and must not build a mask.
+DA_MASKING_ARMS: tuple[str, ...] = ("da_base", "da_mtp")
+
+
+def _image_sha256(image_bytes: bytes | None, image_path: str | Path | None) -> str | None:
+    """SHA256 of the request's image source, or None when no source is available."""
+    if image_bytes is not None:
+        return hashlib.sha256(bytes(image_bytes)).hexdigest()
+    if image_path is not None:
+        return hashlib.sha256(Path(image_path).read_bytes()).hexdigest()
+    return None
+
+
 # --- 2. Production Seven-Arm Engine with True Backend Interventions ---
 
 @dataclass
@@ -1022,6 +1049,9 @@ class RealSevenArmEngine:
         "mtp",
         "h2o_mtp",
         "da_mtp",
+        "starlight_s1",
+        "starlight_s1_no_da",
+        "starlight_s1_no_grounding",
     ))
 
     def __init__(
@@ -1092,8 +1122,10 @@ class RealSevenArmEngine:
         # min_budget is the floor of the per-layer budget. With a fixed budget it can dominate on
         # short prompts (see docs/H2O_DEVIATIONS.md). Default 32 is unsourced and kept as-is.
         self.h2o_config = H2OConfig(budget_ratio=h2o_budget_ratio, min_budget=h2o_min_budget)
-        self.da_fsm = DAFSM() if "da" in self.method_arm else None
-        self.da_mask_gen = DAMaskGenerator() if "da" in self.method_arm else None
+        # STARLIGHT arms are protection-only ablations of the H2O tracker; None for the seven.
+        self.starlight_signals: tuple[str, ...] | None = STARLIGHT_ARM_SIGNALS.get(method_arm)
+        self.da_fsm = DAFSM() if method_arm in DA_MASKING_ARMS else None
+        self.da_mask_gen = DAMaskGenerator() if method_arm in DA_MASKING_ARMS else None
         self.ecrd_processors: dict[str, ECRDLogitsProcessor] = {}
 
     def close(self) -> None:
@@ -1387,6 +1419,60 @@ class RealSevenArmEngine:
             "speed_claim": None,
         }
 
+    def _starlight_build_step_plans(
+        self,
+        tracker: H2OCacheTracker,
+        k_lens: dict[int, int],
+        orig_positions: dict[int, np.ndarray],
+        appended_position: int,
+        budget_total: int,
+        da_spans: Sequence[tuple[str, int, int]],
+        grounding_positions: dict[int, tuple[str, ...]],
+        enabled: Sequence[str],
+    ) -> tuple[dict[int, torch.Tensor], dict[int, np.ndarray], list[StarlightLayerPlan]]:
+        """One decode step of STARLIGHT Stage 1 over every full-attention layer (CPU reference).
+
+        Candidate set: H2O's keep choice with NO internal protection, computed at
+        budget - |protected| over all physical entries. The controller then vetoes candidates
+        that are protected. Recurrent layers are not in full_attention_layers and are never planned.
+        `orig_positions[l]` holds each physical slot's ORIGINAL token position, so protection
+        follows the token through compaction.
+        """
+        enabled_t = tuple(enabled)
+        plans_tensor: dict[int, torch.Tensor] = {}
+        next_orig: dict[int, np.ndarray] = {}
+        step_plans: list[StarlightLayerPlan] = []
+        for l_idx in self.config.full_attention_layers:
+            k_len = int(k_lens[l_idx])
+            prev = np.asarray(orig_positions[l_idx], dtype=np.int64)
+            if prev.shape[0] != k_len - 1:
+                raise RuntimeError(
+                    f"STARLIGHT position bookkeeping out of sync on layer {l_idx}: "
+                    f"{prev.shape[0]} tracked vs {k_len - 1} cached entries"
+                )
+            orig = np.asarray(compact_orig_positions(prev, None, appended=appended_position), dtype=np.int64)
+            da_slots = da_protection_from_spans(da_spans, orig) if "da" in enabled_t else {}
+            grounding_spans = [
+                (label, pos, pos + 1) for pos, labels in grounding_positions.items() for label in labels
+            ]
+            gr_slots = da_protection_from_spans(grounding_spans, orig) if "grounding" in enabled_t else {}
+            if k_len <= budget_total:
+                candidates: list[int] = []  # within budget: nothing to evict
+            else:
+                n_protected = len(set(da_slots) | set(gr_slots))
+                effective = budget_total - n_protected if n_protected <= budget_total else 0
+                keep = tracker.keep_mask_without_protection(l_idx, k_len, effective)
+                candidates = np.flatnonzero(~keep).tolist()
+            plan = plan_starlight_layer(
+                layer=l_idx, length=k_len, budget=budget_total, h2o_candidates=candidates,
+                signals={"da": da_slots, "grounding": gr_slots}, enabled_signals=enabled_t,
+            )
+            retained = np.asarray(plan.retained, dtype=np.int64)
+            plans_tensor[l_idx] = torch.as_tensor(retained, dtype=torch.long, device=self.device)
+            next_orig[l_idx] = orig[retained]
+            step_plans.append(plan)
+        return plans_tensor, next_orig, step_plans
+
     def execute_request(
         self,
         request_id: str,
@@ -1456,7 +1542,13 @@ class RealSevenArmEngine:
             "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH",
         }
 
-        tracker = self._get_or_create_h2o_tracker(request_id, reset=True) if "h2o" in self.method_arm else None
+        starlight_active = self.starlight_signals is not None
+        tracker = (
+            self._get_or_create_h2o_tracker(request_id, reset=True)
+            if ("h2o" in self.method_arm or starlight_active) else None
+        )
+        # The H2O budget/plan path is for h2o arms only; STARLIGHT arms use their own plan.
+        h2o_plan_active = tracker is not None and not starlight_active
         if tracker is not None:
             is_vis = [
                 t in (
@@ -1482,6 +1574,60 @@ class RealSevenArmEngine:
         if image_present and self.config.vision_end_token_id in full_prompt:
             da_question_start = len(full_prompt) - 1 - full_prompt[::-1].index(self.config.vision_end_token_id) + 1
 
+        starlight_enabled: tuple[str, ...] = self.starlight_signals or ()
+        starlight_budget = 0
+        starlight_orig: dict[int, np.ndarray] = {}
+        starlight_da_spans: list[tuple[str, int, int]] = []
+        starlight_grounding: dict[int, tuple[str, ...]] = {}
+        starlight_grounding_status = "NOT_STARTED" if "grounding" in starlight_enabled else "DISABLED_ABLATION"
+        starlight_verdicts: dict[str, list[str]] = {}
+        starlight_summaries: list[dict[str, Any]] = []
+        starlight_max_retained = 0
+        starlight_text_fraction: float | None = None
+        starlight_text_positions: np.ndarray | None = None
+        starlight_next_orig: dict[int, np.ndarray] = {}
+        if starlight_active:
+            # Total budget per full-attention layer, fixed from the prefill length (as H2O does).
+            starlight_budget = max(self.h2o_config.min_budget, int(len(full_prompt) * self.h2o_config.budget_ratio))
+            starlight_orig = {l: np.arange(len(full_prompt), dtype=np.int64) for l in self.config.full_attention_layers}
+            visual_ids = {
+                self.config.image_token_id, self.config.vision_start_token_id, self.config.vision_end_token_id,
+            }
+            starlight_text_positions = np.asarray(
+                [i for i, t in enumerate(full_prompt) if t not in visual_ids], dtype=np.int64,
+            )
+            if "da" in starlight_enabled:
+                # SCRIPTED DIAGNOSTIC DA scope, anchored to the prefill. Only GLOBAL (sink, question) and
+                # FOCUS spans protect; the LOCAL window is a mask-only scope and does not protect.
+                for tag in _da_scripted_tags(
+                    anchor_len=da_anchor_len, phys_len=da_anchor_len, n_visual=da_n_visual,
+                    image_present=image_present, question_start=da_question_start,
+                ):
+                    if tag.tag_type == DATagType.GLOBAL:
+                        label = "sink_global" if tag.start_idx == 0 else "question_global"
+                    elif tag.tag_type == DATagType.FOCUS:
+                        label = f"focus:{tag.focus_id}"
+                    else:
+                        continue
+                    starlight_da_spans.append((label, tag.start_idx, tag.end_idx))
+            if "grounding" in starlight_enabled:
+                image_sha = _image_sha256(image_bytes, image_path) if image_present else None
+                if evidence_pool is None:
+                    starlight_grounding_status = "NO_EVIDENCE_DECLARED"
+                else:
+                    starlight_verdicts = {
+                        eid: list(verdict) for eid, verdict in
+                        evidence_validity(evidence_pool, request_id, image_sha).items()
+                    }
+                    if self.tokenizer is None:
+                        starlight_grounding_status = "UNAVAILABLE_NO_TOKENIZER"
+                    elif image_present and image_sha is None:
+                        starlight_grounding_status = "NOT_PROTECTED_IMAGE_SOURCE_UNKNOWN"
+                    else:
+                        starlight_grounding = grounding_protection_from_pool(
+                            evidence_pool, full_prompt, self.tokenizer.encode, request_id, image_sha,
+                        )
+                        starlight_grounding_status = "ACTIVE"
         tokens_generated: list[int] = []
         step_latencies: list[float] = []
         ttft_ms = 0.0
@@ -1536,7 +1682,7 @@ class RealSevenArmEngine:
         forward_path_executed = prefill_out["forward_path"]
 
         # Fix each full-attention layer's H2O budget from the PREFILL length, once.
-        if tracker is not None:
+        if h2o_plan_active:
             for l_idx in self.config.full_attention_layers:
                 tracker.initialize_budget(l_idx, len(full_prompt))
             h2o_slots_at_prefill = len(self.config.full_attention_layers) * len(full_prompt)
@@ -1609,7 +1755,28 @@ class RealSevenArmEngine:
 
             # 2. H2O physical eviction plans for full-attention layers coordinated with physical KV length
             h2o_eviction_plans: dict[int, torch.Tensor] = {}
-            if tracker is not None:
+            if starlight_active:
+                k_lens: dict[int, int] = {}
+                for l_idx in self.config.full_attention_layers:
+                    if self.model.hf_forward_active and past_kv is not None:
+                        k_lens[l_idx] = past_kv.layers[l_idx].keys.shape[2] + 1
+                    elif past_kv is not None and past_kv[l_idx] is not None:
+                        k_lens[l_idx] = past_kv[l_idx][0].shape[2] + 1
+                    else:
+                        k_lens[l_idx] = curr_len
+                h2o_eviction_plans, starlight_next_orig, step_plans = self._starlight_build_step_plans(
+                    tracker, k_lens, starlight_orig, curr_len - 1, starlight_budget,
+                    starlight_da_spans, starlight_grounding, starlight_enabled,
+                )
+                starlight_summaries.append(summarize_plans(step_plans))
+                starlight_max_retained = max(starlight_max_retained, max(len(p.retained) for p in step_plans))
+                if starlight_text_positions is not None and starlight_text_positions.size:
+                    starlight_text_fraction = float(np.mean([
+                        np.isin(starlight_next_orig[l_idx], starlight_text_positions).sum()
+                        / starlight_text_positions.size
+                        for l_idx in self.config.full_attention_layers
+                    ]))
+            if h2o_plan_active:
                 step_evicted = 0
                 step_total = 0
                 step_retained = 0
@@ -1680,6 +1847,8 @@ class RealSevenArmEngine:
                             retained_np = h2o_eviction_plans[l_idx].cpu().numpy()
                             tracker.compact_layer_state(l_idx, retained_np)
                         tracker.update_attention_scores(l_idx, attn_w[0].float().cpu().numpy())
+                if starlight_active:
+                    starlight_orig = starlight_next_orig
 
                 for telem in out["layer_telemetries"]:
                     if "physical_bytes_freed" in telem:
@@ -1759,10 +1928,10 @@ class RealSevenArmEngine:
         output_str = decoded_str if decoded_str else f"Decoded {len(tokens_generated)} committed tokens via {self.method_arm}"
 
         # P1-03: Strictly separate H2O physical KV eviction from DA logical attention mask restriction
-        if "da" in self.method_arm and "h2o" not in self.method_arm:
+        if self.method_arm in DA_MASKING_ARMS and "h2o" not in self.method_arm:
             total_physical_freed = 0
 
-        return RealExecutionResult(
+        result = RealExecutionResult(
             method_arm=self.method_arm,
             tokens_generated=tokens_generated,
             output_text=output_str,
@@ -1905,10 +2074,10 @@ class RealSevenArmEngine:
                         ["question_span_global"] if da_question_start is not None else []
                     ),
                     "original_paper_protocol_qualified": False,
-                    "physical_kv_bytes_freed": 0 if "da" in self.method_arm else total_physical_freed,
-                    "kv_residency_preserved_ratio": 1.0 if "da" in self.method_arm else (
+                    "physical_kv_bytes_freed": 0 if self.method_arm in DA_MASKING_ARMS else total_physical_freed,
+                    "kv_residency_preserved_ratio": 1.0 if self.method_arm in DA_MASKING_ARMS else (
                         round(h2o_final_retained_fraction, 4) if h2o_final_retained_fraction is not None else None),
-                    "kv_residency_preserved_pct": 100.0 if "da" in self.method_arm else (
+                    "kv_residency_preserved_pct": 100.0 if self.method_arm in DA_MASKING_ARMS else (
                         round(h2o_final_retained_fraction * 100.0, 2) if h2o_final_retained_fraction is not None else None),
                     "physical_kv_read_saving_claimed": False,
                     "hbm_traffic_reduction_claimed": False,
@@ -1919,3 +2088,56 @@ class RealSevenArmEngine:
                 },
             },
         )
+        if starlight_active:
+            summary = combine_summaries(starlight_summaries)
+            grounding_by_evidence: dict[str, int] = {}
+            for labels in starlight_grounding.values():
+                for eid in labels:
+                    grounding_by_evidence[eid] = grounding_by_evidence.get(eid, 0) + 1
+            result.telemetry["h2o_logical_selection_accounting"] = {
+                "method_variant": "NOT_APPLICABLE_STARLIGHT_ARM",
+                "note": "STARLIGHT arms report telemetry['starlight']; H2O budget fields are not used.",
+            }
+            result.telemetry["starlight"] = {
+                "measurement_label": STARLIGHT_MEASUREMENT_LABEL,
+                "method_variant": f"starlight_stage1::{'+'.join(starlight_enabled)}",
+                "method_variant_is_upstream_h2o": False,
+                "signals_enabled": list(starlight_enabled),
+                "da_signal": (
+                    "SCRIPTED_DIAGNOSTIC_NOT_MODEL_DECLARED" if "da" in starlight_enabled else "DISABLED_ABLATION"
+                ),
+                "grounding_signal_status": starlight_grounding_status,
+                "grounding_evidence_verdicts": starlight_verdicts,
+                "grounding_protected_by_evidence": grounding_by_evidence,
+                "candidate_basis": "H2O keep set over all positions with NO internal protection, at budget - protected",
+                "budget_total": starlight_budget,
+                "budget_basis": (
+                    "max(min_budget, int(prefill_len * budget_ratio)) total retained entries per full-attention "
+                    "layer; protected entries are reserved inside the budget"
+                ),
+                "layers": list(self.config.full_attention_layers),
+                "recurrent_layers_exempt": list(self.config.recurrent_layers),
+                "recurrent_exemption_label": "RECURRENT_STATE_NOT_TOKEN_ADDRESSABLE_KV",
+                "steps": summary["steps"],
+                "status_counts": summary["status_counts"],
+                "infeasible_steps": summary["status_counts"].get(STATUS_INFEASIBLE, 0),
+                "evicted_total": summary["evicted_total"],
+                "retained_total": summary["retained_total"],
+                "max_retained_per_layer_step": starlight_max_retained,
+                "h2o_candidates_vetoed": summary["h2o_candidates_vetoed"],
+                "conflicts_resolved_by_protection": summary["conflicts_resolved_by_protection"],
+                "conflicts_by_source": summary["conflicts_by_source"],
+                "protected_count_by_source": summary["protected_count_by_source"],
+                "protected_count_basis": "entry x full-attention-layer x decode-step, summed over steps",
+                "invariant_protected_evicted": summary["protected_evicted"],
+                "invariant_evicted_not_candidate": summary["evicted_not_candidate"],
+                "text_side_retained_fraction_last_step": (
+                    round(starlight_text_fraction, 4) if starlight_text_fraction is not None else None
+                ),
+                "physical_vram_saving_claimed": False,
+                "limitation": (
+                    "CPU PyTorch reference, not vLLM. Scripted DA geometry, token-level keyword matching, "
+                    "text-side retention only. No speed or VRAM claim."
+                ),
+            }
+        return result

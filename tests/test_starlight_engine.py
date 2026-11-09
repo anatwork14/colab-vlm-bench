@@ -209,7 +209,7 @@ def test_malformed_evidence_declaration_is_rejected_before_any_protection():
     bad = EvidenceItem(evidence_id="ev_bad", modality="text_span", content="the",
                        source_sha256="not-a-sha", verified=True)
     pool = EvidencePool("r_bad")
-    with pytest.raises(ValueError, match="sha256"):
+    with pytest.raises(ValueError, match="SHA256"):
         pool.add_evidence(bad, keywords=["the"])
     assert pool.total_items == 0
 
@@ -292,4 +292,4 @@ def test_combine_summaries_adds_steps_and_keeps_invariant_counts():
     assert total["h2o_candidates_vetoed"] == 2 * one["h2o_candidates_vetoed"]
     assert total["evicted_total"] == 2 * one["evicted_total"]
     assert total["protected_evicted"] == 0 and total["evicted_not_candidate"] == 0
-    assert total["status_counts"] == {STATUS_OK: 2}
+    assert total["status_counts"] == {STATUS_OK: 4}  # 2 steps x 2 full-attention layers
