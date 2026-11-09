@@ -26,7 +26,9 @@ from vlmbench.infrastructure.starlight import (
 )
 
 SEVEN_ARMS = frozenset(("base", "h2o_base", "da_base", "ecrd_base", "mtp", "h2o_mtp", "da_mtp"))
-STARLIGHT_ARMS = frozenset(("starlight_s1", "starlight_s1_no_da", "starlight_s1_no_grounding"))
+STARLIGHT_ARMS = frozenset((
+    "starlight_s1", "starlight_s1_no_da", "starlight_s1_no_grounding", "starlight_s1_mtp",
+))  # Stage 2(b): + starlight_s1_mtp
 SHA = hashlib.sha256(b"no-image").hexdigest()
 
 
@@ -84,7 +86,7 @@ def _step(engine, tracker, length, budget, da_spans=(), grounding=None, enabled=
 
 # --- arm registry -------------------------------------------------------------------------
 
-def test_supported_arms_adds_three_starlight_arms_and_keeps_the_seven():
+def test_supported_arms_adds_four_starlight_arms_and_keeps_the_seven():
     assert RealSevenArmEngine.SUPPORTED_ARMS == SEVEN_ARMS | STARLIGHT_ARMS
 
 
