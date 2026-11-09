@@ -6,14 +6,15 @@
 
 | Gate | Why | Owner / status |
 |---|---|---|
-| **G-A** `run_job` must not skip failed or stale cell receipts (ledger F-05) | Otherwise Base and MTP lose different cells and the pairing is biased | `cli.py` owner. Diff in ledger §5.1. **OPEN.** |
-| **G-B** A run with non-PASS cells must not report success (F-06) | `GPU_JOB_FINISHED` / `ACTION_COMPLETED` currently appear even when every cell fails | `cli.py`, `agent_pipeline.py`, `scripts/colab_agent_remote.py`. Diff in ledger §5.2. **OPEN.** |
-| **G-C** Do not use `colab_controller.sh --publish` or `remote_entry.py` (F-07) | Pushes from a paid helper; no bundle digest on the legacy path | Lead. **OPEN.** Use the agent CLI only. |
-| **G-D** Revisions and checksums pinned (F-13, F-14, §6 of the manifest) | Otherwise the run is not reproducible | Owner. **OPEN.** |
+| **G-A** `run_job` must not skip failed or stale cell receipts (ledger F-05) | Otherwise Base and MTP lose different cells and the pairing is biased | **CODE FIXED** `92c8b68`: only COMPLETED receipts are skipped. Non-completed receipts stop the job before GPU (`BLOCKED_NONCOMPLETE_RECEIPTS`, rc 2). `--requeue-nonpass` quarantines them (nothing deleted) and re-runs those cells. Independent review **OPEN**. |
+| **G-B** A run with non-PASS cells must not report success (F-06) | Before the fix, `GPU_JOB_FINISHED` / `ACTION_COMPLETED` appeared even when every cell failed | **CODE FIXED** `00260cc`: distinct statuses and exit codes in `run_status.json` (see §2 step 6). The wrapper returns `ACTION_FAILED` on any non-zero exit. Independent review **OPEN**. |
+| **G-C** Do not use `colab_controller.sh --publish` or `remote_entry.py` (F-07) | Pushed from a paid helper; no bundle digest on the legacy path | **CODE FIXED** `4975562`: the controller never commits or pushes, and `--publish` is refused. `remote_entry.py` checks the bundle digest and uses PYTHONPATH, with no runtime `pip install`. The legacy path remains **not recommended**. Use `scripts/colab_agent.py` only. Lead review **OPEN**. |
+| **G-D** Revisions and checksums pinned (F-13, F-14, §6 of the manifest) | Otherwise the run is not reproducible | **OPEN, owner.** `docs/audit/PINNED_INPUTS.md` (generated, `e4a30ae`) lists every model revision as `UNPINNED` and every dataset revision as `BLOCKED`. A fabricated or placeholder SHA is refused by the generator. |
 | **G-E** Independent review of the E2E and proxy-denominator definition changes (`ebbf60d`) | `AGENTS.md` requires an independent reviewer for metric definitions | Lead. **OPEN.** |
 | **G-F** vLLM 0.29.0 and A100 40 GB BF16 verified on the actual session | Not observed in this audit | Verified on the GPU session before benchmark |
+| **G-G** One derivation route per serving pool (ledger F-09) | Two MemLens routes produce different prompts for the same dataset | **CODE FIXED** `573be47`: run-job refuses a derived file with mixed or unlabelled rows (`BLOCKED_MIXED_DERIVATION`, rc 2). Receipts and the job manifest record the label. Review **OPEN**. |
 
-Stop rule: if any gate is open, run only the CPU steps in §1 and §2.
+Stop rule: if any gate is open, run only the CPU steps in §1 and §2. Gates G-A, G-B, G-C and G-G are code-fixed but still need independent review, so paid execution stays blocked.
 
 ## 1. CPU (no GPU charge)
 
@@ -70,12 +71,26 @@ Stop the CPU session when done: `python scripts/colab_agent.py stop --session vl
    python scripts/colab_agent.py benchmark --session vlmb-a100 --model qwen35_08b --dataset memlens \
      --phase pilot --mode mtp  --max-cells 1 --approve-paid
    ```
+   Resume and requeue (G-A): a re-run skips only COMPLETED receipts. Any other existing receipt stops the job before GPU start with `BLOCKED_NONCOMPLETE_RECEIPTS`, and nothing is edited. Re-run with `--requeue-nonpass` (or `benchmark ... --requeue-nonpass`) only after you have read those receipts. Requeued receipts are moved to `quarantine/<UTC stamp>/` locally and on Drive, never deleted.
    After each call, read the cell receipt and `server.log`:
    - `status` must be `PASS_MEASURED` for the cell to count. `PARTIAL_FAILURE`, `ERROR`, `TIMEOUT` are recorded results, not retries.
    - For MTP, confirm the speculative config is active in the server log. Do not infer it from the argv alone.
    - Record `gpu_count_max`, `parse_failures`, `query_failures` from the telemetry block. Any non-zero failure count means the memory peak is not trustworthy for that cell.
    - Record the vLLM KV-cache size from `server.log`. It is **not** collected by the code yet (ledger C3-7).
-6. **Stop rule (pilot).** The engineering pilot stops after the first runtime failure (`cli.py` circuit breaker). Inspect the receipt before continuing. Do not raise timeouts to make a cell pass. An OOM or capacity failure at CCU 32 is a finding, to be reported as such.
+6. **Stop rule (pilot).** The engineering pilot stops after the first runtime failure (`cli.py` circuit breaker, exit 4, `PILOT_STOPPED_ON_FAILURE`). Inspect the receipt before continuing. Do not raise timeouts to make a cell pass. An OOM or capacity failure at CCU 32 is a finding, to be reported as such.
+
+   **Exit codes and statuses** (G-B), written to `run_status.json` as `status` and `exit_code`:
+
+   | Status | Exit | Meaning |
+   |---|---|---|
+   | `COMPLETE` | 0 | Every planned cell is PASS_MEASURED |
+   | `IN_PROGRESS` | 0 | `--max-cells` cap reached, nothing failed; continue with the next call |
+   | `PARTIAL_FAILURE` | 6 | Some cells PASS, some non-PASS remain. Read `counts` and the receipts |
+   | `ALL_ATTEMPTED_FAILED` | 5 | Every cell attempted in this call failed |
+   | `PILOT_STOPPED_ON_FAILURE` | 4 | Engineering circuit breaker fired |
+   | `BLOCKED_*`, `BLOCKED_NONCOMPLETE_RECEIPTS`, `BLOCKED_MIXED_DERIVATION` | 2 | Refused before GPU start |
+
+   Only exit 0 is a success. The remote wrapper reports `ACTION_FAILED` for any non-zero exit. Quality runs map to `QUALITY_ALL_FAILED` (5), `QUALITY_PARTIAL_FAILURE` (6) and `QUALITY_STOPPED_AFTER_REPEATED_FAILURES` (4).
 7. **Quality (last).** Native full-context, natural EOS, CCU 1, `max_model_len 65536`. Skip the step if the quality preflight reports images over `max_images_per_prompt`; that is `BLOCKED_QUALITY_IMAGE_LIMIT`, not a truncation. Official scoring is a separate upstream run.
 8. **Report and export.** Generate the report, pull the small summary, and verify the raw receipts on Drive before stopping the session.
    ```bash
@@ -91,6 +106,7 @@ Stop the CPU session when done: `python scripts/colab_agent.py stop --session vl
 - **Client-side latency only.** TTFT is service-side from the HTTP send. E2E includes the client CCU-slot wait, and excludes vLLM's internal queue, which is not measured (`NOT_MEASURED`).
 - **Peak GPU memory** is sampled every 0.5 s and counts total device use, not allocated or KV bytes.
 - **Official accuracy and hallucination metrics are not produced here.** They need the publisher judge and independent evidence labels.
+- **Derived rows need one route label.** A derived file must carry exactly one `derivation` value (G-G). AMBER rows carry none, and no AMBER config is registered, so AMBER serving is refused until it is labelled.
 - **Only the two priority models** are in scope. The other five registered models and the H2O/DA/ECRD arms are not measured by this path.
 
 ## 4. What a passing run does and does not show

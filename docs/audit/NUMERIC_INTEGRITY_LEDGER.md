@@ -19,8 +19,9 @@ Status vocabulary: `FIXED` (code changed, regression test added), `OPEN-OWNER` (
 | New regression tests at `ebbf60d` | same file | 11 passed |
 | 5 named modules at `ebbf60d` | same command | 40 passed, 8 skipped (unchanged) |
 | Full suite at `ebbf60d` | `-m pytest -q` | **283 passed, 1 failed, 10 skipped**. The failure is the same pre-existing p7 test. |
+| Full suite at `49e3d58` (round 2 HEAD) | `-m pytest -q` | **340 passed, 1 failed, 10 skipped** (588 s under load 16-21). The failure is the same p7 test (`CCU_ISOLATION_PASS` gate). |
 
-**Flake note:** one full-suite run at `ebbf60d` showed 3 failures: two in `tests/test_real_engine.py` and one I did not capture. The next full run showed only the p7 failure. `test_real_engine.py`, `test_seven_methods.py` and `test_infrastructure.py` passed 3 of 3 isolated runs at `ebbf60d` and 2 of 2 on the `cfccc4b` archive. Treat this as an unexplained flake to watch, not as a regression caused by these fixes. Owner p7 should check the engine tests for timing sensitivity.
+**Flake analysis (round 2, item 5): UNEXPLAINED, not reproduced.** At `ebbf60d` one full run showed 3 failures (two in `tests/test_real_engine.py`); the tracebacks were not captured, so the cause cannot be identified from the logs. Three further full runs at `dd6df27` (same code as the round-1 tree) gave the same single deterministic failure each time: `test_multimodal_fixture.py::test_progressive_qualification_test_c_multimodal_execution` (`CCU_ISOLATION_PASS` = `GATED_MULTIREQUEST_ISOLATION_TEST_REQUIRED` != `PASS`), 283 passed, 10 skipped; wall times 453.6 s, 256.3 s and 56.4 s under host load 6-16 on 8 cores. Hypothesis checked: `tests/test_real_engine.py` calls `torch.randn` without a seed at 13 sites, and some assertions depend on the random values (`logical_selection_fraction > 0`, `grounded_citations > 0`, `max_abs_logits_diff <= 1e-5`, `physical_bytes_freed > 0`). Seeded runs of that module (a scratch-only pytest plugin sets random, numpy and torch seeds per test; no repository file changed): seed 0 10 passed (293 s), seed 1 10 passed (251 s), seed 2 10 passed (587 s). The unseeded-RNG hypothesis is therefore not supported, but 3 seeds do not rule it out. Timing hypothesis: the assertions that compare latency are `> 0.0` only, which load cannot plausibly break. No timeout or shared global state was found in the engine tests. Verdict: the 3-failure run stays **unexplained**. Owner p7 should keep the traceback capture (`-rfE`, full `-vv` output on failure) on any future full run. Treat `test_real_engine.py` as a watch item, not a known cause.
 
 **Skips are real gaps:** the 10 skipped tests are all legacy notebook tests (`test_notebooks.py` ×8) and `test_stepwise_audit.py` ×2, skipped with "Legacy uploadable notebooks retired". CI runs `pytest -q` and reports green with these skipped. See F-19.
 
@@ -119,16 +120,16 @@ Scope: the two active arms, Base and native MTP. The five external arms (H2O, DA
 | Pilot plan totals | `python -m vlmbench.cli plan --config configs/a100_qwen_priority_pilot.json` | 48 cells; 2,816 measured requests; 656 warmups; 720,896 nominal output tokens (= 2,816 × 256) ✓ reconciles with `runbooks/QWEN_PRIORITY.md` |
 | Confirmatory plan totals | `plan --config configs/a100_qwen_priority_full.json` | 1,008 cells; 45,696 measured; 10,584 warmups; 11,698,176 output tokens (= 45,696 × 256) ✓ |
 | Remote source integrity | `scripts/colab_agent_remote.py:35-40` checks bundle SHA256; `colab_agent.py:check_git_clean` refuses a dirty tree | ✓ for the agent path |
-| Remote **legacy** path | `scripts/remote_entry.py:21-32` extracts `/content/vlmbench_checkout.zip` **without a digest check** and runs `pip install -e` on the runtime | **OPEN-OWNER F-07** |
+| Remote **legacy** path | `scripts/remote_entry.py:21-32` extracts `/content/vlmbench_checkout.zip` **without a digest check** and runs `pip install -e` on the runtime | **FIXED `4975562`** (F-07) |
 | Persistence | `artifacts.sync_files` copies receipts to Drive and checks SHA256 (`artifacts.py:72-87`) | ✓ |
 | Safe resume: source | `prepare` writes an intent before downloading and refuses drift (`agent_pipeline.py:159-167`, `hf_sources.py:31-53`) | ✓ |
 | Safe resume: annotation | `annotate_with_backend` keeps a source-SHA state file and refuses changed sources (`derivation.py:95-108`) | ✓ |
 | Safe resume: quality | `run_quality_predictions` checks IDs and order, and does not re-run completed receipts (`bench.py`, quality block) | ✓ code path; **no direct test** |
-| Safe resume: serving cells | `run_job` skips any existing cell receipt, regardless of status (`cli.py:262-273`) | **OPEN-OWNER F-05** |
+| Safe resume: serving cells | `run_job` skipped any existing cell receipt, regardless of status (`cli.py:262-273`, before `92c8b68`) | **FIXED `92c8b68`** (F-05) |
 | Manifest | `frozen_config.json`, `jobs/*.json` (dataset SHA256 for native and derived), `environment.json` (vLLM, torch, `VLMBENCH_SOURCE_SHA` or `UNRECORDED`), `launch/*.json` (`cli.py` `run_job`) | ✓ with `UNRECORDED` allowed when the env var is unset (direct CLI) |
 | Dependencies | `requirements-agent-cpu.txt` and `requirements-agent-gpu.txt` pin ranges, not a lock; `torch` is not pinned in any agent requirement file; `vllm==0.29.0` is pinned only in GPU/colab files. The audit venv has `huggingface_hub 2.4.0`, outside the `<2` pin, and **vLLM is not installed**. | **OPEN-DOC**: the GPU path is **NOT_TESTED** here. |
 | Mount / auth | `colab_agent.py mount` is interactive by design | NOT_TESTED |
-| Honest "finished" status | `agent_pipeline.benchmark` returns `GPU_JOB_FINISHED…` and the remote wrapper returns `ACTION_COMPLETED` whenever the process exits 0, even when every cell failed (F-06) | **OPEN-OWNER F-06** |
+| Honest "finished" status | Before `00260cc`, `run_job` returned 0 when every cell failed, so `agent_pipeline.benchmark` returned `GPU_JOB_FINISHED…` and the remote wrapper returned `ACTION_COMPLETED` (F-06) | **FIXED `00260cc`** (F-06) |
 | CI | `.github/workflows/ci.yml` runs `pytest -q` with Python 3.11 and CPU torch. Legacy notebook tests skip silently (F-19). | ✓ CPU only |
 
 ---
@@ -143,15 +144,15 @@ Severity: **H** = can produce a wrong or unsafe reported number or an unauthoriz
 | F-02 | H | **FIXED** `ebbf60d` | `bench.py:32-45`, `:101` | CCU=1 second request: `e2e_ms=201` after a 200 ms queue (reproduced on `cfccc4b`) | `admitted_stream` adds slot wait to e2e; TTFT stays HTTP-send; new `client_queue_wait_p50/p95_ms` | `test_e2e_is_measured_from_admission_including_client_queue_wait`, `test_stream_completion_is_service_timing_only` |
 | F-03 | M | **FIXED** `ebbf60d` | `telemetry.py:12-80` | `"1234, 0\n5678, 3"` → `ValueError` swallowed → zero samples, peak = NOT_MEASURED with no reason | `parse_nvidia_smi_csv` sums devices; `parse_failures` / `query_failures` / `gpu_count_max` reported | `test_multi_gpu_csv_sums_devices_instead_of_dropping_sample`, `test_malformed_csv_raises…`, `test_sampler_reports_parse_failures…` |
 | F-04 | M | **FIXED** `ebbf60d` | `datasets/mmlong.py:74-76` | Render cache keyed by document only; 96-dpi run reused 72-dpi pages (`renders == [72]` on `cfccc4b`) | DPI in cache directory name | `test_mmlong_render_cache_is_keyed_by_dpi` |
-| F-05 | H | **OPEN-OWNER** (`cli.py`, unowned: lead decides) | `cli.py:262-273` | Both branches `continue`. A failed or stale receipt is never re-run, and a changed `dataset_sha256` is silently accepted. Makes the Base/MTP coverage asymmetric (C3-6). | Proposed diff §5.1 | proposed: `tests/test_run_job_preflight.py` |
-| F-06 | H | **OPEN-OWNER** (`cli.py`, `agent_pipeline.py`, `scripts/colab_agent_remote.py`) | `cli.py:302`; `agent_pipeline.py:373`; `colab_agent_remote.py:86-91` | `run_job` returns 0 after the serving loop regardless of cell status. The orchestration layer reports `ACTION_COMPLETED` / `GPU_JOB_FINISHED`. | Proposed diff §5.2 | proposed |
-| F-07 | M | **OPEN-OWNER** (`scripts/colab_controller.sh`, `scripts/remote_entry.py`) | `colab_controller.sh:74-75`; `remote_entry.py:21-32` | `--publish` runs `git commit` **and `git push origin HEAD`** from a GPU helper. The legacy path has no bundle digest and runs `pip install -e` on the paid runtime. `docs/PRIORITY_EXECUTION.md:41` still documents the controller as active. | Proposed §5.3 | proposed (`bash -n` in CI only) |
+| F-05 | H | **FIXED** `92c8b68` | `cli.py:262-273` | Both branches `continue`. A failed or stale receipt is never re-run, and a changed `dataset_sha256` is silently accepted. Makes the Base/MTP coverage asymmetric (C3-6). | Applied in `92c8b68` (`src/vlmbench/resume.py`, `cli.py`): only COMPLETED receipts are skipped; the rest stop before GPU (`BLOCKED_NONCOMPLETE_RECEIPTS`) unless `--requeue-nonpass` quarantines them. | proposed: `tests/test_run_job_preflight.py` |
+| F-06 | H | **FIXED** `00260cc` | `cli.py:302`; `agent_pipeline.py:373`; `colab_agent_remote.py:86-91` | `run_job` returns 0 after the serving loop regardless of cell status. The orchestration layer reports `ACTION_COMPLETED` / `GPU_JOB_FINISHED`. | Applied in `00260cc`: exit codes 0/2/4/5/6 with named statuses in `run_status.json`; `benchmark` raises on any non-zero exit, so the wrapper returns `ACTION_FAILED`. | proposed |
+| F-07 | M | **FIXED (legacy path kept, not recommended)** `4975562` | `colab_controller.sh:74-75`; `remote_entry.py:21-32` | `--publish` runs `git commit` **and `git push origin HEAD`** from a GPU helper. The legacy path has no bundle digest and runs `pip install -e` on the paid runtime. `docs/PRIORITY_EXECUTION.md:41` still documents the controller as active. | Applied in `4975562`: controller never commits or pushes; `--publish` refused; `remote_entry.py` checks `bundle_sha256` and uses PYTHONPATH instead of runtime `pip install -e`. | proposed (`bash -n` in CI only) |
 | F-08 | M | **OPEN-DOC** | `cli.py:244-300`; `engine.py:46` | C3-5 and C3-7: no interleaving; KV-cache capacity not recorded per launch | Record `vLLM GPU KV cache size` / max concurrency from `server.log`; interleave `base`/`mtp` per cell pair | proposed |
-| F-09 | M | **OPEN-OWNER** (`notebook_bridge.py`, `derivation.py` unowned) | `memlens.py:194-201`; `notebook_bridge.py:90,110`; `derivation.py:138`; `agent_pipeline.py:198-205` | Two MemLens derivation routes with different joins and image selection, both labelled `memlens` (C3-9) | One builder; record the route in the manifest | proposed |
+| F-09 | M | **FIXED** `573be47` | `memlens.py:194-201`; `notebook_bridge.py:90,110`; `derivation.py:138`; `agent_pipeline.py:198-205` | Two MemLens derivation routes with different joins and image selection, both labelled `memlens` (C3-9) | Applied in `573be47`: one `derivation` label per derived file, enforced before GPU; the label is in the job manifest and receipts and is part of the resume identity. AMBER rows are unlabelled, so AMBER serving is refused until they are labelled. | proposed |
 | F-10 | L | **OPEN-DOC** (latent) | `bench.py:154-161` | AMBER branch ignores `input_length`; receipt records the requested bin anyway | Enforce bin membership or refuse before any AMBER campaign | proposed |
 | F-11 | M | **OPEN-DOC** (owned by me; low urgency) | `report.py:31` | Metrics of `PARTIAL_FAILURE` cells are copied into the serving table next to the status. Claims are protected because `paired_speedups` uses PASS only. | Show `NOT_MEASURED` for non-PASS metrics, or mark the status column explicitly | proposed |
 | F-12 | L | **OPEN-DOC** | `bench.py` quantiles; `report.py` | At CCU 1, n = 16 measured requests; p95/p99 are interpolated near the maximum | Report `n` next to every percentile; do not claim p99 below ~100 samples | proposed |
-| F-13 | M | **OPEN-DOC** | `hf_sources.py:16-18,31-53,134-141`; `README.md:77-78`; `docs/PROTOCOL.md:29` | No committed revision pins; owner-name mismatch between HF and GitHub; heuristic QA split | Commit pinned revisions after review; resolve the upstream owner; record the split name | proposed |
+| F-13 | M | **OPEN-OWNER** (rendering fixed `e4a30ae`) | `hf_sources.py:16-18,31-53,134-141`; `README.md:77-78`; `docs/PROTOCOL.md:29` | No committed revision pins; owner-name mismatch between HF and GitHub; heuristic QA split | Generated `docs/audit/PINNED_INPUTS.md` (`e4a30ae`) renders model revisions as UNPINNED and dataset revisions as BLOCKED. Owner must supply commit SHAs. | proposed |
 | F-14 | M | **OPEN-DOC** | `preflight.py:44-63`; `hf_sources.py:118-131`; `artifacts.py:46-69` | Model source receipts record file count and bytes only. Per-file SHA256 only at staging. | Run `scripts/audit_safetensors_payload.py --hash-shards` on the pinned checkpoint before any GPU run (existing tool, not run here) | proposed |
 | F-15 | L | **OPEN-DOC** | `hf_sources.py:155` | `LICENSE-DATA` downloaded, not hashed or recorded | Record SHA256 and text path in `.hf_source.json` | proposed |
 | F-16 | M | **OPEN-OWNER p7** | `real_engine.py:1431`, `:1466`, `:870` | `mtp_acceptance_rate = 0.0` is a sentinel stored as a float | Emit `None` / `NOT_MEASURED` | p7 |
@@ -161,39 +162,12 @@ Severity: **H** = can produce a wrong or unsafe reported number or an unauthoriz
 | F-20 | L | **OPEN-DOC** | `agent_pipeline.py:189-205` | Historical MemLens route ignores the pilot phase's two bins and builds all seven; the candidate file differs by phase | Use `lengths` on every route | proposed |
 | F-21 | L | **OPEN-DOC** | `preflight.py:83-88` | MMLong PDF presence check samples the first 16 rows only | Full presence check happens in normalization (`mmlong.py:60-62`). Document as sample-only. | — |
 
-### 5.1 Proposed diff for F-05 (`cli.py`, not applied: owner decision)
+### 5.1–5.3 Applied in round 2 (replaces the proposed diffs)
 
-Replace the two-branch skip with an explicit disposition:
-
-```python
-existing = root / "cells" / f"{cell_id(cell)}.json"
-if existing.is_file():
-    old = json.loads(existing.read_text(encoding="utf8"))
-    if old.get("cell") != cell or old.get("config_sha256") != fp:
-        raise RuntimeError(f"Receipt conflicts with frozen campaign: {existing.name}")
-    if old.get("dataset_sha256") != derived_hash:
-        raise RuntimeError(f"Receipt was measured on a different derived dataset: {existing.name}")
-    if old.get("status") == "PASS_MEASURED":
-        continue
-    # Non-PASS receipt: keep it (cost protection), but count it so the run cannot look complete.
-    recorded_non_pass.append(existing.name)
-    continue
-```
-
-Test: a receipt with a different `dataset_sha256` raises; a `PARTIAL_FAILURE` receipt is counted in `run_status.json`, not silently skipped.
-
-### 5.2 Proposed diff for F-06
-
-- `cli.py` `run_job`: before `return 0`, compute `non_pass = [r for r in cell receipts if status != PASS_MEASURED]` for the scoped cells. Write it into `run_status.json`. Return a nonzero code if any scoped cell is non-PASS **and** the invocation attempted cells.
-- `agent_pipeline.benchmark`: return `GPU_JOB_PARTIAL_OR_FAILED…` when the status file reports non-PASS cells.
-- `colab_agent_remote.py`: pass the receipt status through in `result["status"]`. The host currently requires only `ACTION_COMPLETED` (`colab_agent.py` `remote_job`).
-
-### 5.3 Proposed diff for F-07
-
-- `colab_controller.sh`: remove `git push` from the helper, or require a separate explicit `--push-results` flag and a clean tree. Remove `--publish` from the documented path.
-- `remote_entry.py`: add the same `bundle_sha256` check that `colab_agent_remote.py:35-40` already does; remove `pip install -e` on the paid runtime.
-
----
+- **F-05 (`92c8b68`).** Each receipt is classified COMPLETED, MISSING, FAILED, STALE or INVALID (`src/vlmbench/resume.py`). COMPLETED requires PASS_MEASURED plus matching config, dataset, code (`VLMBENCH_SOURCE_SHA`; `UNRECORDED` never certifies), derivation, execution pass, output contract, cell, sample-set digest and measured request count. Any other receipt stops the job before GPU start (`BLOCKED_NONCOMPLETE_RECEIPTS`, rc 2) unless `--requeue-nonpass` is given. Requeue moves the receipt, local and Drive, to `quarantine/<stamp>/`. Nothing is deleted or rewritten. Tests: `tests/test_resume_policy.py`.
+- **F-06 (`00260cc`).** Exit codes: 0 `COMPLETE` / `IN_PROGRESS`; 2 blocked; 4 pilot stop or repeated quality failure; 5 `ALL_ATTEMPTED_FAILED` / `QUALITY_ALL_FAILED`; 6 `PARTIAL_FAILURE` / `QUALITY_PARTIAL_FAILURE`. Counts go to `run_status.json`. `agent_pipeline.benchmark` raises with the status name on any non-zero exit, so the remote wrapper returns `ACTION_FAILED`. Tests: `tests/test_resume_policy.py` (F-06 section).
+- **F-07 (`4975562`).** `colab_controller.sh` has no `git add/commit/push`. `--publish` is refused at argument parsing. The job carries `bundle_sha256` of the uploaded zip. `remote_entry.py` verifies that digest before extraction and runs with `PYTHONPATH`, with no runtime `pip install`. **Legacy gap, documented:** the path still has no independent review and is not used for paid runs. `runbooks/GPU_RUNBOOK.md` G-C says so. Tests: `tests/test_gpu_helper_safety.py`.
+- **F-09 (`573be47`).** `src/vlmbench/derivation_labels.py` defines one constant per route. `run-job` refuses a derived file with zero, mixed or unlabelled rows (`BLOCKED_MIXED_DERIVATION`, rc 2) before GPU start. The label is recorded in the job manifest and in every receipt, and it is part of the resume identity, so another route's receipts are STALE. Tests: `tests/test_derivation_routes.py`, `tests/test_resume_policy.py`.
 
 ## 6. Regression tests added (`tests/test_measurement_regressions.py`)
 

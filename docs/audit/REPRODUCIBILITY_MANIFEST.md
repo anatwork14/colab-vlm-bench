@@ -10,7 +10,10 @@ Companion to [NUMERIC_INTEGRITY_LEDGER.md](NUMERIC_INTEGRITY_LEDGER.md). Status:
 | Audited base | `cfccc4b5b3c24621298ddf93144709cace9944d2` (PR #20 head, branch `feat/qwen35-pretrained-validation`) |
 | Code fixes (tests first, then fix) | `ebbf60d5bee25b6095e84fba8f9d46dd7a9ba94c` |
 | Telemetry trust fields in receipts | `07b64c9` (HEAD of the code at the time of this audit; counts in §3 are at this commit) |
-| Docs commit | the commit that adds `docs/audit/*` and `runbooks/GPU_RUNBOOK.md` (see `git log`) |
+| Docs commit | `dd6df27`: adds `docs/audit/*` and `runbooks/GPU_RUNBOOK.md` |
+| Round 2 fixes (tests first, one commit each) | F-05 `92c8b68` · F-06 `00260cc` · F-07 `4975562` · F-09 `573be47` |
+| Round 2 generator and guard | item 6 `e4a30ae` (`repro_manifest.py`, `PINNED_INPUTS.md`) · item 7 `49e3d58` (`test_no_paper_targets.py`) |
+| Round 2 docs | the commit that updates this file, `runbooks/GPU_RUNBOOK.md` and the ledger (see `git log`) |
 | Branch | `feat/…` worktree branch; **not pushed, not merged** |
 
 To reproduce the audit state: `git checkout ebbf60d` (or the docs commit), then run §4.
@@ -40,6 +43,8 @@ The audit reused an existing venv on this host so that no software was installed
 | 5 named modules, `ebbf60d` | 40 passed, 8 skipped |
 | Full suite, `cfccc4b` | 272 passed, 1 failed, 10 skipped |
 | Full suite, `ebbf60d` | 283 passed, 1 failed, 10 skipped |
+| Full suite, `49e3d58` (round 2 HEAD) | 340 passed, 1 failed, 10 skipped (same p7 failure) |
+| Full suite, `dd6df27` x3 (flake check) | 283 passed, 1 failed, 10 skipped each time |
 | New regression file vs `cfccc4b` archive | 10 failed, 1 passed (guard) |
 | New regression file, `ebbf60d` | 11 passed |
 
@@ -108,12 +113,14 @@ Re-verify with `sha256sum` before use. These hashes describe the audited files o
 
 ## 6. Pins and inputs NOT present in the repository
 
+Status tokens: **UNPINNED** = no revision in the config, so the run cannot start. **BLOCKED** = not in the config and not resolved offline; no value is invented. The generated table is [PINNED_INPUTS.md](PINNED_INPUTS.md), produced by `python -m vlmbench.repro_manifest` and checked by `tests/test_repro_manifest.py`. Note: the Hub answered a status request from this host during round 2. That is not a pin. Only an owner-approved commit SHA closes these rows.
+
 | Input | Status | Required before any GPU action |
 |---|---|---|
-| HF model revision, `Qwen/Qwen3.5-0.8B` | Not pinned (resolved at run time, `hf_sources.py:31-53`) | Owner-approved commit SHA, written to `.hf_source.json` and to the campaign `models[].revision` |
-| HF model revision, `Qwen/Qwen3.5-4B` | same | same |
-| HF dataset revision, `xiyuRenBill/MEMLENS` | same | same. Resolve the owner-name mismatch with the GitHub link first (ledger F-13). |
-| HF dataset revision, `yubo2333/MMLongBench-Doc` | same | same |
+| HF model revision, `Qwen/Qwen3.5-0.8B` | **UNPINNED** (config `revision`; generated in `PINNED_INPUTS.md`) | Owner-approved commit SHA, written to `.hf_source.json` and to the campaign `models[].revision` |
+| HF model revision, `Qwen/Qwen3.5-4B` | **UNPINNED** (same generated table) | same |
+| HF dataset revision, `xiyuRenBill/MEMLENS` | **BLOCKED**: absent from configs; not resolved offline, so no value is given | same. Resolve the owner-name mismatch with the GitHub link first (ledger F-13). |
+| HF dataset revision, `yubo2333/MMLongBench-Doc` | **BLOCKED**: same as above | same |
 | Per-shard SHA-256 of the checkpoint | Not recorded (only size and count, `preflight.py:44-63`) | Run `scripts/audit_safetensors_payload.py --checkpoint-dir <pinned> --hash-shards` on CPU; record the output (ledger F-14) |
 | Dataset file SHA-256 (`dataset_32k.json`, QA file, image archive) | Recorded by `prepare` (`hf_sources.py:165-178`) | Keep with the run manifest |
 | `LICENSE-DATA` text and SHA | Not recorded | Record (F-15) |
@@ -129,14 +136,14 @@ A run is reproducible only if these exist under the run root and on Drive:
 | File | Must contain |
 |---|---|
 | `frozen_config.json` | Campaign config; fingerprint must match on resume (`cli.py` `run_job`) |
-| `jobs/<job>.json` | Native and derived dataset SHA-256, output contract, `config_sha256`, GPU inventory |
+| `jobs/<job>.json` | Native and derived dataset SHA-256, `derivation` label (F-09), output contract, `config_sha256`, GPU inventory |
 | `environment.json` | GPU, torch, vLLM version, httpx, Python, `repo_source_sha` (**must not be `UNRECORDED`** for a paid run) |
 | `model_manifests/<model>.json` | Checkpoint HF id, revision, per-file list with SHA-256 from staging |
 | `launch/<job>.json` | Server argv, `startup_status`, and the speculative config for MTP |
-| `cells/<cell>.json` | Status, metrics, `sample_id_sha256`, `dataset_sha256`, notes |
+| `cells/<cell>.json` | Status, metrics, `sample_id_sha256`, `dataset_sha256`, `code_sha256`, `derivation`, notes (`92c8b68`, `573be47`) |
 | `requests/<cell>.jsonl` | Per-request timings including `client_queue_wait_ms` |
 | `preflight/<job>.workload.json` | Eligible unique prompts per text bin and CCU |
-| `run_status.json` | Final status; **after F-06 is fixed, the count of non-PASS cells** |
+| `run_status.json` | `status`, `exit_code` (0 / 2 / 4 / 5 / 6), `counts` {planned, attempted, completed, non_completed}, `requeued_nonpass` (F-05, F-06; `00260cc`) |
 | `RUNBOOK.md`, `summary.json` | Generated by `report`; non-PASS metrics are shown with their status (F-11) |
 
 ## 8. What this manifest does not establish
