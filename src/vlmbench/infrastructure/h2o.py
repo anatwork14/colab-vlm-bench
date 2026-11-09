@@ -392,3 +392,48 @@ class H2OMTPTransaction:
 
         self._snapshot = None
         self.in_transaction = False
+
+
+
+def calibrate_h2o_ratio_to_retained(measure, target_mean_retained: float, prompt_len: int, min_budget: int) -> dict:
+    """Matched retention by MEASUREMENT: find the H2O budget whose measured mean retained count
+    is closest to a target (ITER2 D4 S-2).
+
+    `measure(budget_ratio) -> mean retained entries per decode step` must run the real engine.
+    A budget-to-retained formula is not used: H2O's out-of-budget protected entries make the
+    mapping non-linear (measured: budget 25 gives retained 26, not 29). The budget is the integer
+    b with int(prompt_len * ratio) == b, ratio = (b + 0.5) / prompt_len. Bisection assumes the
+    measured mean is non-decreasing in b; the best of the bisection point and its neighbours is
+    returned with its measured value, so the residual is reported, never hidden.
+    """
+    if type(prompt_len) is not int or prompt_len < 1:
+        raise ValueError("prompt_len must be a positive integer")
+    lo = max(1, int(min_budget))
+    hi = prompt_len
+    if lo > hi:
+        raise ValueError("min_budget exceeds prompt_len: no calibratable budget")
+    target = float(target_mean_retained)
+    measured: dict[int, float] = {}
+
+    def m(b: int) -> float:
+        if b not in measured:
+            measured[b] = float(measure((b + 0.5) / prompt_len))
+        return measured[b]
+
+    left, right = lo, hi
+    while left < right:
+        mid = (left + right) // 2
+        if m(mid) < target:
+            left = mid + 1
+        else:
+            right = mid
+    candidates = [b for b in (left - 1, left, left + 1) if lo <= b <= hi]
+    best = min(candidates, key=lambda b: abs(m(b) - target))
+    return {
+        "budget": best,
+        "budget_ratio": (best + 0.5) / prompt_len,
+        "measured_mean_retained": m(best),
+        "target_mean_retained": target,
+        "evaluations": len(measured),
+        "method": "bisection_on_measured_retained_mean",
+    }

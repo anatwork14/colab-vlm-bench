@@ -47,23 +47,30 @@ def test_every_arm_reports_retained_entries_per_layer_per_decode_step(arm):
     assert rec["mean"] is not None and rec["mean"] > 0
 
 
-def test_matched_retention_ratio_reproduces_the_target_budget():
-    from vlmbench.infrastructure.h2o import matched_retention_budget_ratio
+def test_calibration_finds_the_budget_whose_measured_retention_is_closest_to_target():
+    from vlmbench.infrastructure.h2o import calibrate_h2o_ratio_to_retained
 
-    for prompt_len, target, min_budget in [(40, 20, 16), (100, 37, 16), (64, 32, 32), (40, 33, 16)]:
-        ratio = matched_retention_budget_ratio(target, prompt_len, min_budget)
-        assert max(min_budget, int(prompt_len * ratio)) == target, (prompt_len, target, min_budget)
+    # Synthetic monotone measure with a constant out-of-budget offset of 4 entries.
+    def measure(ratio):
+        return float(max(1, int(40 * ratio)) + 4)
+
+    cal = calibrate_h2o_ratio_to_retained(measure, 29, prompt_len=40, min_budget=1)
+    assert cal["budget"] == 25
+    assert cal["measured_mean_retained"] == 29.0
+    assert cal["budget_ratio"] == (25 + 0.5) / 40
     with pytest.raises(ValueError):
-        matched_retention_budget_ratio(10, 40, 16)  # H2O cannot retain fewer than min_budget
+        calibrate_h2o_ratio_to_retained(measure, 29, prompt_len=0, min_budget=1)
 
 
 def test_h2o_calibrated_to_starlight_mean_retention_matches_it_within_one_entry():
-    from vlmbench.infrastructure.h2o import matched_retention_budget_ratio
+    from vlmbench.infrastructure.h2o import calibrate_h2o_ratio_to_retained
 
-    star = _run("starlight_s1")
-    star_mean = star.telemetry["retained_entries_per_layer"]["mean"]
-    target = round(star_mean)
-    ratio = matched_retention_budget_ratio(target, len(PROMPT), min_budget=32)
-    h2o = _run("h2o_base", h2o_budget_ratio=ratio)
-    h2o_mean = h2o.telemetry["retained_entries_per_layer"]["mean"]
-    assert abs(h2o_mean - star_mean) <= 1.0, (star_mean, h2o_mean, ratio)
+    star_mean = _run("starlight_s1").telemetry["retained_entries_per_layer"]["mean"]
+
+    def measure(ratio):
+        # min_budget=1 so the calibrated budget is not floored above the target.
+        return _run("h2o_base", h2o_budget_ratio=ratio, h2o_min_budget=1).telemetry[
+            "retained_entries_per_layer"]["mean"]
+
+    cal = calibrate_h2o_ratio_to_retained(measure, star_mean, len(PROMPT), min_budget=1)
+    assert abs(cal["measured_mean_retained"] - star_mean) <= 1.0, (star_mean, cal)

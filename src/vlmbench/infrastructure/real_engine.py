@@ -1023,6 +1023,24 @@ def _image_sha256(image_bytes: bytes | None, image_path: str | Path | None) -> s
 
 # --- 2. Production Seven-Arm Engine with True Backend Interventions ---
 
+def _retained_entries_summary(samples: Sequence[int], *, unit: str, n_layers: int) -> dict[str, Any]:
+    """Retained physical entries per full-attention layer, summarised over the recorded samples.
+
+    `mean` is None until a sample exists (never a literal zero). Prefill is never included: the
+    prefill cache is unbounded and is reported separately as prefill_excluded.
+    """
+    values = [int(x) for x in samples]
+    return {
+        "unit": unit,
+        "prefill_excluded": True,
+        "n_full_attention_layers": int(n_layers),
+        "samples": len(values),
+        "mean": (sum(values) / len(values)) if values else None,
+        "min": min(values) if values else None,
+        "max": max(values) if values else None,
+    }
+
+
 @dataclass
 class RealExecutionResult:
     """Telemetry and outputs of real model execution across the 7 arms."""
@@ -1392,6 +1410,7 @@ class RealSevenArmEngine:
         t_start = time.perf_counter() if t0 is None else t0
         first_commit_ms: float | None = None
         verifier_calls = 0
+        retained_samples: list[int] = []  # physical cache length after each verifier forward
         with torch.no_grad():
             out = _feed(ids, 0, 1)
             verifier_calls += 1  # prefill is a target forward
@@ -1424,6 +1443,7 @@ class RealSevenArmEngine:
                 if proposal == target_after_pending:
                     accepted += 1
                     cache_len += 2
+                    retained_samples.append(cache_len)
                     if proposal in stops:
                         # The verifier agreed the next target token is EOS: stop, do not emit it.
                         stop_reason = "eos"
@@ -1439,6 +1459,7 @@ class RealSevenArmEngine:
                     v1 = _feed([pending], cache_len, 1)
                     verifier_calls += 1
                     cache_len += 1
+                    retained_samples.append(cache_len)
                     pending = int(torch.argmax(v1["logits"][0]).item())
                     draft = int(torch.argmax(v1["mtp_logits"][0, 0]).item())
 
@@ -1460,10 +1481,17 @@ class RealSevenArmEngine:
             "acceptance_rate": (accepted / proposed) if proposed else None,
             "first_commit_ms": first_commit_ms,
             "kv_bytes_allocated": kv_bytes,
+            "retained_samples": retained_samples,
             "speed_claim": None,
         }
 
     MTP_TEXT_SPECULATION_GATE = "CPU_REFERENCE_SPECULATION_EXECUTED_NOT_VLLM"
+
+    def _full_layer_physical_lengths(self, past_kv: Any) -> list[int]:
+        """Physical KV length of every full-attention layer (one entry per layer)."""
+        if self.model.hf_forward_active:
+            return [int(past_kv.layers[l].keys.shape[2]) for l in self.config.full_attention_layers]
+        return [int(past_kv[l][0].shape[2]) for l in self.config.full_attention_layers]
 
     def _mtp_text_speculation_route(self, image_present: bool) -> bool:
         """True when the mtp arm must run verifier-backed speculation (official, text-only)."""
@@ -1535,6 +1563,11 @@ class RealSevenArmEngine:
                 "architectural_status": arch_status,
                 "is_official_hf_hooked": self.is_official_hf_hooked,
                 "measurement_label": "cpu_pytorch_reference_not_vllm",
+                "retained_entries_per_layer": _retained_entries_summary(
+                    spec["retained_samples"],
+                    unit="per_verifier_forward_full_attention_layer",
+                    n_layers=len(self.config.full_attention_layers),
+                ),
                 "speculation_executed": True,
                 "arm_label": "mtp_cpu_speculative_reference_text_only_not_vllm",
                 "speculation": speculation,
@@ -1864,6 +1897,8 @@ class RealSevenArmEngine:
         mtp_proposed_total = 0
         mtp_matched_total = 0
         pending_mtp_candidate: int | None = None
+        # S-2: physical full-attention cache length after each DECODE forward (prefill excluded).
+        retained_decode_samples: list[int] = []
 
         # Prefill forward pass. Reference MTP candidate is evaluated at the
         # next target token's absolute 3-axis RoPE position, never position 0.
@@ -2054,6 +2089,7 @@ class RealSevenArmEngine:
                 past_kv = out["past_key_values"]
                 recurrent_s = out["recurrent_states"]
                 step_logits = out["logits"][0]
+                retained_decode_samples.extend(self._full_layer_physical_lengths(past_kv))
                 for layer_telem in out["layer_telemetries"]:
                     n_entries = layer_telem.get("da_measured_masked_entry_count")
                     if n_entries is None:
@@ -2190,6 +2226,11 @@ class RealSevenArmEngine:
                 "architectural_status": arch_status,
                 "is_official_hf_hooked": self.is_official_hf_hooked,
                 "forward_path_executed": forward_path_executed,
+                "retained_entries_per_layer": _retained_entries_summary(
+                    retained_decode_samples,
+                    unit="per_decode_step_full_attention_layer",
+                    n_layers=len(self.config.full_attention_layers),
+                ),
                 # R5-5: serving-style arms never speculate. The verifier-backed reference is a separate helper.
                 "speculation_executed": False,
                 "arm_label": (
