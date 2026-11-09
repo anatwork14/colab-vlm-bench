@@ -164,3 +164,44 @@ def test_reported_result_fields_exist_on_current_execution_result():
         "physical_kv_bytes_freed",
     ):
         assert name in names, f"{name} is not a field of RealExecutionResult"
+
+
+# ITER2 D2b G-07: the default receipt never targets the supersession notice, and an
+# existing receipt is never overwritten without --force.
+
+def test_default_receipt_path_is_a_new_timestamped_run_file():
+    path = qual.default_receipt_path("20261109T120000Z")
+    assert path.parent == ROOT / "artifacts" / "runs"
+    assert path.name == "20261109T120000Z_qwen35_pretrained_qualification.json"
+    assert path != ROOT / "artifacts" / "qwen35_pretrained_qualification_receipt.json"
+
+
+def test_script_has_no_default_that_points_at_the_committed_notice():
+    src = SCRIPT.read_text(encoding="utf8")
+    assert 'artifacts" / "qwen35_pretrained_qualification_receipt.json"' not in src
+
+
+def test_write_receipt_refuses_to_overwrite_without_force(tmp_path):
+    target = tmp_path / "receipt.json"
+    qual.write_receipt(target, {"v": 1})
+    with pytest.raises(FileExistsError):
+        qual.write_receipt(target, {"v": 2})
+    assert '"v": 1' in target.read_text(encoding="utf8"), "the existing receipt must be untouched"
+
+
+def test_write_receipt_overwrites_only_with_force_and_creates_parents(tmp_path):
+    target = tmp_path / "nested" / "receipt.json"
+    qual.write_receipt(target, {"v": 1})
+    qual.write_receipt(target, {"v": 2}, force=True)
+    assert '"v": 2' in target.read_text(encoding="utf8")
+
+
+def test_main_refuses_existing_receipt_before_running_any_test(tmp_path, monkeypatch):
+    existing = tmp_path / "receipt.json"
+    existing.write_text("{}", encoding="utf8")
+    monkeypatch.setattr("sys.argv", ["run_progressive_qualification.py", "--receipt-path", str(existing)])
+    monkeypatch.setattr(qual, "guarded", lambda *a, **k: pytest.fail("no test may run when the receipt is refused"))
+    with pytest.raises(SystemExit) as exc:
+        qual.main()
+    assert exc.value.code != 0
+    assert existing.read_text(encoding="utf8") == "{}"

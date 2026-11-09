@@ -665,6 +665,23 @@ def verdict_for(tests: dict[str, dict[str, Any]]) -> str:
     return OK_VERDICT if not failed else "INCOMPLETE_OR_FAILED: " + ", ".join(failed)
 
 
+RUNS_DIR = REPO_ROOT / "artifacts" / "runs"
+
+
+def default_receipt_path(stamp: str) -> Path:
+    """A new per-run file. Committed receipts and the supersession notice are never targets."""
+    return RUNS_DIR / f"{stamp}_qwen35_pretrained_qualification.json"
+
+
+def write_receipt(path: Path, receipt: dict[str, Any], force: bool = False) -> None:
+    """Refuse to replace an existing receipt unless the caller explicitly forces it."""
+    if path.exists() and not force:
+        raise FileExistsError(f"Refusing to overwrite existing receipt {path}; pass --force to replace it")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w" if force else "x", encoding="utf8") as f:
+        json.dump(receipt, f, indent=2)
+
+
 def _round_or_none(value: float | None, digits: int = 4) -> float | None:
     """Null stays null: an unmeasured quantity must never be reported as zero."""
     return None if value is None else round(float(value), digits)
@@ -688,8 +705,14 @@ def main() -> None:
     parser.add_argument("--model-dir", type=Path, default=Path("/mnt/ssd/genos2/research_workspace/models/Qwen/Qwen3.5-0.8B"))
     parser.add_argument("--fixture-path", type=Path, default=REPO_ROOT / "tests" / "fixtures" / "000000039769.png")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--receipt-path", type=Path, default=REPO_ROOT / "artifacts" / "qwen35_pretrained_qualification_receipt.json")
+    parser.add_argument("--receipt-path", type=Path, default=None,
+                        help="Receipt file to create. Default: a new timestamped file under artifacts/runs/.")
+    parser.add_argument("--force", action="store_true", help="Allow replacing an existing receipt file.")
     args = parser.parse_args()
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    args.receipt_path = args.receipt_path or default_receipt_path(stamp)
+    if args.receipt_path.exists() and not args.force:
+        parser.error(f"receipt already exists: {args.receipt_path} (pass --force to replace it)")
 
     overall_t0 = time.perf_counter()
     print("================================================================================")
@@ -726,9 +749,7 @@ def main() -> None:
     receipt["release_gates"] = compute_release_gates(tests, device_name=receipt["cuda_device_name"])
     receipt["release_gate_evidence"] = gate_evidence(tests)
 
-    args.receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(args.receipt_path, "w", encoding="utf8") as f:
-        json.dump(receipt, f, indent=2)
+    write_receipt(args.receipt_path, receipt, force=args.force)
 
     print("\n================================================================================")
     print(f"  VERDICT: {receipt['qualification_verdict']} in {receipt['total_duration_s']:.2f}s")
