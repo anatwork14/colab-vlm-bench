@@ -494,3 +494,41 @@ def test_p7_concurrent_requests_match_sequential_non_vllm():
         concurrent_tokens = {rid: f.result().tokens_generated for rid, f in futures.items()}
     assert concurrent_tokens == sequential
     engine.close()
+
+
+def test_p7_ecrd_alpha_is_disclosed_as_uncalibrated_condition_dependent():
+    """Round 2: alpha is 3.5 for official+image runs and 20.0 otherwise. This is a
+    cross-condition confounder, so telemetry must say so instead of hiding it."""
+    engine = RealSevenArmEngine(method_arm="ecrd_base", config=_p7_small_cfg(), device="cpu")
+    res = engine.execute_request("p7_ecrd_alpha", prompt_token_ids=[100, 101, 102],
+                                 max_new_tokens=2, image_present=False)
+    meta = res.telemetry["ecrd_reweight"]
+    assert meta["reweight_alpha"] == 20.0
+    assert meta["alpha_rule"] == "3.5 if official_hf_hooked and image_present else 20.0"
+    assert meta["calibrated"] is False
+    assert meta["cross_condition_comparable"] is False
+    engine.close()
+
+
+def test_p7_ecrd_unsupported_penalty_is_inert_and_documented():
+    """unsupported_penalty (beta) is NOT applied by the processor: changing it must not
+    change any logit. Documented as inert until an unsupported-token detector exists."""
+    from vlmbench.infrastructure.grounding_evidence import ECRDConfig
+
+    class _Tok:
+        def decode(self, ids, skip_special_tokens=True):
+            return "apple" if 3 in ids else "banana"
+
+        def encode(self, text):
+            return []
+
+    logits = np.zeros(8, dtype=np.float32)
+    logits[2] = 1.0
+    logits[3] = 0.5
+    outs = []
+    for beta in (0.0, 5.0):
+        pool = EvidencePool("p7_beta")
+        pool.add_evidence(EvidenceItem("ev_b", "text", "apple", "5" * 64), keywords=["apple"])
+        proc = ECRDLogitsProcessor(pool, _Tok(), ECRDConfig(reweight_alpha=1.0, unsupported_penalty=beta))
+        outs.append(proc([], logits.copy()))
+    np.testing.assert_array_equal(outs[0], outs[1])

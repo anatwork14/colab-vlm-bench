@@ -573,3 +573,49 @@ def test_p7_h2o_unsaturated_protected_keeps_total_budget():
     tracker.set_visual_tokens(visual)
     counts = _h2o_decode_steps(tracker, 0, start_len=40, steps=6, seed=3)
     assert counts == [20] * 6
+
+
+# --- P7 round 2: ECRD keyword matching must be word-bounded (audit wF:p9) ---
+
+def _p7_pool(keyword):
+    pool = EvidencePool("p7_ecrd")
+    pool.add_evidence(EvidenceItem("ev_kw", "text", "fact", "4" * 64), keywords=[keyword])
+    return pool
+
+
+@pytest.mark.parametrize("token_text", ["reduced", "shred", "hundred", "tar", "rede"])
+def test_p7_ecrd_keyword_does_not_match_inside_other_words(token_text):
+    """Regression: 'red' matched 'reduced'/'shred'; 'tar' matched 'target' (substring rule)."""
+    keyword = "red" if token_text != "tar" else "target"
+    assert _p7_pool(keyword).match_keywords(token_text) == []
+
+
+@pytest.mark.parametrize("token_text", ["red", " Red", "red.", "RED,"])
+def test_p7_ecrd_keyword_matches_whole_word_with_bpe_and_punctuation(token_text):
+    assert _p7_pool("red").match_keywords(token_text) == ["ev_kw"]
+
+
+def test_p7_ecrd_multiword_keyword_matches_contiguous_words_only():
+    pool = _p7_pool("red apple")
+    assert pool.match_keywords("red apple") == ["ev_kw"]
+    assert pool.match_keywords("apple") == []
+    assert pool.match_keywords("red") == []
+
+
+def test_p7_ecrd_does_not_boost_substring_token_in_logits():
+    class _Tok:
+        table = {5: "reduced", 6: "red"}
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join(self.table.get(i, "") for i in ids)
+
+        def encode(self, text):
+            return []
+
+    proc = ECRDLogitsProcessor(_p7_pool("red"), _Tok(), ECRDConfig(reweight_alpha=3.0))
+    logits = np.zeros(10, dtype=np.float32)
+    logits[5] = 1.0  # "reduced" would win only if it were boosted
+    out = proc([], logits)
+    assert out[5] == pytest.approx(1.0), "substring token was boosted by evidence keyword"
+    assert out[6] == pytest.approx(3.0), "whole-word token must still be boosted by alpha"
+    assert int(np.argmax(out)) == 6
