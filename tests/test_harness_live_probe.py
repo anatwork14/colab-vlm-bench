@@ -32,13 +32,16 @@ def _load():
 inv = _load()
 RESOURCE = "NVIDIA A100 40GB"
 PIN = "0.29.0"
+RECORD_SHA = "ee" * 32      # ITER3 C1: signed vLLM distribution-record pin
+GPU_UUID = "GPU-1"          # ITER3 C1: signed GPU uuid pin
 WEIGHTS = {"qwen35_08b": {"files": {"model.safetensors": {"sha256": "ab" * 32, "size": 5}}}}
 
 
 def genuine(nonce: str, **overrides) -> dict:
     report = {
         "nonce": nonce, "pid": 4242, "python": "/venv/bin/python",
-        "vllm": {"dist_version": PIN, "module_version": PIN, "module_file": "/venv/lib/vllm/__init__.py"},
+        "vllm": {"dist_version": PIN, "module_version": PIN, "module_file": "/venv/lib/vllm/__init__.py",
+                 "record_sha256": RECORD_SHA},
         "nvidia_smi": {"path": "/usr/bin/nvidia-smi", "name": RESOURCE, "uuid": "GPU-1"},
         "cuda": {"device_name": RESOURCE, "kernel_sum": 256.0, "expected_sum": 256.0, "capability": [8, 0]},
         "weights": {"qwen35_08b": {"files": {"model.safetensors": {"sha256": "ab" * 32, "size": 5}}}},
@@ -48,7 +51,8 @@ def genuine(nonce: str, **overrides) -> dict:
 
 
 def evaluate(report, **kw):
-    args = dict(nonce="n1", parent_pid=1, resource_name=RESOURCE, vllm_pin=PIN, weight_specs=WEIGHTS)
+    args = dict(nonce="n1", parent_pid=1, resource_name=RESOURCE, vllm_pin=PIN, weight_specs=WEIGHTS,
+                vllm_record_sha256=RECORD_SHA, gpu_uuid=GPU_UUID)
     args.update(kw)
     return inv.evaluate_probe(report, **args)
 
@@ -108,9 +112,29 @@ def test_output_produced_in_the_parent_process_is_refused():
     assert out["ok"] is False and any("same process" in r for r in out["reasons"])
 
 
+def test_a_vllm_distribution_record_differing_from_the_signed_pin_is_refused():
+    # ITER3 C1: same version string, different RECORD (a swapped or stub build)
+    out = evaluate(genuine("n1", vllm={"dist_version": PIN, "module_version": PIN, "module_file": "/x",
+                                       "record_sha256": "00" * 32}))
+    assert out["ok"] is False and any("RECORD" in r for r in out["reasons"])
+
+
+def test_a_gpu_with_the_signed_name_but_another_uuid_is_refused():
+    # ITER3 C1: the name matches, the device does not
+    out = evaluate(genuine("n1", nvidia_smi={"path": "/usr/bin/nvidia-smi", "name": RESOURCE, "uuid": "GPU-2"}))
+    assert out["ok"] is False and any("uuid" in r for r in out["reasons"])
+
+
+def test_a_probe_without_a_signed_record_or_uuid_pin_cannot_pass():
+    out = evaluate(genuine("n1"), vllm_record_sha256=None, gpu_uuid=None)
+    assert out["ok"] is False
+    assert any("distribution-record pin" in r for r in out["reasons"])
+    assert any("uuid pin" in r for r in out["reasons"])
+
+
 def test_a_plan_that_names_no_resource_cannot_pass():
     out = evaluate(genuine("n1"), resource_name=None)
-    assert out["ok"] is False and any("resource" in r for r in out["reasons"])
+    assert out["ok"] is False and any("GPU name pin" in r for r in out["reasons"])
 
 
 def test_run_live_probe_refuses_a_replayed_nonce_from_the_runner():
@@ -182,7 +206,7 @@ def test_full_bundle_with_a_signed_owner_plan_and_forged_environment_is_zero_rea
         pilot_path, matrix_path, models_root=models, authorization=record, receipts_dir=receipts,
         min_free_gib=0.0, hash_weights=True,
         probe_gpu_fn=lambda: {"name": RESOURCE, "compute_cap": 8.0, "memory_total_mib": 40960},
-        feasibility_path=None, allowed_signers=signers, pinned_manifest_sha256={}, owner_record=record,
+        feasibility_path=None, allowed_signers=signers, owner_record=record,
     )
     assert report["matrices"]["pilot"]["counts"]["READY"] == 0
     assert report["matrices"]["full"]["counts"]["READY"] == 0

@@ -123,6 +123,37 @@ def test_vllm_without_a_configured_pin_is_not_verified():
     assert inv.verify_vllm(None)["verified"] is False
 
 
+def _vllm_runner(record_sha: str, version: str = "0.29.0"):
+    def runner(args, **kwargs):
+        class Done:
+            returncode = 0
+            stdout = json.dumps({"module_version": version, "dist_version": version,
+                                 "record_sha256": record_sha}) + "\n"
+        return Done()
+    return runner
+
+
+def test_vllm_whose_distribution_record_differs_from_the_signed_pin_is_refused():
+    # ITER3 C1: a fake or swapped build with the right version string but a different RECORD
+    signed = "dd" * 32
+    res = inv.verify_vllm("0.29.0", runner=_vllm_runner("cc" * 32), pinned_record_sha256=signed)
+    assert res["verified"] is False
+    assert "RECORD" in res["reason"]
+
+
+def test_vllm_matching_the_signed_version_and_record_verifies():
+    # positive control for the test above
+    signed = "dd" * 32
+    res = inv.verify_vllm("0.29.0", runner=_vllm_runner(signed), pinned_record_sha256=signed)
+    assert res["verified"] is True
+
+
+def test_vllm_with_the_right_record_but_another_version_is_refused():
+    signed = "dd" * 32
+    res = inv.verify_vllm("0.29.0", runner=_vllm_runner(signed, version="0.30.0"), pinned_record_sha256=signed)
+    assert res["verified"] is False
+
+
 # --- weights: the manifest must be pinned and must cover every weight file ---
 
 def _model_dir(tmp_path: Path) -> tuple[Path, bytes]:
@@ -205,7 +236,33 @@ def test_indexed_receipt_with_matching_hash_counts(tmp_path):
     index = tmp_path / "index.json"
     index.write_text(json.dumps({"receipts": [{"cell_id": "cell-1", "file": "cell-1.json", "sha256": sha(data)}]}),
                      encoding="utf8")
-    assert inv.load_receipts(rdir, index) == {"cell-1": True}
+    # ITER3 C1: the index counts only when its own hash is the owner-signed pin
+    assert inv.load_receipts(rdir, index, expected_index_sha256=sha(index.read_bytes())) == {"cell-1": True}
+
+
+def test_an_index_without_a_signed_hash_counts_nothing(tmp_path):
+    # ITER3 C1: a locally written index, self-consistent with the receipts, is not a pin
+    rdir = tmp_path / "receipts"
+    rdir.mkdir()
+    data = _receipt(rdir, "cell-1")
+    index = tmp_path / "index.json"
+    index.write_text(json.dumps({"receipts": [{"cell_id": "cell-1", "file": "cell-1.json", "sha256": sha(data)}]}),
+                     encoding="utf8")
+    assert inv.load_receipts(rdir, index) == {}
+    assert inv.load_receipts(rdir, index, expected_index_sha256=None) == {}
+
+
+def test_an_index_edited_after_it_was_signed_counts_nothing(tmp_path):
+    rdir = tmp_path / "receipts"
+    rdir.mkdir()
+    data = _receipt(rdir, "cell-1")
+    index = tmp_path / "index.json"
+    index.write_text(json.dumps({"receipts": [{"cell_id": "cell-1", "file": "cell-1.json", "sha256": sha(data)}]}),
+                     encoding="utf8")
+    signed_hash = sha(index.read_bytes())
+    index.write_text(json.dumps({"receipts": [{"cell_id": "cell-2", "file": "cell-1.json", "sha256": sha(data)}]}),
+                     encoding="utf8")
+    assert inv.load_receipts(rdir, index, expected_index_sha256=signed_hash) == {}
 
 
 # --- end to end: the auditor's fabricated bundle must produce zero READY cells ---
@@ -255,7 +312,7 @@ def test_full_fabricated_bundle_yields_zero_ready(tmp_path, owner_keys, monkeypa
         pilot_path, matrix_path, models_root=models, authorization=forged, receipts_dir=receipts,
         min_free_gib=0.0, hash_weights=True,
         probe_gpu_fn=lambda: {"name": "mock A100", "compute_cap": 8.0, "memory_total_mib": 40960},
-        feasibility_path=None, allowed_signers=None, pinned_manifest_sha256={}, owner_record=forged,
+        feasibility_path=None, allowed_signers=None, owner_record=forged,
     )
     assert report["matrices"]["pilot"]["counts"]["READY"] == 0
     assert report["matrices"]["full"]["counts"]["READY"] == 0

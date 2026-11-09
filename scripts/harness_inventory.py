@@ -9,6 +9,10 @@ checksum, dataset revision, disk headroom, and a GPU smoke receipt.
 
 Status vocabulary: READY, BLOCKED_<REASON>, UNSUPPORTED, NOT_TESTED. A cell is READY only when
 every check passes. A GPU smoke receipt is required, so no cell is READY without a real run.
+ITER3 C1: every pin (revisions, weights manifest, dataset checksum, vLLM version and RECORD, receipt
+index, GPU name and uuid) comes only from the owner-signed record. Config values and flags are never pins.
+Each cell also gets a ladder state (see LADDER_RUNGS). Trust model: host-produced evidence has no external
+trust anchor except the owner's signing key, which must stay off this host. See docs/harness/READINESS.md.
 Nothing here starts a GPU job, installs software or writes outside the report paths.
 """
 from __future__ import annotations
@@ -58,6 +62,7 @@ CHECKS = (
     ("owner_authorization", "BLOCKED_OWNER_AUTHORIZATION"),
     ("vllm_importable", "BLOCKED_VLLM_NOT_INSTALLED"),
     ("live_probe", "BLOCKED_LIVE_PROBE_FAILED"),  # N-1: an executed probe in this run, not a file on disk
+    ("gpu_identity", "BLOCKED_GPU_IDENTITY"),     # ITER3 C1: name AND uuid equal the owner-signed GPU pin
     ("gpu_compute_capability", "BLOCKED_GPU_CAPABILITY"),
     ("gpu_memory", "BLOCKED_GPU_MEMORY"),
     ("context_fits", "BLOCKED_CONTEXT_EXCEEDS_WINDOW"),
@@ -69,6 +74,25 @@ CHECKS = (
 )
 STATUS_VOCABULARY = (STATUS_READY, STATUS_UNSUPPORTED, STATUS_NOT_TESTED) + tuple(
     sorted({code for _, code in CHECKS if code} - {ARM_CODE}))
+
+# ITER3 C1: the explicit state ladder. A cell's ladder_state is the highest rung such that every check on
+# that rung and on every lower rung passes. BENCHMARK_CELL_COMPLETED is part of the vocabulary but NOTHING in
+# this inventory can reach it: a finished benchmark cell is recorded by the run itself, and no attestation
+# mechanism for that exists here. READY is exactly GPU_SMOKE_VERIFIED with every check passing.
+LADDER_RUNGS = (
+    ("PLAN_AUTHORIZED", ("owner_authorization",)),
+    ("STATIC_PREREQUISITES_VALID", ("arm_supported", "weights_present", "weights_verified",
+                                    "model_revision_pinned", "dataset_present", "dataset_checksum",
+                                    "dataset_revision_pinned", "disk_headroom", "context_fits")),
+    ("LIVE_ENVIRONMENT_VERIFIED", ("vllm_importable", "gpu_identity", "gpu_compute_capability",
+                                   "gpu_memory", "live_probe")),
+    ("GPU_SMOKE_VERIFIED", ("gpu_smoke_receipt",)),
+)
+LADDER_UNREACHABLE = "BENCHMARK_CELL_COMPLETED"
+LADDER_STATES = ("NONE",) + tuple(name for name, _ in LADDER_RUNGS) + (LADDER_UNREACHABLE,)
+_CHECK_NAMES = {name for name, _ in CHECKS}
+if sorted(n for _, names in LADDER_RUNGS for n in names) != sorted(_CHECK_NAMES):
+    raise RuntimeError("ladder rungs must cover every check exactly once")  # explicit: survives python -O
 
 
 # ---------------------------------------------------------------- enumeration
@@ -142,6 +166,14 @@ def classify_cell(cell: dict, env: dict) -> dict:
     outcomes["owner_authorization"] = "PASS" if env["authorization_ok"] else "FAIL"
     outcomes["vllm_importable"] = "PASS" if env["vllm_installed"] else "FAIL"
     outcomes["live_probe"] = "PASS" if (env.get("live_probe") or {}).get("ok") is True else "FAIL"
+    # ITER3 C1: identity is the signed pin, never a config value. Name AND uuid must both match it.
+    gpu_pin = env.get("gpu_pin") or {}
+    if gpu is None or not gpu_pin.get("name") or not gpu_pin.get("uuid"):
+        outcomes["gpu_identity"] = "FAIL"
+    elif gpu.get("name") == gpu_pin["name"] and gpu.get("uuid") == gpu_pin["uuid"]:
+        outcomes["gpu_identity"] = "PASS"
+    else:
+        outcomes["gpu_identity"] = "FAIL"
     if gpu is None:
         outcomes["gpu_compute_capability"] = "FAIL"
         outcomes["gpu_memory"] = "NOT_TESTED"
@@ -186,17 +218,31 @@ def classify_cell(cell: dict, env: dict) -> dict:
     checks = {name: ("PASS" if outcomes[name] == "PASS" else
                      "FAIL" if outcomes[name].startswith("FAIL") else "NOT_TESTED")
               for name, _ in CHECKS}
-    return {"status": status, "blockers": blockers, "not_tested": not_tested, "checks": checks}
+    return {"status": status, "blockers": blockers, "not_tested": not_tested, "checks": checks,
+            "ladder_state": ladder_state(checks)}
+
+
+def ladder_state(checks: dict) -> str:
+    """Highest rung whose checks, and every lower rung's, all PASS. Never BENCHMARK_CELL_COMPLETED."""
+    state = "NONE"
+    for rung, names in LADDER_RUNGS:
+        if not all(checks.get(n) == "PASS" for n in names):
+            break
+        state = rung
+    return state
 
 
 def summarize(statuses: list[dict]) -> dict:
     counts = {s: 0 for s in STATUS_VOCABULARY}
+    ladder = {s: 0 for s in LADDER_STATES}
     blocker_counts: dict[str, int] = {}
     for st in statuses:
         counts[st["status"]] = counts.get(st["status"], 0) + 1
+        if "ladder_state" in st:
+            ladder[st["ladder_state"]] = ladder.get(st["ladder_state"], 0) + 1
         for code in st["blockers"]:
             blocker_counts[code] = blocker_counts.get(code, 0) + 1
-    return {"cell_count": len(statuses), "counts": counts,
+    return {"cell_count": len(statuses), "counts": counts, "ladder_counts": ladder,
             "blocker_counts": dict(sorted(blocker_counts.items()))}
 
 
@@ -256,7 +302,7 @@ def sha256_hex(data: bytes) -> str:
 
 
 def probe_gpu(runner=subprocess.run) -> dict | None:
-    args = ["nvidia-smi", "--query-gpu=name,compute_cap,memory.total",
+    args = ["nvidia-smi", "--query-gpu=name,uuid,compute_cap,memory.total",
             "--format=csv,noheader,nounits"]
     try:
         done = runner(args, capture_output=True, text=True, timeout=10, check=True)
@@ -264,10 +310,12 @@ def probe_gpu(runner=subprocess.run) -> dict | None:
         return None
     line = next((x for x in done.stdout.splitlines() if x.strip()), "")
     parts = [p.strip() for p in line.split(",")]
-    if len(parts) != 3:
+    if len(parts) != 4:
         return None
     try:
-        return {"name": parts[0], "compute_cap": float(parts[1]), "memory_total_mib": int(float(parts[2]))}
+        # Self-reported by the host: this is identity evidence only when it equals the owner-signed pin.
+        return {"name": parts[0], "uuid": parts[1], "compute_cap": float(parts[2]),
+                "memory_total_mib": int(float(parts[3]))}
     except ValueError:
         return None
 
@@ -278,7 +326,7 @@ def verify_owner_authorization(record_path: Path, campaign_id: str, plan_path: P
     owner signer file kept outside the repository, naming this campaign and this plan's hash.
     A bare JSON file, however it reads, never authorizes.
     """
-    out = {"verified": False, "reason": "", "resource": None}
+    out = {"verified": False, "reason": "", "resource": None, "pins": {}}
     sig = record_path.with_name(record_path.name + ".sig")
     if not record_path.is_file() or not sig.is_file():
         out["reason"] = "no signed owner record"
@@ -315,31 +363,67 @@ def verify_owner_authorization(record_path: Path, campaign_id: str, plan_path: P
         return out
     out["verified"] = True
     out["resource"] = str(record["resource"])
+    # ITER3 C1: the pins live only in the signed record. Config values and flags never supply them.
+    out["pins"] = record.get("pins") if isinstance(record.get("pins"), dict) else {}
     out["reason"] = "signed by an owner key for this campaign and plan"
     return out
 
 
-def verify_vllm(pinned_version: str | None, runner=subprocess.run) -> dict:
-    """vLLM counts only when importing it and its compiled kernels succeeds and the version equals
-    the configured pin. A stub package or an unpinned install is not verified."""
+def signed_pin(pins: dict, *path: str) -> str | None:
+    """Read one string pin from the signed record. Anything that is not a non-empty string is no pin."""
+    node: Any = pins
+    for key in path:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return node if isinstance(node, str) and node else None
+
+
+VLLM_CHECK_CODE = r"""
+import hashlib, importlib.metadata as md, json, sys
+import vllm, vllm._C
+dist = md.distribution("vllm")
+record = (dist.read_text("RECORD") or "").encode("utf8")
+print(json.dumps({"module_version": vllm.__version__, "dist_version": dist.version,
+                  "record_sha256": hashlib.sha256(record).hexdigest()}))
+"""
+
+
+def verify_vllm(pinned_version: str | None, runner=subprocess.run,
+                pinned_record_sha256: str | None = None) -> dict:
+    """vLLM counts only when importing it and its compiled kernels succeeds, the module and distribution
+    versions equal the signed version pin, and the installed distribution RECORD hashes to the signed pin.
+    A stub package, an unpinned install or a different build is not verified. Both pins come from the
+    owner-signed record. The RECORD hash is produced on this host: it defeats a casual swap, not a
+    determined local actor."""
     out = {"verified": False, "installed": False, "kernels_importable": False, "version": None,
-           "pinned_version": pinned_version}
-    if not pinned_version:
-        out["reason"] = "no vLLM version pinned in config"
+           "record_sha256": None, "pinned_version": pinned_version,
+           "pinned_record_sha256": pinned_record_sha256}
+    if not pinned_version or not pinned_record_sha256:
+        out["reason"] = "no signed vLLM pin (version and distribution record)"
         return out
-    code = "import vllm, vllm._C; print(vllm.__version__)"
     try:
-        done = runner([sys.executable, "-c", code], capture_output=True, text=True, timeout=180)
+        done = runner([sys.executable, "-I", "-c", VLLM_CHECK_CODE], capture_output=True, text=True, timeout=180)
     except (OSError, subprocess.SubprocessError):
         out["reason"] = "could not run the import check"
         return out
     if done.returncode != 0:
         out["reason"] = "import of vllm or vllm._C failed"
         return out
-    version = done.stdout.strip().splitlines()[-1] if done.stdout.strip() else ""
-    out.update(installed=True, kernels_importable=True, version=version)
-    out["verified"] = version == pinned_version
-    out["reason"] = "pinned version and kernels import" if out["verified"] else "version differs from pin"
+    try:
+        info = json.loads(done.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError, AttributeError):
+        out["reason"] = "import check produced no metadata"
+        return out
+    out.update(installed=True, kernels_importable=True, version=info.get("dist_version"),
+               record_sha256=info.get("record_sha256"))
+    if info.get("module_version") != pinned_version or info.get("dist_version") != pinned_version:
+        out["reason"] = "version differs from the signed pin"
+    elif info.get("record_sha256") != pinned_record_sha256:
+        out["reason"] = "distribution RECORD differs from the signed pin"
+    else:
+        out["verified"] = True
+        out["reason"] = "signed version and distribution record match, kernels import"
     return out
 
 
@@ -352,10 +436,12 @@ import hashlib, importlib.metadata as md, json, os, subprocess, sys
 nonce, spec = sys.argv[1], json.loads(sys.argv[2])
 out = {"nonce": nonce, "pid": os.getpid(), "python": sys.executable}
 try:
-    dist = md.version("vllm")
+    dist_obj = md.distribution("vllm")
+    dist = dist_obj.version
+    record = (dist_obj.read_text("RECORD") or "").encode("utf8")
+    out["vllm"] = {"dist_version": dist, "record_sha256": hashlib.sha256(record).hexdigest()}
 except md.PackageNotFoundError:
-    dist = None
-out["vllm"] = {"dist_version": dist}
+    out["vllm"] = {"dist_version": None, "record_sha256": None}
 try:
     import vllm, vllm._C
     out["vllm"]["module_version"] = getattr(vllm, "__version__", None)
@@ -401,8 +487,12 @@ print(json.dumps(out))
 
 
 def evaluate_probe(report: Any, *, nonce: str, parent_pid: int, resource_name: str | None,
-                   vllm_pin: str | None, weight_specs: dict | None) -> dict:
-    """Pure check of one probe report against the plan. Every reason to refuse is listed."""
+                   vllm_pin: str | None, weight_specs: dict | None,
+                   vllm_record_sha256: str | None = None, gpu_uuid: str | None = None) -> dict:
+    """Pure check of one probe report against the signed plan. Every reason to refuse is listed.
+
+    resource_name, vllm_pin, vllm_record_sha256, gpu_uuid and weight_specs must come from the owner-signed
+    record. A missing value is refused, never skipped."""
     if not isinstance(report, dict):
         return {"ok": False, "reasons": ["probe output is not a JSON object"]}
     reasons: list[str] = []
@@ -416,14 +506,22 @@ def evaluate_probe(report: Any, *, nonce: str, parent_pid: int, resource_name: s
     if not vllm.get("dist_version"):
         reasons.append("vLLM distribution metadata missing (stub or unmanaged package)")
     elif not vllm_pin:
-        reasons.append("no vLLM version pinned in config")
+        reasons.append("no signed vLLM version pin")
     elif vllm["dist_version"] != vllm_pin:
-        reasons.append(f"vLLM version {vllm['dist_version']} differs from pin {vllm_pin}")
+        reasons.append(f"vLLM version {vllm['dist_version']} differs from the signed pin {vllm_pin}")
+    if not vllm_record_sha256:
+        reasons.append("no signed vLLM distribution-record pin")
+    elif vllm.get("record_sha256") != vllm_record_sha256:
+        reasons.append("vLLM distribution RECORD differs from the signed pin")
     if not resource_name:
-        reasons.append("plan names no resource")
+        reasons.append("no signed GPU name pin")
     smi = report.get("nvidia_smi") or {}
     if resource_name and smi.get("name") != resource_name:
-        reasons.append(f"GPU name {smi.get('name')!r} differs from plan resource {resource_name!r}")
+        reasons.append(f"GPU name {smi.get('name')!r} differs from the signed pin {resource_name!r}")
+    if not gpu_uuid:
+        reasons.append("no signed GPU uuid pin")
+    elif smi.get("uuid") != gpu_uuid:
+        reasons.append("GPU uuid differs from the signed pin")
     cuda = report.get("cuda") or {}
     if "error" in cuda:
         reasons.append(f"CUDA kernel did not run: {cuda['error']}")
@@ -453,7 +551,8 @@ def evaluate_probe(report: Any, *, nonce: str, parent_pid: int, resource_name: s
 
 
 def run_live_probe(resource_name: str | None, vllm_pin: str | None, weight_specs: dict | None, *,
-                   runner=subprocess.run, timeout_s: float = 600) -> dict:
+                   runner=subprocess.run, timeout_s: float = 600,
+                   vllm_record_sha256: str | None = None, gpu_uuid: str | None = None) -> dict:
     nonce = secrets.token_hex(16)
     cmd = [sys.executable, "-I", "-c", LIVE_PROBE_CODE, nonce, json.dumps(weight_specs or {})]
     try:
@@ -468,13 +567,16 @@ def run_live_probe(resource_name: str | None, vllm_pin: str | None, weight_specs
     if report is None:
         return {"ok": False, "reasons": [f"live probe produced no JSON (exit {done.returncode})"]}
     return evaluate_probe(report, nonce=nonce, parent_pid=os.getpid(), resource_name=resource_name,
-                          vllm_pin=vllm_pin, weight_specs=weight_specs)
+                          vllm_pin=vllm_pin, weight_specs=weight_specs,
+                          vllm_record_sha256=vllm_record_sha256, gpu_uuid=gpu_uuid)
 
 
-def probe_dataset(spec: dict) -> dict:
+def probe_dataset(spec: dict, expected_sha256: str | None = None) -> dict:
+    """The expected checksum is the owner-signed native_sha256. A checksum in the config (or written next
+    to the file by the local actor) is never the expectation."""
     path = Path(spec["native_path"]) if spec.get("native_path") else None
     present = bool(path and path.exists())
-    expected = spec.get("native_sha256")
+    expected = expected_sha256
     checksum_verified = False
     if present and expected and path.is_file():
         digest = hashlib.sha256()
@@ -486,14 +588,22 @@ def probe_dataset(spec: dict) -> dict:
             "checksum_verified": checksum_verified}
 
 
-def load_receipts(receipts_dir: Path | None, index_path: Path | None = DEFAULT_RECEIPT_INDEX) -> dict:
-    """A receipt counts only when the committed index lists it with a matching SHA-256 and it
-    reports PASS_MEASURED for that same cell. A file in the directory alone never counts."""
-    if receipts_dir is None or index_path is None or not index_path.is_file():
+def load_receipts(receipts_dir: Path | None, index_path: Path | None = DEFAULT_RECEIPT_INDEX,
+                  *, expected_index_sha256: str | None = None) -> dict:
+    """A receipt counts only when the index file hashes to the owner-signed receipt_index_sha256, the index
+    lists it with a matching SHA-256, and it reports PASS_MEASURED for that same cell. A file in the
+    directory alone never counts, and an index that is not signed counts for nothing (ITER3 C1)."""
+    if receipts_dir is None or index_path is None or not index_path.is_file() or not expected_index_sha256:
         return {}
     try:
-        entries = json.loads(index_path.read_text(encoding="utf8")).get("receipts", [])
-    except (OSError, json.JSONDecodeError, AttributeError):
+        index_bytes = index_path.read_bytes()
+    except OSError:
+        return {}
+    if sha256_hex(index_bytes) != expected_index_sha256:
+        return {}
+    try:
+        entries = json.loads(index_bytes.decode("utf8")).get("receipts", [])
+    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
         return {}
     found = {}
     for entry in entries:
@@ -525,7 +635,6 @@ def build_report(pilot_config: Path, matrix_manifest: Path, *, models_root: Path
                  hash_weights: bool, probe_gpu_fn=probe_gpu,
                  feasibility_path: Path | None = DEFAULT_FEASIBILITY,
                  allowed_signers: Path | None = None,
-                 pinned_manifest_sha256: dict[str, str] | None = None,
                  owner_record: Path | None = None,
                  receipt_index: Path | None = DEFAULT_RECEIPT_INDEX,
                  live_probe: bool = True) -> dict:
@@ -535,6 +644,22 @@ def build_report(pilot_config: Path, matrix_manifest: Path, *, models_root: Path
     matrix_cells = enumerate_matrix_cells(matrix_manifest)
 
     models = {m["id"]: m for m in config["models"]}
+    campaign_pilot = config["campaign_id"]
+    record = owner_record or authorization
+    auth_pilot = verify_owner_authorization(record, campaign_pilot, pilot_config, allowed_signers)
+    auth_full = verify_owner_authorization(record, manifest["campaign_id"], matrix_manifest, allowed_signers)
+    authorized_pilot, authorized_full = auth_pilot["verified"], auth_full["verified"]
+
+    # ITER3 C1: every pin comes from the owner-signed record, and only from a record whose signature
+    # verified. Config revisions, config checksums, config vllm_pin and command-line flags are reported
+    # for transparency but never used as pins. The signature is the only external anchor, and it must
+    # be checked against a signer file kept off this host.
+    pins = (auth_pilot if authorized_pilot else auth_full)["pins"] if (authorized_pilot or authorized_full) else {}
+    gpu_pin = {"name": signed_pin(pins, "gpu", "name"), "uuid": signed_pin(pins, "gpu", "uuid")}
+    vllm_version_pin = signed_pin(pins, "vllm", "version")
+    vllm_record_pin = signed_pin(pins, "vllm", "distribution_record_sha256")
+    receipt_index_pin = signed_pin(pins, "receipt_index_sha256")
+
     weights, revisions = {}, {}
     for mid in sorted(set(manifest["models"]) | {c["model"] for c in pilot_cells}):
         hf_id = models[mid]["hf_id"]
@@ -542,20 +667,15 @@ def build_report(pilot_config: Path, matrix_manifest: Path, *, models_root: Path
         manifest_file = model_dir / LOCAL_WEIGHTS_MANIFEST
         weights[mid] = probe_weights(model_dir, manifest_file if manifest_file.is_file() else None,
                                      hash_files=hash_weights,
-                                     pinned_manifest_sha256=(pinned_manifest_sha256 or {}).get(mid))
-        rev = models[mid].get("revision")
-        revisions[mid] = rev if rev else None
-    datasets = {d["id"]: probe_dataset(d) for d in config["datasets"]}
-    dataset_revisions = {d["id"]: d.get("revision") or None for d in config["datasets"]}
+                                     pinned_manifest_sha256=signed_pin(pins, "models", mid, "weights_manifest_sha256"))
+        revisions[mid] = signed_pin(pins, "models", mid, "revision")
+    datasets = {d["id"]: probe_dataset(d, expected_sha256=signed_pin(pins, "datasets", d["id"], "native_sha256"))
+                for d in config["datasets"]}
+    dataset_revisions = {d["id"]: signed_pin(pins, "datasets", d["id"], "revision") for d in config["datasets"]}
     gpu = probe_gpu_fn()
-    receipts = load_receipts(receipts_dir, receipt_index)
+    receipts = load_receipts(receipts_dir, receipt_index, expected_index_sha256=receipt_index_pin)
     disk_free = shutil.disk_usage(models_root if models_root.exists() else REPO).free / 2**30
-    campaign_pilot = config["campaign_id"]
-    record = owner_record or authorization
-    auth_pilot = verify_owner_authorization(record, campaign_pilot, pilot_config, allowed_signers)
-    auth_full = verify_owner_authorization(record, manifest["campaign_id"], matrix_manifest, allowed_signers)
-    authorized_pilot, authorized_full = auth_pilot["verified"], auth_full["verified"]
-    vllm = verify_vllm(config.get("vllm_pin"))["verified"]
+    vllm = verify_vllm(vllm_version_pin, pinned_record_sha256=vllm_record_pin)["verified"]
 
     # N-1: READY also needs a live probe executed in this run. Weight specs come only from pinned manifests.
     weight_specs = None
@@ -570,12 +690,12 @@ def build_report(pilot_config: Path, matrix_manifest: Path, *, models_root: Path
     elif not (authorized_pilot or authorized_full):
         live = {"ok": False, "reasons": ["not run: no verified owner authorization"]}
     else:
-        resource = (auth_pilot if authorized_pilot else auth_full)["resource"]
-        live = run_live_probe(resource, config.get("vllm_pin"), weight_specs)
+        live = run_live_probe(gpu_pin["name"], vllm_version_pin, weight_specs,
+                              vllm_record_sha256=vllm_record_pin, gpu_uuid=gpu_pin["uuid"])
 
     def env_for(serving_max, authorized):
         return {"weights": weights, "revisions": revisions, "dataset_revisions": dataset_revisions,
-                "authorization_ok": authorized, "vllm_installed": vllm, "gpu": gpu,
+                "authorization_ok": authorized, "vllm_installed": vllm, "gpu": gpu, "gpu_pin": gpu_pin,
                 "serving_max_model_len": serving_max, "datasets": datasets,
                 "disk_free_gib": disk_free, "min_free_gib": min_free_gib, "receipts": receipts,
                 "live_probe": live}
@@ -589,31 +709,42 @@ def build_report(pilot_config: Path, matrix_manifest: Path, *, models_root: Path
     pilot_summary = summarize([c for c in cells if c["matrix"] == "pilot"])
     full_summary = summarize([c for c in cells if c["matrix"] == "full"])
     return {
-        "schema": "harness_inventory/1",
+        "schema": "harness_inventory/2",
         "head": git_head(),
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "status_vocabulary": list(STATUS_VOCABULARY),
+        "ladder": list(LADDER_STATES),
         "rules": {
             "required_compute_capability": REQUIRED_CAPABILITY,
             "required_vram_mib": REQUIRED_VRAM_MIB,
             "output_tokens": OUTPUT_TOKENS,
             "min_free_gib": min_free_gib,
             "min_free_gib_is_guard_not_measurement": True,
-            "ready_requires": ("every check PASS, including a live probe executed in this run "
-                               "(nonce echo, vLLM metadata and import, CUDA kernel, GPU name matching the plan, "
-                               "recomputed weight SHA-256) and a verified gpu_smoke_receipt"),
+            "pins_source": "owner-signed record only (revisions, weights manifest, dataset native_sha256, "
+                           "vLLM version and RECORD, receipt index, GPU name and uuid)",
+            "ready_requires": ("every check PASS: a signed owner authorization, pins from the signed record, "
+                               "weights matching the signed manifest, vLLM and GPU identity matching the signed "
+                               "pins, a live probe executed in this run (nonce echo, CUDA kernel, recomputed "
+                               "weight SHA-256), and a gpu_smoke_receipt listed in the signed receipt index"),
+            "ladder_top_reachable": "GPU_SMOKE_VERIFIED (BENCHMARK_CELL_COMPLETED is not reachable here)",
         },
         "environment": {
             "models_root": str(models_root),
             "weights": weights,
-            "revisions_in_config": revisions,
+            "signed_pins_used": pins,
+            "config_values_ignored": {
+                "revisions": {mid: models[mid].get("revision") for mid in models},
+                "datasets_native_sha256": {d["id"]: d.get("native_sha256") for d in config["datasets"]},
+                "vllm_pin": config.get("vllm_pin"),
+            },
+            "revisions_pinned": revisions,
             "vllm_installed": vllm,
             "gpu": gpu,
             "disk_free_gib": round(disk_free, 3),
             "authorization_file": str(authorization),
             "authorization_ok": {"pilot": authorized_pilot, "full": authorized_full},
             "datasets": datasets,
-            "dataset_revisions_in_config": dataset_revisions,
+            "dataset_revisions_pinned": dataset_revisions,
             "receipts_loaded": len(receipts),
             "weights_hashed": hash_weights,
             "live_probe": live,
@@ -659,6 +790,13 @@ def render_markdown(report: dict) -> str:
         m = report["matrices"][name]
         row = " | ".join(str(m["counts"].get(s, 0)) for s in report["status_vocabulary"])
         lines.append(f"| {name} ({m['campaign_id']}) | {m['cell_count']} | {row} |")
+    lines += ["", "Ladder state reached per cell (highest rung whose checks, and all lower ones, pass):", "",
+              "| Matrix | " + " | ".join(report["ladder"]) + " |",
+              "|---|" + "---:|" * len(report["ladder"])]
+    for name in ("pilot", "full"):
+        m = report["matrices"][name]
+        row = " | ".join(str(m["ladder_counts"].get(s, 0)) for s in report["ladder"])
+        lines.append(f"| {name} | {row} |")
     lines += ["", "## 2. Blocker counts (a cell can carry several)", "",
               "| Blocker | Pilot cells | Full-matrix cells |", "|---|---:|---:|"]
     codes = sorted(set(report["matrices"]["pilot"]["blocker_counts"]) |
@@ -678,16 +816,22 @@ def render_markdown(report: dict) -> str:
               f"- Disk free on models root: {env['disk_free_gib']} GiB (guard: {report['rules']['min_free_gib']} GiB)",
               f"- Owner authorization file `{env['authorization_file']}`: {env['authorization_ok']}",
               f"- Datasets: " + "; ".join(f"`{k}` present={v['present']}" for k, v in env["datasets"].items()),
-              f"- Revisions in config: models {env['revisions_in_config']}; datasets {env['dataset_revisions_in_config']}",
+              f"- Pins from the owner-signed record (only source): models {env['revisions_pinned']}; "
+              f"datasets {env['dataset_revisions_pinned']}; signed pins present: {bool(env['signed_pins_used'])}",
+              f"- Config revisions, checksums and vllm_pin are reported but ignored: {env['config_values_ignored']}",
               f"- GPU smoke receipts loaded: {env['receipts_loaded']}", "",
               "## 4. Assumptions and limits", "",
               f"- BF16 native support requires compute capability >= {REQUIRED_CAPABILITY} (Ampere or newer). "
               "This is an assumption about the target runtime, not a measurement.",
               f"- VRAM floor {REQUIRED_VRAM_MIB} MiB is the A100 40GB contract from `vlmbench.config.validate`.",
               f"- Disk guard {report['rules']['min_free_gib']} GiB is a conservative guard, not a measured requirement.",
-              "- The 0.8B weights are checked against the local manifest (`starlight_local_manifest.json`). That manifest's "
-              "revision is not an owner pin, so the config revision remains UNPINNED.",
-              "- Datasets are checked at the config's `native_path` (Drive paths). None exist on this host.",
+              "- The weights are checked against the local manifest (`starlight_local_manifest.json`) only when that "
+              "manifest's SHA-256 is pinned in the owner-signed record. A manifest on disk is not a pin.",
+              "- Datasets are checked at the config's `native_path` (Drive paths) against the signed `native_sha256`. "
+              "A checksum written beside a file is not an expectation.",
+              "- The ladder (PLAN_AUTHORIZED < STATIC_PREREQUISITES_VALID < LIVE_ENVIRONMENT_VERIFIED < "
+              "GPU_SMOKE_VERIFIED < BENCHMARK_CELL_COMPLETED) is documented in `docs/harness/READINESS.md`. "
+              "This report can reach GPU_SMOKE_VERIFIED at most.",
               "- Full-matrix cells use the pilot config's dataset paths and authorization record, and have no serving "
               "`max_model_len` (the 7-method manifest does not set one).",
               "- Nothing here starts a GPU job, loads a model or contacts the network.", "",
@@ -722,18 +866,16 @@ def main(argv=None) -> int:
                    help="owner signer file kept outside the repository (required for any authorization)")
     p.add_argument("--owner-record", type=Path, default=None, help="signed owner record (defaults to --authorization)")
     p.add_argument("--receipt-index", type=Path, default=DEFAULT_RECEIPT_INDEX)
-    p.add_argument("--pin-manifest", action="append", default=[], metavar="MODEL_ID=SHA256",
-                   help="pinned SHA-256 of a model's local weights manifest (repeatable)")
     p.add_argument("--plan-only", action="store_true",
                    help="skip the live probe: the report says so and no cell can be READY")
     p.add_argument("--out-json", type=Path, default=REPO / "docs/harness/PILOT_INVENTORY.json")
     p.add_argument("--out-md", type=Path, default=REPO / "docs/harness/PILOT_INVENTORY.md")
+    # ITER3 C1: there is no flag for pins. They come only from the owner-signed record (--owner-record).
     args = p.parse_args(argv)
-    pins = dict(item.split("=", 1) for item in args.pin_manifest)
     report = build_report(args.pilot_config, args.matrix_manifest, models_root=args.models_root,
                           authorization=args.authorization, receipts_dir=args.receipts_dir,
                           min_free_gib=args.min_free_gib, hash_weights=not args.no_hash_weights,
-                          allowed_signers=args.allowed_signers, pinned_manifest_sha256=pins,
+                          allowed_signers=args.allowed_signers,
                           owner_record=args.owner_record or args.authorization,
                           receipt_index=args.receipt_index, live_probe=not args.plan_only)
     args.out_json.parent.mkdir(parents=True, exist_ok=True)

@@ -542,6 +542,11 @@ def main(argv=None):
     official.add_argument("--upstream-result", required=True, type=Path)
     official.add_argument("--judge-revision", required=True)
     official.add_argument("--sample-manifest-sha256", required=True)
+    # ITER3 C4: without a signed extractor-stage qualification the output is BLOCKED_NO_JUDGE, never official.
+    official.add_argument("--qualification", type=Path, default=None,
+                          help="signed extractor-stage qualification (namespace vlmbench-extractor-qualification)")
+    official.add_argument("--allowed-signers", type=Path, default=None,
+                          help="qualifier signer file, kept outside the repository")
     official.add_argument("--out", required=True, type=Path)
 
     args = p.parse_args(argv)
@@ -618,7 +623,8 @@ def main(argv=None):
     if args.command == "import-official-score":
         data = import_official(args.upstream_result, dataset=args.dataset,
                                judge_revision=args.judge_revision,
-                               sample_manifest_sha256=args.sample_manifest_sha256)
+                               sample_manifest_sha256=args.sample_manifest_sha256,
+                               qualification=args.qualification, allowed_signers=args.allowed_signers)
         atomic_json(args.out, data)
         print(args.out)
         return 0

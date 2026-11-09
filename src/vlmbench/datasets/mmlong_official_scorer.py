@@ -21,15 +21,25 @@ WHAT IS NOT PORTED (official three-stage protocol, README section 4.1):
   a model step, so it is an interface only. Without its output this module reports
   BLOCKED_NO_JUDGE and never a heuristic score labelled as official.
   Stage 3 is the deterministic scoring in this file.
+
+ITER3 C4: an OFFICIAL_SCORED_STAGE3_ONLY label needs a signed extractor-stage qualification (see
+`verify_qualification`) that names this scorer's provenance, the official extractor model and prompt
+hash, the sample manifest and the exact stage-2 outputs. Without it, every path returns BLOCKED_NO_JUDGE.
+Declared metadata alone never produces the label. No proxy metric (EM, token F1) is labelled official.
 """
 from __future__ import annotations
 
 import ast
+import json
 import re
+import subprocess
 from collections import defaultdict
 from dataclasses import dataclass
 from math import isclose
+from pathlib import Path
 from typing import Any, Iterable, Sequence
+
+from ..signed_records import sha256_hex, verify_signed_record
 
 UPSTREAM_REPO = "https://github.com/mayubo2333/MMLongBench-Doc"
 UPSTREAM_COMMIT = "d73f0dc0be7e0a2ff6a403d5fe65fcd96461f384"
@@ -268,6 +278,68 @@ def is_official_extraction(ext: ExtractedAnswer) -> bool:
     return ext.extractor_model == OFFICIAL_EXTRACTOR_MODEL and ext.extractor_prompt_sha256 == EXTRACTION_PROMPT_SHA256
 
 
+# ITER3 C4: a declared model name and prompt hash are not enough. An official label also needs
+# (a) the scorer provenance below, and (b) a signed extractor-stage qualification that binds the exact
+# extraction outputs (or the exact upstream result file) and the sample manifest. The signer is a qualifier
+# key in its own namespace, never the owner's key.
+SCORER_PROVENANCE = {
+    "upstream_repo": UPSTREAM_REPO,
+    "upstream_commit": UPSTREAM_COMMIT,
+    "eval_score_sha256": EVAL_SCORE_SHA256,
+    "extract_answer_sha256": EXTRACT_ANSWER_SHA256,
+    "extraction_prompt_sha256": EXTRACTION_PROMPT_SHA256,
+}
+QUALIFICATION_NAMESPACE = "vlmbench-extractor-qualification"
+QUALIFICATION_PRINCIPAL = "extractor-qualifier"
+QUALIFICATION_RECORD_TYPE = "extractor_stage_qualification"
+
+
+def extractions_digest(extracted: dict[str, ExtractedAnswer]) -> str:
+    """Canonical SHA-256 over every stage-2 output: question id, prediction, extractor model and prompt hash."""
+    rows = [[qid, e.pred, e.extractor_model, e.extractor_prompt_sha256] for qid, e in sorted(extracted.items())]
+    return sha256_hex(json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode("utf8"))
+
+
+def verify_qualification(path: Path | None, *, allowed_signers: Path | None, sample_manifest_sha256: str | None,
+                         extractions: dict[str, ExtractedAnswer] | None = None,
+                         upstream_result_sha256: str | None = None, runner=subprocess.run) -> dict[str, Any]:
+    """Verify a signed extractor-stage qualification. Every mismatch is listed; nothing is skipped.
+
+    It must bind the scorer provenance, the official extractor model, the sample manifest, and at least one
+    output: the stage-2 extractions (`extractions`) or the upstream result file (`upstream_result_sha256`).
+    """
+    signed = verify_signed_record(path, namespace=QUALIFICATION_NAMESPACE, principal=QUALIFICATION_PRINCIPAL,
+                                  allowed_signers=allowed_signers, runner=runner)
+    if not signed["verified"]:
+        return {"verified": False, "reasons": [signed["reason"]], "sha256": None}
+    rec = signed["record"]
+    reasons: list[str] = []
+    if rec.get("record_type") != QUALIFICATION_RECORD_TYPE:
+        reasons.append("record is not an extractor-stage qualification")
+    if rec.get("dataset") != "mmlongbench_doc":
+        reasons.append("qualification names another dataset")
+    scorer = rec.get("scorer") if isinstance(rec.get("scorer"), dict) else {}
+    for key, value in SCORER_PROVENANCE.items():
+        if scorer.get(key) != value:
+            reasons.append(f"scorer {key} differs from the ported upstream provenance")
+    if rec.get("extractor_model") != OFFICIAL_EXTRACTOR_MODEL:
+        reasons.append("extractor model is not the official one")
+    if sample_manifest_sha256 is None or rec.get("sample_manifest_sha256") != sample_manifest_sha256:
+        reasons.append("sample manifest differs from the qualified one")
+    bound = False
+    if extractions is not None:
+        bound = True
+        if rec.get("extractions_sha256") != extractions_digest(extractions):
+            reasons.append("stage-2 extractions differ from the qualified outputs")
+    if upstream_result_sha256 is not None:
+        bound = True
+        if rec.get("upstream_result_sha256") != upstream_result_sha256:
+            reasons.append("upstream result file differs from the qualified one")
+    if not bound:
+        reasons.append("qualification is bound to no output")
+    return {"verified": not reasons, "reasons": reasons, "sha256": signed["sha256"], "record": rec}
+
+
 def _blocked(reason: str, **extra: Any) -> dict[str, Any]:
     out: dict[str, Any] = {
         "status": "BLOCKED_NO_JUDGE",
@@ -288,13 +360,23 @@ def official_status(extracted: Iterable[ExtractedAnswer] | None) -> dict[str, An
     raise NotImplementedError("scoring of extracted answers is applied via score_records()")
 
 
-def score_records(records: Sequence[dict], extracted: dict[str, ExtractedAnswer]) -> dict[str, Any]:
-    """Stage 3 over records and stage-2 output. The official label needs official extraction for every
-    question. Any other extraction, or a missing one, is BLOCKED_NO_JUDGE with no numbers.
+def score_records(records: Sequence[dict], extracted: dict[str, ExtractedAnswer], *,
+                  qualification: Path | None = None, allowed_signers: Path | None = None,
+                  sample_manifest_sha256: str | None = None, runner=subprocess.run) -> dict[str, Any]:
+    """Stage 3 over records and stage-2 output. The official label needs all of:
 
-    Limit: the scorer cannot verify that the extractor ran. It checks the model name and prompt hash the
-    caller declares, so OFFICIAL_SCORED_STAGE3_ONLY is only as strong as the caller's record of stage 2.
+      1. a signed extractor-stage qualification (`qualification`, verified against `allowed_signers`) that
+         binds the sample manifest and the exact extraction outputs (see verify_qualification);
+      2. official extraction (model and prompt hash) for every question;
+      3. no missing extraction.
+
+    Without (1) the result is BLOCKED_NO_JUDGE with no numbers, however the extraction was produced.
+    Limit: the signature proves who qualified these outputs, not that the extractor really ran. That trust sits
+    with the qualifier and the signer file, which must be kept off the benchmark host.
     """
+    if qualification is None:
+        return _blocked("no signed extractor-stage qualification: the judge stage is unqualified",
+                        reason_code="NO_QUALIFICATION")
     missing = [rec["question_id"] for rec in records if rec["question_id"] not in extracted]
     if missing:
         return _blocked("no stage-2 extraction for some questions", missing_question_ids=missing)
@@ -303,6 +385,10 @@ def score_records(records: Sequence[dict], extracted: dict[str, ExtractedAnswer]
         return _blocked("extraction is not from the official extractor model and prompt hash",
                         refused_question_ids=refused, official_extractor_model=OFFICIAL_EXTRACTOR_MODEL,
                         official_prompt_sha256=EXTRACTION_PROMPT_SHA256)
+    qual = verify_qualification(qualification, allowed_signers=allowed_signers,
+                                sample_manifest_sha256=sample_manifest_sha256, extractions=extracted, runner=runner)
+    if not qual["verified"]:
+        return _blocked("extractor-stage qualification did not verify", qualification_reasons=qual["reasons"])
     scored = []
     for rec in records:
         ext = extracted[rec["question_id"]]
@@ -316,5 +402,7 @@ def score_records(records: Sequence[dict], extracted: dict[str, ExtractedAnswer]
         "extractor_models": sorted({e.extractor_model for e in extracted.values()}),
         "extractor_prompt_sha256": sorted({e.extractor_prompt_sha256 for e in extracted.values()}),
         "upstream_commit": UPSTREAM_COMMIT,
+        "extractor_qualification_sha256": qual["sha256"],
+        "scorer_provenance": dict(SCORER_PROVENANCE),
     })
     return out
