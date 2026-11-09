@@ -313,7 +313,7 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
 
         # Verify arm-specific interventions & P1-03 cost accounting
         if "h2o" in arm:
-            assert res.physical_kv_bytes_freed > 0, f"{arm} must physically free KV bytes"
+            assert res.physical_kv_bytes_freed > 0, f"{arm}: expected nonzero per-step KV tensor footprint deltas"
             assert res.logical_selection_fraction > 0.0, f"{arm} must report logical selection fraction > 0"
         if "da" in arm:
             assert res.attention_mask_restriction_ratio > 0.0
@@ -338,6 +338,8 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
             "tpot_ms": round(res.tpot_ms, 2),
             "physical_kv_bytes_allocated": res.physical_kv_bytes_allocated,
             "physical_kv_bytes_freed": res.physical_kv_bytes_freed,
+            "kv_memory_accounting": res.telemetry["kv_memory_accounting"],
+            "mtp_candidate_diagnostic": res.telemetry["mtp_candidate_diagnostic"],
             "logical_selection_fraction": round(res.logical_selection_fraction, 4),
             "attention_mask_restriction_ratio": round(res.attention_mask_restriction_ratio, 4),
             "grounded_citations_count": len(res.grounded_citations),
@@ -354,7 +356,7 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
         arm_results[arm] = arm_info
         print(
             f"  Arm [{arm:10s}] -> Text: {res.output_text!r} | TTFT: {res.ttft_ms:.1f}ms, "
-            f"TPOT: {res.tpot_ms:.1f}ms, Freed: {res.physical_kv_bytes_freed}B, "
+            f"TPOT: {res.tpot_ms:.1f}ms, KVShapeDeltaSum(NOT VRAM): {res.physical_kv_bytes_freed}B, "
             f"DA_Mask_Ratio: {res.attention_mask_restriction_ratio:.4f}, "
             f"ViT_Tokens: {vis_trace['visual_token_embeddings_count']}, Citations: {len(res.grounded_citations)}"
         )
@@ -449,7 +451,7 @@ def run_test_e_speculative_correctness(model_dir: Path, fixture_path: Path, devi
     assert res.gates["MTP_CORRECTNESS_PASS"] == "GATED_NATIVE_MTP_VERIFIER_REQUIRED"
     assert res.gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS"
     assert res.mtp_acceptance_rate == 0.0
-    assert res.physical_kv_bytes_freed > 0, "H2O MTP transaction must physically free bytes"
+    assert res.physical_kv_bytes_freed > 0, "H2O diagnostic must show KV tensor footprint compaction"
     assert 0.0 <= res.mtp_acceptance_rate <= 1.0
 
     engine.close()
@@ -475,7 +477,9 @@ def run_test_e_speculative_correctness(model_dir: Path, fixture_path: Path, devi
         "mtp_acceptance_rate": 0.0,
         "proposal_match_rate": mtp_diag["proposal_match_rate"],
         "greedy_target_equivalence": True,
-        "physical_kv_freed_bytes": res.physical_kv_bytes_freed,
+        "legacy_physical_kv_freed_bytes": res.physical_kv_bytes_freed,
+        "kv_memory_accounting": res.telemetry["kv_memory_accounting"],
+        "peak_gpu_vram_saved_bytes": None,
         "output_text": res.output_text,
         "architectural_status": res.telemetry["architectural_status"],
         "gates": res.gates,
@@ -514,9 +518,11 @@ def run_test_f_fixed_output_serving(model_dir: Path, device: str = "cpu", target
         "ttft_ms": round(res.ttft_ms, 2),
         "tpot_ms": round(res.tpot_ms, 2),
         "throughput_tok_per_sec": round(target_tokens / (res.total_latency_ms / 1000.0), 2),
+        "throughput_scope": "SINGLE_REQUEST_LOCAL_PYTORCH_REFERENCE_NOT_VLLM_SERVING",
+        "quality_score_qualified": False,
         "architectural_status": res.telemetry["architectural_status"],
     }
-    print(f"Test F PASSED in {dt:.2f}s ({target_tokens} tokens committed, Throughput: {result['throughput_tok_per_sec']} tok/s)")
+    print(f"Test F PYTORCH DIAGNOSTIC PASSED in {dt:.2f}s ({target_tokens} tokens, local reference rate {result['throughput_tok_per_sec']} tok/s; NOT vLLM serving)")
     return result
 
 
@@ -573,6 +579,7 @@ def run_test_g_ccu_concurrency(model_dir: Path, device: str = "cpu") -> dict[str
     dt = time.perf_counter() - t0
     result = {
         "status": "PASS",
+        "concurrency_scope": "PYTORCH_THREAD_REQUEST_ISOLATION_NOT_VLLM_SCHEDULER",
         "duration_s": round(dt, 3),
         "levels": ccu_results,
     }
