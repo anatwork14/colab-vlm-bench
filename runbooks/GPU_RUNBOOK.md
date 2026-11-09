@@ -86,6 +86,7 @@ Stop the CPU session when done: `python scripts/colab_agent.py stop --session vl
    | `COMPLETE` | 0 | Every planned cell is PASS_MEASURED |
    | `IN_PROGRESS` | 0 | `--max-cells` cap reached, nothing failed; continue with the next call |
    | `PARTIAL_FAILURE` | 6 | Some cells PASS, some non-PASS remain. Read `counts` and the receipts |
+   | `INCOMPLETE_NOT_ATTEMPTED` | 6 | Nothing attempted in this call, and some planned cells are not PASS_MEASURED (R3-B). Uncapped MISSING cells count as non-completed, not as in progress |
    | `ALL_ATTEMPTED_FAILED` | 5 | Every cell attempted in this call failed |
    | `PILOT_STOPPED_ON_FAILURE` | 4 | Engineering circuit breaker fired |
    | `BLOCKED_*`, `BLOCKED_NONCOMPLETE_RECEIPTS`, `BLOCKED_MIXED_DERIVATION` | 2 | Refused before GPU start |
