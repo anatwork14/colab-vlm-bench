@@ -1506,6 +1506,13 @@ class RealSevenArmEngine:
         mtp_proposal_match_rate = (
             mtp_matched_total / mtp_proposed_total if mtp_proposed_total else None
         )
+        if "da" in self.method_arm:
+            # G4: DA counts as exercised only when a real decode read was restricted.
+            gates["DA_MASKING_EXERCISED"] = (
+                "PASS" if final_da_restriction_ratio > 0.0 else "NOT_EXERCISED_NO_RESTRICTED_READS"
+            )
+        else:
+            gates["DA_MASKING_EXERCISED"] = "NOT_APPLICABLE"
         if "mtp" in self.method_arm:
             gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] = (
                 "PASS" if mtp_proposed_total > 0 else "INSUFFICIENT_TOKENS"
