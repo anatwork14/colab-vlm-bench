@@ -93,8 +93,18 @@ def test_host_rejects_failed_or_stale_result(tmp_path, monkeypatch, bad_result):
 
 def test_cpu_probe_absence_is_unknown(monkeypatch):
     monkeypatch.setattr("shutil.which", lambda cmd: None)
+    monkeypatch.setattr(pipeline, "_accelerator_indicators", lambda: ["/proc/driver/nvidia"])
     with pytest.raises(RuntimeError, match="ACCELERATOR_STATE_UNKNOWN"):
         pipeline.require_cpu_for_hf_intake()
+
+
+def test_cpu_probe_clean_cpu_environment(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda cmd: None)
+    monkeypatch.setattr(pipeline, "_accelerator_indicators", lambda: [])
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    # Verifies standard CPU container allows intake
+    pipeline.require_cpu_for_hf_intake()
 
 
 @pytest.mark.parametrize("node", ["nvidia0", "nvidia7", "nvidiactl", "nvidia-uvm",
