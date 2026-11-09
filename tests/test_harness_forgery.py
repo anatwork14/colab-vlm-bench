@@ -259,3 +259,21 @@ def test_full_fabricated_bundle_yields_zero_ready(tmp_path, owner_keys, monkeypa
     )
     assert report["matrices"]["pilot"]["counts"]["READY"] == 0
     assert report["matrices"]["full"]["counts"]["READY"] == 0
+
+
+def test_a_signature_copied_onto_a_different_record_is_refused(tmp_path, owner_keys):
+    # ITER2 N-1: a real owner signature is bound to the record's exact bytes. Copying it next to
+    # a record that differs (here: a larger resource grant) must not authorize that record.
+    plan = _plan(tmp_path)
+    genuine = _record(tmp_path, plan)
+    _sign(owner_keys["owner"], genuine)
+    other_dir = tmp_path / "widened_copy"
+    other_dir.mkdir()
+    widened = other_dir / "OWNER_AUTHORIZATION.json"
+    rec = json.loads(genuine.read_text(encoding="utf8"))
+    rec["resource"] = "NVIDIA A100 40GB x8, 320 GPU-hours"
+    widened.write_text(json.dumps(rec, indent=2), encoding="utf8")
+    shutil.copyfile(genuine.with_name(genuine.name + ".sig"), widened.with_name(widened.name + ".sig"))
+    out = inv.verify_owner_authorization(widened, "camp-x", plan, owner_keys["signers"])
+    assert out["verified"] is False and out["resource"] is None
+    assert inv.verify_owner_authorization(genuine, "camp-x", plan, owner_keys["signers"])["verified"] is True

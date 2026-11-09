@@ -43,6 +43,7 @@ def healthy_env(**overrides):
         "dataset_revisions": {"memlens": SHA, "mmlongbench_doc": SHA},
         "authorization_ok": True,
         "vllm_installed": True,
+        "live_probe": {"ok": True, "reasons": []},
         "gpu": {"name": "NVIDIA A100 40GB", "compute_cap": 8.0, "memory_total_mib": 40960},
         "serving_max_model_len": 32768,
         "datasets": {"memlens": {"present": True, "checksum_verified": True},
@@ -299,3 +300,12 @@ def test_feasibility_metadata_is_attached_marked_unapproved_and_changes_no_statu
     assert without["dataset_feasibility"] is None
     assert [c["status"] for c in with_meta["cells"]] == [c["status"] for c in without["cells"]]
     assert all(c["status"] != "READY" for c in with_meta["cells"])
+
+
+def test_a_failed_live_probe_blocks_an_otherwise_ready_cell():
+    # ITER2 N-1: every static precondition passes, but no executed probe in this run: not READY.
+    verdict = inv.classify_cell(_cell(), healthy_env(live_probe={"ok": False, "reasons": ["vLLM distribution metadata missing"]},
+                                                     receipts={_cell()["cell_id"]: True}))
+    assert verdict["status"] == "BLOCKED_LIVE_PROBE_FAILED"
+    assert verdict["checks"]["live_probe"] == "FAIL"
+    assert inv.classify_cell(_cell(), healthy_env(receipts={_cell()["cell_id"]: True}))["status"] == "READY"

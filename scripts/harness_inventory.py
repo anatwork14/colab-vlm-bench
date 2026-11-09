@@ -17,11 +17,14 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
@@ -54,6 +57,7 @@ CHECKS = (
     ("model_revision_pinned", "BLOCKED_REVISION_UNPINNED"),
     ("owner_authorization", "BLOCKED_OWNER_AUTHORIZATION"),
     ("vllm_importable", "BLOCKED_VLLM_NOT_INSTALLED"),
+    ("live_probe", "BLOCKED_LIVE_PROBE_FAILED"),  # N-1: an executed probe in this run, not a file on disk
     ("gpu_compute_capability", "BLOCKED_GPU_CAPABILITY"),
     ("gpu_memory", "BLOCKED_GPU_MEMORY"),
     ("context_fits", "BLOCKED_CONTEXT_EXCEEDS_WINDOW"),
@@ -137,6 +141,7 @@ def classify_cell(cell: dict, env: dict) -> dict:
     outcomes["model_revision_pinned"] = "PASS" if (revision and not is_degenerate_sha(revision)) else "FAIL"
     outcomes["owner_authorization"] = "PASS" if env["authorization_ok"] else "FAIL"
     outcomes["vllm_importable"] = "PASS" if env["vllm_installed"] else "FAIL"
+    outcomes["live_probe"] = "PASS" if (env.get("live_probe") or {}).get("ok") is True else "FAIL"
     if gpu is None:
         outcomes["gpu_compute_capability"] = "FAIL"
         outcomes["gpu_memory"] = "NOT_TESTED"
@@ -273,7 +278,7 @@ def verify_owner_authorization(record_path: Path, campaign_id: str, plan_path: P
     owner signer file kept outside the repository, naming this campaign and this plan's hash.
     A bare JSON file, however it reads, never authorizes.
     """
-    out = {"verified": False, "reason": ""}
+    out = {"verified": False, "reason": "", "resource": None}
     sig = record_path.with_name(record_path.name + ".sig")
     if not record_path.is_file() or not sig.is_file():
         out["reason"] = "no signed owner record"
@@ -309,6 +314,7 @@ def verify_owner_authorization(record_path: Path, campaign_id: str, plan_path: P
         out["reason"] = "signature does not verify against the owner signer file"
         return out
     out["verified"] = True
+    out["resource"] = str(record["resource"])
     out["reason"] = "signed by an owner key for this campaign and plan"
     return out
 
@@ -335,6 +341,134 @@ def verify_vllm(pinned_version: str | None, runner=subprocess.run) -> dict:
     out["verified"] = version == pinned_version
     out["reason"] = "pinned version and kernels import" if out["verified"] else "version differs from pin"
     return out
+
+
+# N-1: the live probe. It runs in a separate isolated interpreter (python -I, so PYTHONPATH and user
+# site packages are ignored) with a fresh nonce. It executes the checks itself; the parent evaluates the
+# returned report. A determined local actor who controls this machine can still forge the output: READY
+# means "preconditions probed in this run", not an attestation.
+LIVE_PROBE_CODE = r"""
+import hashlib, importlib.metadata as md, json, os, subprocess, sys
+nonce, spec = sys.argv[1], json.loads(sys.argv[2])
+out = {"nonce": nonce, "pid": os.getpid(), "python": sys.executable}
+try:
+    dist = md.version("vllm")
+except md.PackageNotFoundError:
+    dist = None
+out["vllm"] = {"dist_version": dist}
+try:
+    import vllm, vllm._C
+    out["vllm"]["module_version"] = getattr(vllm, "__version__", None)
+    out["vllm"]["module_file"] = getattr(vllm, "__file__", None)
+except Exception as exc:
+    out["vllm"]["import_error"] = type(exc).__name__ + ": " + str(exc)
+smi = next((p for p in ("/usr/bin/nvidia-smi", "/usr/local/bin/nvidia-smi") if os.path.isfile(p)), None)
+out["nvidia_smi"] = {"path": smi}
+if smi:
+    try:
+        line = subprocess.run([smi, "-i", "0", "--query-gpu=name,uuid", "--format=csv,noheader"],
+                              capture_output=True, text=True, timeout=30, check=True).stdout.strip().splitlines()[0]
+        name, uuid = [part.strip() for part in line.split(",", 1)]
+        out["nvidia_smi"].update(name=name, uuid=uuid)
+    except Exception as exc:
+        out["nvidia_smi"]["error"] = type(exc).__name__ + ": " + str(exc)
+try:
+    import torch
+    x = torch.arange(16, dtype=torch.float32, device="cuda")
+    out["cuda"] = {"device_name": torch.cuda.get_device_name(0),
+                   "kernel_sum": float((x * 2 + 1).sum().item()),
+                   "expected_sum": float(sum(2 * i + 1 for i in range(16))),
+                   "capability": list(torch.cuda.get_device_capability(0))}
+except Exception as exc:
+    out["cuda"] = {"error": type(exc).__name__ + ": " + str(exc)}
+weights = {}
+for model_id, entry in spec.items():
+    files = {}
+    for rel in entry["files"]:
+        try:
+            digest, size = hashlib.sha256(), 0
+            with open(os.path.join(entry["path"], rel), "rb") as handle:
+                for chunk in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(chunk)
+                    size += len(chunk)
+            files[rel] = {"sha256": digest.hexdigest(), "size": size}
+        except OSError as exc:
+            files[rel] = {"error": type(exc).__name__ + ": " + str(exc)}
+    weights[model_id] = {"files": files}
+out["weights"] = weights
+print(json.dumps(out))
+"""
+
+
+def evaluate_probe(report: Any, *, nonce: str, parent_pid: int, resource_name: str | None,
+                   vllm_pin: str | None, weight_specs: dict | None) -> dict:
+    """Pure check of one probe report against the plan. Every reason to refuse is listed."""
+    if not isinstance(report, dict):
+        return {"ok": False, "reasons": ["probe output is not a JSON object"]}
+    reasons: list[str] = []
+    if report.get("nonce") != nonce:
+        reasons.append("nonce mismatch: output is not from this probe execution")
+    if report.get("pid") == parent_pid:
+        reasons.append("probe ran in the same process as the parent")
+    vllm = report.get("vllm") or {}
+    if vllm.get("import_error"):
+        reasons.append(f"vLLM import failed: {vllm['import_error']}")
+    if not vllm.get("dist_version"):
+        reasons.append("vLLM distribution metadata missing (stub or unmanaged package)")
+    elif not vllm_pin:
+        reasons.append("no vLLM version pinned in config")
+    elif vllm["dist_version"] != vllm_pin:
+        reasons.append(f"vLLM version {vllm['dist_version']} differs from pin {vllm_pin}")
+    if not resource_name:
+        reasons.append("plan names no resource")
+    smi = report.get("nvidia_smi") or {}
+    if resource_name and smi.get("name") != resource_name:
+        reasons.append(f"GPU name {smi.get('name')!r} differs from plan resource {resource_name!r}")
+    cuda = report.get("cuda") or {}
+    if "error" in cuda:
+        reasons.append(f"CUDA kernel did not run: {cuda['error']}")
+    else:
+        if cuda.get("kernel_sum") != cuda.get("expected_sum"):
+            reasons.append("CUDA kernel result is wrong")
+        if smi.get("name") and cuda.get("device_name") != smi.get("name"):
+            reasons.append("CUDA device differs from nvidia-smi device")
+    if not weight_specs:
+        reasons.append("weights are not pinned for every model")
+    else:
+        got_weights = report.get("weights") or {}
+        for model_id, spec in weight_specs.items():
+            got_files = (got_weights.get(model_id) or {}).get("files") or {}
+            for rel, pinned in spec["files"].items():
+                got = got_files.get(rel)
+                if got is None:
+                    reasons.append(f"{model_id}/{rel} not recomputed")
+                elif "error" in got:
+                    reasons.append(f"{model_id}/{rel}: {got['error']}")
+                elif got.get("sha256") != pinned["sha256"]:
+                    reasons.append(f"{model_id}/{rel}: recomputed sha256 differs from the pinned manifest")
+                elif got.get("size") != pinned["size"]:
+                    reasons.append(f"{model_id}/{rel}: size differs from the pinned manifest")
+    return {"ok": not reasons, "reasons": reasons, "probe_pid": report.get("pid"),
+            "nonce_echoed": report.get("nonce") == nonce}
+
+
+def run_live_probe(resource_name: str | None, vllm_pin: str | None, weight_specs: dict | None, *,
+                   runner=subprocess.run, timeout_s: float = 600) -> dict:
+    nonce = secrets.token_hex(16)
+    cmd = [sys.executable, "-I", "-c", LIVE_PROBE_CODE, nonce, json.dumps(weight_specs or {})]
+    try:
+        done = runner(cmd, capture_output=True, text=True, timeout=timeout_s)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "reasons": [f"live probe could not run: {type(exc).__name__}"]}
+    lines = [line for line in (done.stdout or "").splitlines() if line.strip()]
+    try:
+        report = json.loads(lines[-1]) if lines else None
+    except json.JSONDecodeError:
+        report = None
+    if report is None:
+        return {"ok": False, "reasons": [f"live probe produced no JSON (exit {done.returncode})"]}
+    return evaluate_probe(report, nonce=nonce, parent_pid=os.getpid(), resource_name=resource_name,
+                          vllm_pin=vllm_pin, weight_specs=weight_specs)
 
 
 def probe_dataset(spec: dict) -> dict:
@@ -393,7 +527,8 @@ def build_report(pilot_config: Path, matrix_manifest: Path, *, models_root: Path
                  allowed_signers: Path | None = None,
                  pinned_manifest_sha256: dict[str, str] | None = None,
                  owner_record: Path | None = None,
-                 receipt_index: Path | None = DEFAULT_RECEIPT_INDEX) -> dict:
+                 receipt_index: Path | None = DEFAULT_RECEIPT_INDEX,
+                 live_probe: bool = True) -> dict:
     config = load_config(pilot_config)
     manifest = manifest_from_path(matrix_manifest)
     pilot_cells = enumerate_pilot_cells(pilot_config)
@@ -417,16 +552,33 @@ def build_report(pilot_config: Path, matrix_manifest: Path, *, models_root: Path
     disk_free = shutil.disk_usage(models_root if models_root.exists() else REPO).free / 2**30
     campaign_pilot = config["campaign_id"]
     record = owner_record or authorization
-    authorized_pilot = verify_owner_authorization(record, campaign_pilot, pilot_config, allowed_signers)["verified"]
-    authorized_full = verify_owner_authorization(record, manifest["campaign_id"], matrix_manifest,
-                                                 allowed_signers)["verified"]
+    auth_pilot = verify_owner_authorization(record, campaign_pilot, pilot_config, allowed_signers)
+    auth_full = verify_owner_authorization(record, manifest["campaign_id"], matrix_manifest, allowed_signers)
+    authorized_pilot, authorized_full = auth_pilot["verified"], auth_full["verified"]
     vllm = verify_vllm(config.get("vllm_pin"))["verified"]
+
+    # N-1: READY also needs a live probe executed in this run. Weight specs come only from pinned manifests.
+    weight_specs = None
+    if all(w.get("manifest_verified") for w in weights.values()):
+        weight_specs = {}
+        for mid in weights:
+            model_dir = models_root / models[mid]["hf_id"]
+            files = json.loads((model_dir / LOCAL_WEIGHTS_MANIFEST).read_text(encoding="utf8"))["files"]
+            weight_specs[mid] = {"path": str(model_dir), "files": files}
+    if not live_probe:
+        live = {"ok": False, "reasons": ["plan-only mode: no live probe was run"]}
+    elif not (authorized_pilot or authorized_full):
+        live = {"ok": False, "reasons": ["not run: no verified owner authorization"]}
+    else:
+        resource = (auth_pilot if authorized_pilot else auth_full)["resource"]
+        live = run_live_probe(resource, config.get("vllm_pin"), weight_specs)
 
     def env_for(serving_max, authorized):
         return {"weights": weights, "revisions": revisions, "dataset_revisions": dataset_revisions,
                 "authorization_ok": authorized, "vllm_installed": vllm, "gpu": gpu,
                 "serving_max_model_len": serving_max, "datasets": datasets,
-                "disk_free_gib": disk_free, "min_free_gib": min_free_gib, "receipts": receipts}
+                "disk_free_gib": disk_free, "min_free_gib": min_free_gib, "receipts": receipts,
+                "live_probe": live}
 
     pilot_env = env_for(config["serving"]["max_model_len"], authorized_pilot)
     full_env = env_for(None, authorized_full)
@@ -446,7 +598,9 @@ def build_report(pilot_config: Path, matrix_manifest: Path, *, models_root: Path
             "output_tokens": OUTPUT_TOKENS,
             "min_free_gib": min_free_gib,
             "min_free_gib_is_guard_not_measurement": True,
-            "ready_requires": "every check PASS, including a verified gpu_smoke_receipt",
+            "ready_requires": ("every check PASS, including a live probe executed in this run "
+                               "(nonce echo, vLLM metadata and import, CUDA kernel, GPU name matching the plan, "
+                               "recomputed weight SHA-256) and a verified gpu_smoke_receipt"),
         },
         "environment": {
             "models_root": str(models_root),
@@ -461,7 +615,9 @@ def build_report(pilot_config: Path, matrix_manifest: Path, *, models_root: Path
             "dataset_revisions_in_config": dataset_revisions,
             "receipts_loaded": len(receipts),
             "weights_hashed": hash_weights,
+            "live_probe": live,
         },
+        "mode": "live_probes" if live_probe else "plan_only",
         "matrices": {
             "pilot": {"campaign_id": campaign_pilot, **pilot_summary,
                       "source": "vlmbench.config.planned_cells (" + str(pilot_config.name) + ")"},
@@ -555,12 +711,24 @@ def main(argv=None) -> int:
     p.add_argument("--receipts-dir", type=Path, default=None)
     p.add_argument("--min-free-gib", type=float, default=20.0)
     p.add_argument("--no-hash-weights", action="store_true", help="skip SHA-256 of weight files")
+    p.add_argument("--allowed-signers", type=Path, default=None,
+                   help="owner signer file kept outside the repository (required for any authorization)")
+    p.add_argument("--owner-record", type=Path, default=None, help="signed owner record (defaults to --authorization)")
+    p.add_argument("--receipt-index", type=Path, default=DEFAULT_RECEIPT_INDEX)
+    p.add_argument("--pin-manifest", action="append", default=[], metavar="MODEL_ID=SHA256",
+                   help="pinned SHA-256 of a model's local weights manifest (repeatable)")
+    p.add_argument("--plan-only", action="store_true",
+                   help="skip the live probe: the report says so and no cell can be READY")
     p.add_argument("--out-json", type=Path, default=REPO / "docs/harness/PILOT_INVENTORY.json")
     p.add_argument("--out-md", type=Path, default=REPO / "docs/harness/PILOT_INVENTORY.md")
     args = p.parse_args(argv)
+    pins = dict(item.split("=", 1) for item in args.pin_manifest)
     report = build_report(args.pilot_config, args.matrix_manifest, models_root=args.models_root,
                           authorization=args.authorization, receipts_dir=args.receipts_dir,
-                          min_free_gib=args.min_free_gib, hash_weights=not args.no_hash_weights)
+                          min_free_gib=args.min_free_gib, hash_weights=not args.no_hash_weights,
+                          allowed_signers=args.allowed_signers, pinned_manifest_sha256=pins,
+                          owner_record=args.owner_record or args.authorization,
+                          receipt_index=args.receipt_index, live_probe=not args.plan_only)
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(report, indent=1, sort_keys=True) + "\n", encoding="utf8")
     args.out_md.write_text(render_markdown(report), encoding="utf8")
