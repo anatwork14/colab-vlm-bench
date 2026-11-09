@@ -1,10 +1,10 @@
 # STARLIGHT Benchmark System Readiness Report — Seven-Arm Neural vLLM Engine
 
-**Date:** 2026-11-09  
-**Workspace:** `wF`  
-**Repository:** https://github.com/anatwork14/colab-vlm-bench  
-**Local Commit:** `d4748bc` (qualifies real Qwen3.5-0.8B pretrained multimodal forward passes across all seven arms)  
-**Feature Branch Pushed:** `feat/qwen35-pretrained-validation` -> `https://github.com/anatwork14/colab-vlm-bench/pull/new/feat/qwen35-pretrained-validation`  
+**Date:** 2026-11-09
+**Workspace:** `wF`
+**Repository:** https://github.com/anatwork14/colab-vlm-bench
+**Local Commit:** `d10cbf3` (qualifies real Qwen3.5-0.8B pretrained multimodal forward passes across all seven arms)
+**Feature Branch Pushed:** `feat/qwen35-pretrained-validation` -> `https://github.com/anatwork14/colab-vlm-bench/pull/new/feat/qwen35-pretrained-validation`
 **Test Suite Status:** **238 passed, 10 skipped, 0 failures** in 43.8s.
 
 ---
@@ -166,7 +166,7 @@ Under owner authorization, the official **Qwen/Qwen3.5-0.8B** post-trained multi
 | **Test F** | Fixed-Output Serving | 256 committed tokens, temp 0 | Committed exactly 256 tokens; throughput: 78.52 tok/s on GTX 1080 Ti | **PASS** (6.37s) |
 | **Test G** | Concurrency Isolation | CCU 1, CCU 2, CCU 4 | Strict request slot isolation; zero cross-request citation or state pollution | **PASS** (9.65s) |
 
-**Total Suite Duration:** 50.30s  
+**Total Suite Duration:** 50.30s
 **Receipt File:** `artifacts/qwen35_pretrained_qualification_receipt.json`
 
 ### B. Release Gate Verdict Matrix
@@ -184,6 +184,6 @@ Under owner authorization, the official **Qwen/Qwen3.5-0.8B** post-trained multi
 ### C. Deliverables & PR Status
 - **Pull Request Branch:** `feat/qwen35-pretrained-validation`
 - **GitHub Push URL:** https://github.com/anatwork14/colab-vlm-bench/pull/new/feat/qwen35-pretrained-validation
-- **Local Head Commit:** `d4748bc`
+- **Local Head Commit:** `d10cbf3`
 - **Full Regression Test Status:** 238 passed, 10 skipped in 43.8s.
 - **Execution Receipt:** `artifacts/qwen35_pretrained_qualification_receipt.json`
