@@ -15,6 +15,17 @@ def percentile(samples: list[float], p: float) -> float:
     return xs[low] + (xs[high] - xs[low]) * (at - low)
 
 
+# E2E latency definitions. Receipts from before the client CCU-slot wait was added to E2E
+# (ebbf60d) have no client_queue_wait fields. They measured a different quantity.
+E2E_CURRENT = "INCLUDES_CLIENT_QUEUE_WAIT"
+E2E_LEGACY = "LEGACY_NO_QUEUE_FIELD"
+
+
+def e2e_definition(receipt: dict) -> str:
+    metrics = receipt.get("metrics") or {}
+    return E2E_CURRENT if "client_queue_wait_p50_ms" in metrics else E2E_LEGACY
+
+
 def paired_speedups(records: list[dict]) -> list[dict]:
     groups = defaultdict(dict)
     for rec in records:
@@ -25,6 +36,7 @@ def paired_speedups(records: list[dict]) -> list[dict]:
 
     cohorts = defaultdict(list)
     exclusions = defaultdict(int)
+    mixed_e2e = defaultdict(int)
     for key, pair in groups.items():
         if set(pair) != {"base", "mtp"}:
             exclusions[key[:-1]] += 1
@@ -35,6 +47,11 @@ def paired_speedups(records: list[dict]) -> list[dict]:
             continue
         if not base.get("sample_id_sha256") or base["sample_id_sha256"] != mtp.get("sample_id_sha256"):
             exclusions[key[:-1]] += 1
+            continue
+        if e2e_definition(base) != e2e_definition(mtp):
+            # Refuse to pool a pair whose two receipts measured different E2E quantities.
+            exclusions[key[:-1]] += 1
+            mixed_e2e[key[:-1]] += 1
             continue
         a = base.get("metrics", {}).get("output_tokens_per_s")
         b = mtp.get("metrics", {}).get("output_tokens_per_s")
@@ -51,6 +68,7 @@ def paired_speedups(records: list[dict]) -> list[dict]:
             "dataset": cohort[0], "model": cohort[1], "input_length": cohort[2],
             "concurrency": cohort[3], "paired_repetitions": len(values),
             "excluded_repetitions": exclusions[cohort],
+            "excluded_mixed_e2e_definition": mixed_e2e[cohort],
             "throughput_speedup_median": percentile(values, 0.5) if values else None,
             "status": "PAIRED_SAMPLES" if len(values) >= 3 else "INSUFFICIENT_PAIRED_REPS",
             "per_rep": samples,

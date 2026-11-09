@@ -18,6 +18,11 @@ Metrics are divided into quality, evidence-grounded hallucination, end-to-end se
 | ITL | inter-token emission intervals, not SSE message intervals | engine token-level instrumentation | NOT_MEASURED currently |
 | E2E p50/p95/p99 | submission (before waiting for a CCU slot) to completed streamed response; **includes client-side slot wait** (`client_queue_wait_ms`) | client clock | serving |
 | Client queue wait p50/p95 | submission to CCU-slot acquisition, before the HTTP send; reported separately so E2E can be decomposed | client clock | serving |
+
+**E2E comparability (review F-02, R3-F).** E2E now includes the client CCU-slot wait, so it is **not comparable** with receipts written before that change. Those receipts carry no `client_queue_wait_p50_ms` / `client_queue_wait_p95_ms` fields. Detection: `vlmbench.analysis.e2e_definition(receipt)` returns `INCLUDES_CLIENT_QUEUE_WAIT` or `LEGACY_NO_QUEUE_FIELD`. Rules:
+- `report` withholds the E2E value of a legacy receipt (`e2e_p95_status = NOT_COMPARABLE_LEGACY_DEFINITION`) and sets `e2e_comparability = MIXED_NOT_COMPARABLE` when a campaign mixes definitions.
+- `paired_speedups` does not pool a Base/MTP pair whose two receipts have different definitions. Those pairs are counted in `excluded_mixed_e2e_definition`.
+- Throughput and TTFT are not affected by this change. Only E2E is.
 | Throughput | committed *successful user-facing* output tokens / wall clock | verified completion_tokens | serving |
 | Requests/s | successful requests / complete measured-cell wall clock | per request PASS | serving |
 | Offered CCU | max simultaneous in-flight client requests | client concurrency semaphore | serving |
