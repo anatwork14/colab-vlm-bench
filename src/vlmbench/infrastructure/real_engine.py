@@ -1333,6 +1333,8 @@ class RealSevenArmEngine:
         return input_ids, pos_ids, rope_deltas, {"image": vis_out}, vis_trace
 
     CPU_GREEDY_K1_LABEL = "cpu_greedy_k1_reference_not_vllm_mtp"
+    # Test hook for the H-6 cache-length check (STARLIGHT). Must stay 0 outside tests.
+    _test_cache_len_offset: int = 0
 
     def _speculative_mtp_greedy_k1(
         self,
@@ -2076,6 +2078,8 @@ class RealSevenArmEngine:
                             cache_len = past_kv.layers[l_idx].keys.shape[2]
                         else:
                             cache_len = past_kv[l_idx][0].shape[2]
+                        # ITER2 D4 S-4: test-only injection point (always 0 in production runs).
+                        cache_len += self._test_cache_len_offset
                         if cache_len != len(starlight_next_orig[l_idx]):
                             starlight_cache_mismatch_steps += 1
                     starlight_orig = starlight_next_orig
