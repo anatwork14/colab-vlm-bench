@@ -1043,10 +1043,10 @@ def test_r5_text_side_fields_are_none_before_any_decode_step():
 
 def test_r5_h2o_arm_reports_method_variant_and_keeps_arm_ids():
     from pathlib import Path
-    # The seven original arm IDs are unchanged; the only additions are the three STARLIGHT arms.
+    # The seven original arm IDs are unchanged; the additions are the STARLIGHT arms (Stage 1: three; Stage 2(b): + starlight_s1_mtp).
     assert RealSevenArmEngine.SUPPORTED_ARMS == frozenset((
         "base", "h2o_base", "da_base", "ecrd_base", "mtp", "h2o_mtp", "da_mtp",
-        "starlight_s1", "starlight_s1_no_da", "starlight_s1_no_grounding"))
+        "starlight_s1", "starlight_s1_no_da", "starlight_s1_no_grounding", "starlight_s1_mtp"))  # Stage 2(b)
     cfg = _p7_small_cfg()
     engine = RealSevenArmEngine(method_arm="h2o_base", config=cfg, device="cpu")
     try:

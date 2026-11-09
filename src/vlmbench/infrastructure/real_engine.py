@@ -992,9 +992,10 @@ def _da_scripted_tags(
 # STARLIGHT Stage 1 (cpu_pytorch_reference_not_vllm): arm -> enabled controller signals.
 # The seven original arms are not in this map; their behaviour is unchanged.
 STARLIGHT_ARM_SIGNALS: dict[str, tuple[str, ...]] = {
-    "starlight_s1": ("da", "grounding"),
-    "starlight_s1_no_da": ("grounding",),
-    "starlight_s1_no_grounding": ("da",),
+    "starlight_s1": ("da", "grounding", "structural"),
+    "starlight_s1_no_da": ("grounding", "structural"),
+    "starlight_s1_no_grounding": ("da", "structural"),
+    "starlight_s1_mtp": ("da", "grounding", "structural"),
 }
 STARLIGHT_MEASUREMENT_LABEL = "cpu_pytorch_reference_not_vllm"
 # Arms that run the DA attention mask. Exact membership, never a substring test: the name
@@ -1008,7 +1009,8 @@ EVIDENCE_REASON_CODES: dict[str, str] = {
     "unverified": "UNVERIFIED_EVIDENCE",
 }
 GDN_EXEMPT_LABEL = "GDN_EXEMPT_NOT_TOKEN_ADDRESSABLE"
-STRUCTURAL_POLICY_LABEL = "NOT_RATIFIED_A4_POLICY_DEPENDENT"
+# Lead decision Q2: vision_start/vision_end are protected as an explicit structural source.
+STRUCTURAL_POLICY_LABEL = "PROTECTED_LEAD_DECISION_Q2"
 
 
 def _image_sha256(image_bytes: bytes | None, image_path: str | Path | None) -> str | None:
@@ -1021,6 +1023,68 @@ def _image_sha256(image_bytes: bytes | None, image_path: str | Path | None) -> s
 
 
 # --- 2. Production Seven-Arm Engine with True Backend Interventions ---
+
+def _policy_digests(
+    tracker: "H2OCacheTracker", full_layers: Sequence[int], orig: dict[int, np.ndarray] | None,
+) -> tuple[str, str]:
+    """(decision_digest, policy_digest) over raw bytes. Decision = evicted masks, layer budgets and
+    STARLIGHT original-position maps. Policy = decision + tracker scores, visual masks and seq_len."""
+    dec = hashlib.sha256()
+    for l in full_layers:
+        layer = tracker.layers[l]
+        mask = np.ascontiguousarray(layer.evicted_mask)
+        dec.update(f"L{l}:{mask.shape}:{layer.budget}:".encode())
+        dec.update(mask.tobytes())
+        if orig is not None:
+            pos = np.ascontiguousarray(orig[l])
+            dec.update(f"O{pos.shape}:".encode())
+            dec.update(pos.tobytes())
+    decision = dec.hexdigest()
+    pol = hashlib.sha256(decision.encode())
+    for l in full_layers:
+        layer = tracker.layers[l]
+        sc = np.ascontiguousarray(layer.scores)
+        vm = np.ascontiguousarray(layer.visual_token_mask)
+        pol.update(f"S{l}:{sc.shape}:{sc.dtype}:".encode())
+        pol.update(sc.tobytes())
+        pol.update(f"V{vm.shape}:".encode())
+        pol.update(vm.tobytes())
+    pol.update(f"seq{tracker.seq_len}".encode())
+    return decision, pol.hexdigest()
+
+
+@dataclass
+class _PolicyState:
+    """Everything a speculative policy step can change: cache, tracker, STARLIGHT position map."""
+
+    kind: str
+    cache: Any
+    tracker: "H2OCacheTracker"
+    full_layers: tuple[int, ...]
+    P: int = 0
+    orig: dict[int, np.ndarray] | None = None
+    budget_total: int = 0
+    enabled: tuple[str, ...] = ()
+    da_spans: tuple[tuple[str, int, int], ...] = ()  # scripted DA spans, fixed at the prefill
+
+
+def _retained_entries_summary(samples: Sequence[int], *, unit: str, n_layers: int) -> dict[str, Any]:
+    """Retained physical entries per full-attention layer, summarised over the recorded samples.
+
+    `mean` is None until a sample exists (never a literal zero). Prefill is never included: the
+    prefill cache is unbounded and is reported separately as prefill_excluded.
+    """
+    values = [int(x) for x in samples]
+    return {
+        "unit": unit,
+        "prefill_excluded": True,
+        "n_full_attention_layers": int(n_layers),
+        "samples": len(values),
+        "mean": (sum(values) / len(values)) if values else None,
+        "min": min(values) if values else None,
+        "max": max(values) if values else None,
+    }
+
 
 @dataclass
 class RealExecutionResult:
@@ -1061,6 +1125,7 @@ class RealSevenArmEngine:
         "starlight_s1",
         "starlight_s1_no_da",
         "starlight_s1_no_grounding",
+        "starlight_s1_mtp",
     ))
 
     def __init__(
@@ -1332,12 +1397,19 @@ class RealSevenArmEngine:
         return input_ids, pos_ids, rope_deltas, {"image": vis_out}, vis_trace
 
     CPU_GREEDY_K1_LABEL = "cpu_greedy_k1_reference_not_vllm_mtp"
+    # Test hook for the H-6 cache-length check (STARLIGHT). Must stay 0 outside tests.
+    _test_cache_len_offset: int = 0
+    # Stage 2(b): False forces the normal (non-speculative) decode loop, the same-arm reference.
+    _speculation_enabled: bool = True
+    # Stage 2(b): when a list, the normal decode loop appends per-position policy digests.
+    _policy_trace: list | None = None
 
     def _speculative_mtp_greedy_k1(
         self,
         prompt_ids: Sequence[int],
         max_new_tokens: int,
         draft_override: Any = None,
+        t0: float | None = None,
     ) -> dict[str, Any]:
         """CPU greedy k=1 speculative decoding with the official MTP head (reference, NOT vLLM MTP).
 
@@ -1384,16 +1456,28 @@ class RealSevenArmEngine:
                 logits_to_keep=keep,
             )
 
+        stops: set[int] = set(self.eos_token_ids) if self.stop_at_eos else set()
+        t_start = time.perf_counter() if t0 is None else t0
+        first_commit_ms: float | None = None
+        verifier_calls = 0
+        retained_samples: list[int] = []  # physical cache length after each verifier forward
         with torch.no_grad():
             out = _feed(ids, 0, 1)
+            verifier_calls += 1  # prefill is a target forward
             cache_len = len(ids)  # tokens currently in the cache; `pending` is not yet fed
             pending = int(torch.argmax(out["logits"][0]).item())
             draft = int(torch.argmax(out["mtp_logits"][0, 0]).item())
 
             emitted: list[int] = []
             proposed = accepted = rejected = 0
-            while len(emitted) < max_new_tokens:
+            stop_reason = "max_new_tokens"
+            while True:
+                if pending in stops:
+                    stop_reason = "eos"  # EOS is never emitted into the output
+                    break
                 emitted.append(pending)
+                if first_commit_ms is None:
+                    first_commit_ms = (time.perf_counter() - t_start) * 1000.0
                 if len(emitted) >= max_new_tokens:
                     break
                 proposal = draft
@@ -1404,11 +1488,17 @@ class RealSevenArmEngine:
                 proposed += 1
                 snap = _snapshot_dynamic_cache(cache)
                 v = _feed([pending, proposal], cache_len, 2)
+                verifier_calls += 1
                 target_after_pending = int(torch.argmax(v["full_logits"][0, 0]).item())
                 if proposal == target_after_pending:
                     accepted += 1
-                    emitted.append(proposal)
                     cache_len += 2
+                    retained_samples.append(cache_len)
+                    if proposal in stops:
+                        # The verifier agreed the next target token is EOS: stop, do not emit it.
+                        stop_reason = "eos"
+                        break
+                    emitted.append(proposal)
                     if len(emitted) >= max_new_tokens:
                         break
                     pending = int(torch.argmax(v["logits"][0]).item())
@@ -1417,17 +1507,540 @@ class RealSevenArmEngine:
                     rejected += 1
                     _restore_dynamic_cache(cache, snap)
                     v1 = _feed([pending], cache_len, 1)
+                    verifier_calls += 1
                     cache_len += 1
+                    retained_samples.append(cache_len)
                     pending = int(torch.argmax(v1["logits"][0]).item())
                     draft = int(torch.argmax(v1["mtp_logits"][0, 0]).item())
 
+        kv_bytes = 0
+        for layer in cache.layers:
+            keys = getattr(layer, "keys", None)
+            if keys is not None:
+                kv_bytes += int(keys.numel() * keys.element_size()) + int(
+                    layer.values.numel() * layer.values.element_size())
         return {
             "label": self.CPU_GREEDY_K1_LABEL,
             "tokens": emitted[:max_new_tokens],
+            "committed": len(emitted[:max_new_tokens]),
             "proposed": proposed,
             "accepted": accepted,
             "rejected": rejected,
+            "verifier_calls": verifier_calls,
+            "stop_reason": stop_reason,
             "acceptance_rate": (accepted / proposed) if proposed else None,
+            "first_commit_ms": first_commit_ms,
+            "kv_bytes_allocated": kv_bytes,
+            "retained_samples": retained_samples,
+            "speed_claim": None,
+        }
+
+    MTP_TEXT_SPECULATION_GATE = "CPU_REFERENCE_SPECULATION_EXECUTED_NOT_VLLM"
+
+    def _policy_text_speculation_route(self, image_present: bool, evidence_pool: Any) -> bool:
+        return (
+            self.method_arm in ("h2o_mtp", "starlight_s1_mtp")
+            and self._speculation_enabled
+            and self.is_official_hf_hooked
+            and not image_present
+            and evidence_pool is None
+            and getattr(self.model, "mtp_module", None) is not None
+        )
+
+    def _execute_policy_mtp_speculative_text(
+        self, *, request_id: str, full_prompt: list[int], max_new_tokens: int, t0: float,
+        arch_status: str, gates: dict[str, str],
+    ) -> "RealExecutionResult":
+        kind = "h2o" if self.method_arm == "h2o_mtp" else "starlight"
+        spec = self._speculative_policy_mtp_greedy(kind, full_prompt, max_new_tokens, t0=t0)
+        tokens = list(spec["tokens"])
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        ttft_ms = spec["first_commit_ms"] if spec["first_commit_ms"] is not None else total_ms
+        tpot_ms = (total_ms - ttft_ms) / (len(tokens) - 1) if len(tokens) > 1 else total_ms
+        output_str = ""
+        if self.tokenizer is not None and hasattr(self.tokenizer, "decode"):
+            try:
+                output_str = str(self.tokenizer.decode(tokens, skip_special_tokens=True)).strip()
+            except Exception:
+                output_str = ""
+        if not output_str:
+            output_str = f"Decoded {len(tokens)} committed tokens via {self.method_arm}"
+        gates = dict(gates)
+        gates["MTP_CORRECTNESS_PASS"] = self.MTP_TEXT_SPECULATION_GATE
+        gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] = "PASS" if spec["proposed"] > 0 else "INSUFFICIENT_TOKENS"
+        starlight = kind == "starlight"
+        arm_status = "degraded_text_only_no_evidence" if starlight else "nominal"
+        return RealExecutionResult(
+            method_arm=self.method_arm,
+            tokens_generated=tokens,
+            output_text=output_str,
+            total_latency_ms=total_ms,
+            ttft_ms=ttft_ms,
+            tpot_ms=tpot_ms,
+            physical_kv_bytes_allocated=spec["kv_bytes_allocated"],
+            physical_kv_bytes_freed=None,  # not measured by the policy driver (evictions happen)
+            per_step_evicted_slot_rate=None,
+            attention_read_restriction_ratio=None,
+            attention_mask_restriction_ratio=None,
+            grounded_citations=[],
+            mtp_acceptance_rate=spec["acceptance_rate"],
+            gates=gates,
+            telemetry={
+                "request_id": request_id,
+                "model_id": self.config.model_id,
+                "device": self.device,
+                "architectural_status": arch_status,
+                "is_official_hf_hooked": self.is_official_hf_hooked,
+                "measurement_label": "cpu_pytorch_reference_not_vllm",
+                "speculation_executed": True,
+                "arm_label": f"{self.method_arm}_cpu_policy_speculative_reference_text_only_not_vllm",
+                "speculation": {
+                    "label": spec["label"],
+                    "method_variant": f"text_only_official_{kind}_mtp_k1_policy_verifier",
+                    "proposed": spec["proposed"],
+                    "accepted": spec["accepted"],
+                    "rejected": spec["rejected"],
+                    "verifier_calls": spec["verifier_calls"],
+                    "fallback_steps": spec["fallback_steps"],
+                    "committed": spec["committed"],
+                    "stop_reason": spec["stop_reason"],
+                    "acceptance_rate": spec["acceptance_rate"],
+                    "speed_claim": None,
+                },
+                "policy": {
+                    "kind": kind,
+                    "budget_total": spec["budget_total"] if starlight else None,
+                    "eviction_free_block_rule": "2-row verify block only when no full-attention layer evicts for either row",
+                    "retained_entries_per_layer": _retained_entries_summary(
+                        spec["retained_samples"],
+                        unit="per_verified_row_full_attention_layer",
+                        n_layers=len(self.config.full_attention_layers),
+                    ),
+                },
+                "arm_status": arm_status,
+                "grounding_declaration_missing": starlight,
+                "kv_memory_accounting": {
+                    "scope": "per decode step, prefill cache unbounded",
+                    "classification": "PHYSICAL_KV_ALLOCATED_NOT_FREED_NOT_MEASURED_IN_POLICY_DRIVER",
+                    "final_retained_kv_payload_bytes": spec["kv_bytes_allocated"],
+                },
+                "generation": {
+                    "stop_at_eos": self.stop_at_eos,
+                    "eos_token_ids": list(self.eos_token_ids),
+                    "stop_reason": spec["stop_reason"],
+                },
+            },
+        )
+
+
+    def _full_layer_physical_lengths(self, past_kv: Any) -> list[int]:
+        """Physical KV length of every full-attention layer (one entry per layer)."""
+        if self.model.hf_forward_active:
+            return [int(past_kv.layers[l].keys.shape[2]) for l in self.config.full_attention_layers]
+        return [int(past_kv[l][0].shape[2]) for l in self.config.full_attention_layers]
+
+    def _mtp_text_speculation_route(self, image_present: bool) -> bool:
+        """True when the mtp arm must run verifier-backed speculation (official, text-only)."""
+        return (
+            self.method_arm == "mtp"
+            and self.is_official_hf_hooked
+            and not image_present
+            and getattr(self.model, "mtp_module", None) is not None
+        )
+
+    def _execute_mtp_speculative_text(
+        self,
+        *,
+        request_id: str,
+        full_prompt: list[int],
+        max_new_tokens: int,
+        t0: float,
+        arch_status: str,
+        gates: dict[str, str],
+    ) -> "RealExecutionResult":
+        """Serving-style mtp arm: committed tokens come from the verifier (CPU reference, not vLLM)."""
+        spec = self._speculative_mtp_greedy_k1(full_prompt, max_new_tokens, t0=t0)
+        tokens = list(spec["tokens"])
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        ttft_ms = spec["first_commit_ms"] if spec["first_commit_ms"] is not None else total_ms
+        tpot_ms = (total_ms - ttft_ms) / (len(tokens) - 1) if len(tokens) > 1 else total_ms
+        output_str = ""
+        if self.tokenizer is not None and hasattr(self.tokenizer, "decode"):
+            try:
+                output_str = str(self.tokenizer.decode(tokens, skip_special_tokens=True)).strip()
+            except Exception:
+                output_str = ""
+        if not output_str:
+            output_str = f"Decoded {len(tokens)} committed tokens via mtp"
+        gates = dict(gates)
+        gates["MTP_CORRECTNESS_PASS"] = self.MTP_TEXT_SPECULATION_GATE
+        gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] = "PASS" if spec["proposed"] > 0 else "INSUFFICIENT_TOKENS"
+        speculation = {
+            "label": spec["label"],
+            "method_variant": "text_only_official_mtp_k1_verifier",
+            "proposed": spec["proposed"],
+            "accepted": spec["accepted"],
+            "rejected": spec["rejected"],
+            "verifier_calls": spec["verifier_calls"],
+            "committed": spec["committed"],
+            "stop_reason": spec["stop_reason"],
+            "acceptance_rate": spec["acceptance_rate"],
+            "speed_claim": None,
+        }
+        return RealExecutionResult(
+            method_arm=self.method_arm,
+            tokens_generated=tokens,
+            output_text=output_str,
+            total_latency_ms=total_ms,
+            ttft_ms=ttft_ms,
+            tpot_ms=tpot_ms,
+            physical_kv_bytes_allocated=spec["kv_bytes_allocated"],
+            physical_kv_bytes_freed=0,  # no eviction policy on this arm
+            per_step_evicted_slot_rate=None,
+            attention_read_restriction_ratio=None,
+            attention_mask_restriction_ratio=None,
+            grounded_citations=[],
+            mtp_acceptance_rate=spec["acceptance_rate"],
+            gates=gates,
+            telemetry={
+                "request_id": request_id,
+                "model_id": self.config.model_id,
+                "device": self.device,
+                "architectural_status": arch_status,
+                "is_official_hf_hooked": self.is_official_hf_hooked,
+                "measurement_label": "cpu_pytorch_reference_not_vllm",
+                "kv_memory_accounting": {
+                    "scope": "per decode step, prefill cache unbounded",
+                    "classification": "NO_EVICTION_PHYSICAL_LENGTH_ONLY",
+                    "final_retained_kv_payload_bytes": spec["kv_bytes_allocated"],
+                },
+                "retained_entries_per_layer": _retained_entries_summary(
+                    spec["retained_samples"],
+                    unit="per_verifier_forward_full_attention_layer",
+                    n_layers=len(self.config.full_attention_layers),
+                ),
+                "speculation_executed": True,
+                "arm_label": "mtp_cpu_speculative_reference_text_only_not_vllm",
+                "speculation": speculation,
+                "generation": {
+                    "stop_at_eos": self.stop_at_eos,
+                    "eos_token_ids": list(self.eos_token_ids),
+                    "stop_reason": spec["stop_reason"],
+                },
+            },
+        )
+
+    def _pol_new_state(self, kind: str, prompt_len: int) -> "_PolicyState":
+        """Fresh policy state for one request, built the way the normal decode loop builds it."""
+        if kind not in ("h2o", "starlight"):
+            raise ValueError("kind must be 'h2o' or 'starlight'")
+        from transformers.models.qwen3_5 import modeling_qwen3_5
+        cache = modeling_qwen3_5.DynamicCache(config=self.model.hf_model.config)
+        tracker = H2OCacheTracker(
+            config=self.h2o_config,
+            num_layers=self.config.num_hidden_layers,
+            num_kv_heads=self.config.num_key_value_heads,
+        )
+        for l_idx in self.config.recurrent_layers:
+            tracker.register_recurrent_layer(l_idx)
+        full = tuple(self.config.full_attention_layers)
+        if kind == "h2o":
+            return _PolicyState(kind=kind, cache=cache, tracker=tracker, full_layers=full)
+        if not self.starlight_signals:
+            raise ValueError("kind 'starlight' requires a starlight arm")
+        budget_total = max(self.h2o_config.min_budget, int(prompt_len * self.h2o_config.budget_ratio))
+        orig = {l: np.arange(prompt_len, dtype=np.int64) for l in full}
+        enabled = tuple(self.starlight_signals)
+        # Mirror of execute_request's scripted DA spans for a TEXT-ONLY prefill (n_visual=0, no image,
+        # no question anchor). The normal STARLIGHT path builds these even without an image.
+        da_spans: list[tuple[str, int, int]] = []
+        if "da" in enabled:
+            for tag in _da_scripted_tags(
+                anchor_len=prompt_len, phys_len=prompt_len, n_visual=0,
+                image_present=False, question_start=None,
+            ):
+                if tag.tag_type == DATagType.GLOBAL:
+                    label = "sink_global" if tag.start_idx == 0 else "question_global"
+                elif tag.tag_type == DATagType.FOCUS:
+                    label = f"focus:{tag.focus_id}"
+                else:
+                    continue
+                da_spans.append((label, tag.start_idx, tag.end_idx))
+        return _PolicyState(
+            kind=kind, cache=cache, tracker=tracker, full_layers=full, P=0, orig=orig,
+            budget_total=budget_total, enabled=enabled, da_spans=tuple(da_spans),
+        )
+
+    def _pol_phys(self, st: "_PolicyState", l_idx: int) -> int:
+        return int(st.cache.layers[l_idx].keys.shape[2])
+
+    def _pol_prefill(self, st: "_PolicyState", prompt_ids: Sequence[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prefill as the normal loop does: visual mask, H2O budgets, prefill attention scores."""
+        ids = [int(t) for t in prompt_ids]
+        L = len(ids)
+        st.tracker.set_visual_tokens([False] * L)  # text-only: no vision tokens in the prompt
+        pos = torch.arange(0, L, dtype=torch.long, device=self.device).view(1, 1, L).expand(3, 1, L).clone()
+        with torch.no_grad():
+            out = self.model(
+                torch.tensor([ids], device=self.device, dtype=torch.long), past_key_values=st.cache,
+                position_ids=pos, compute_mtp=True,
+                mtp_position_ids=torch.full((3, 1, 1), L, device=self.device, dtype=torch.long),
+                logits_to_keep=1,
+            )
+        if st.kind == "h2o":
+            for l_idx in st.full_layers:
+                st.tracker.initialize_budget(l_idx, L)
+        for l_idx, attn in out["attention_matrices"].items():
+            st.tracker.update_attention_scores(l_idx, attn[0].float().cpu().numpy())
+        st.P = L
+        return out["logits"][0], out["mtp_logits"][0, 0]
+
+    def _pol_plan_row(self, st: "_PolicyState", row_pos: int, k_lens: dict[int, int]):
+        """Eviction plan for one row, from explicit per-layer physical lengths (k includes the row)."""
+        if st.kind == "h2o":
+            plans: dict[int, np.ndarray] = {}
+            for l_idx in st.full_layers:
+                retained, _metrics = st.tracker.compute_eviction_plan(l_idx, current_length=int(k_lens[l_idx]))
+                plans[l_idx] = np.flatnonzero(retained).astype(np.int64)
+            return plans, None
+        plans_t, next_orig, _steps = self._starlight_build_step_plans(
+            st.tracker, {l: int(k_lens[l]) for l in st.full_layers}, st.orig, row_pos, st.budget_total,
+            list(st.da_spans), {}, st.enabled, structural=None,
+        )
+        plans = {l: plans_t[l].cpu().numpy().astype(np.int64) for l in st.full_layers}
+        return plans, next_orig
+
+    def _pol_apply(self, st: "_PolicyState", plans: dict[int, np.ndarray], next_orig: Any) -> None:
+        for l_idx in st.full_layers:
+            st.tracker.compact_layer_state(l_idx, plans[l_idx])
+        if st.kind == "starlight":
+            st.orig = {l: np.asarray(next_orig[l], dtype=np.int64) for l in st.full_layers}
+
+    def _pol_single(self, st: "_PolicyState", token: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """One target row, the normal loop's protocol: plan -> forward with plan -> compact -> score."""
+        k_lens = {l: self._pol_phys(st, l) + 1 for l in st.full_layers}
+        plans, next_orig = self._pol_plan_row(st, st.P, k_lens)
+        plan_t = {l: torch.as_tensor(plans[l], dtype=torch.long, device=self.device) for l in st.full_layers}
+        pos = st.P
+        with torch.no_grad():
+            out = self.model(
+                torch.tensor([[int(token)]], device=self.device, dtype=torch.long),
+                past_key_values=st.cache, h2o_eviction_plans=plan_t,
+                position_ids=torch.full((3, 1, 1), pos, device=self.device, dtype=torch.long),
+                compute_mtp=True,
+                mtp_position_ids=torch.full((3, 1, 1), pos + 1, device=self.device, dtype=torch.long),
+                logits_to_keep=1,
+            )
+        self._pol_apply(st, plans, next_orig)
+        for l_idx, attn in out["attention_matrices"].items():
+            st.tracker.update_attention_scores(l_idx, attn[0].float().cpu().numpy())
+        st.P += 1
+        return out["logits"][0], out["mtp_logits"][0, 0]
+
+    def _pol_block_is_eviction_free(self, st: "_PolicyState") -> bool:
+        """True when neither row of a 2-row block would evict on any full-attention layer."""
+        L = st.P
+        for l_idx in st.full_layers:
+            if self._pol_phys(st, l_idx) != L:
+                return False
+            if st.kind == "h2o":
+                if st.tracker.unprotected_count(l_idx, L + 2) > st.tracker.layers[l_idx].budget:
+                    return False
+            elif L + 2 > st.budget_total:
+                return False
+        return True
+
+    def _pol_block(self, st: "_PolicyState", pending: int, proposal: int):
+        """Verify [pending, proposal] in ONE forward. Requires an eviction-free block.
+
+        Bookkeeping mirrors two sequential steps with identity plans: row 0 compacts and scores
+        before row 1 is planned. Returns (full_logits, last_logits, last_mtp_logits)."""
+        if not self._pol_block_is_eviction_free(st):
+            raise RuntimeError("block is not eviction-free; the caller must feed the pending token alone")
+        L = st.P
+        plans0, next0 = self._pol_plan_row(st, L, {l: L + 1 for l in st.full_layers})
+        self._pol_apply(st, plans0, next0)
+        pos = torch.arange(L, L + 2, dtype=torch.long, device=self.device).view(1, 1, 2).expand(3, 1, 2).clone()
+        with torch.no_grad():
+            out = self.model(
+                torch.tensor([[int(pending), int(proposal)]], device=self.device, dtype=torch.long),
+                past_key_values=st.cache, position_ids=pos, compute_mtp=True,
+                mtp_position_ids=torch.full((3, 1, 1), L + 2, device=self.device, dtype=torch.long),
+                logits_to_keep=2,
+            )
+        att = out["attention_matrices"]
+        for l_idx, a in att.items():
+            st.tracker.update_attention_scores(l_idx, a[0][:, 0:1, :L + 1].float().cpu().numpy())
+        plans1, next1 = self._pol_plan_row(st, L + 1, {l: L + 2 for l in st.full_layers})
+        self._pol_apply(st, plans1, next1)
+        for l_idx, a in att.items():
+            st.tracker.update_attention_scores(l_idx, a[0][:, 1:2, :L + 2].float().cpu().numpy())
+        st.P = L + 2
+        return out["full_logits"][0], out["logits"][0], out["mtp_logits"][0, 0]
+
+    def _pol_snapshot(self, st: "_PolicyState") -> dict[str, Any]:
+        return {
+            "cache": _snapshot_dynamic_cache(st.cache),
+            "P": st.P,
+            "layers": {
+                l: (
+                    st.tracker.layers[l].scores.copy(),
+                    st.tracker.layers[l].evicted_mask.copy(),
+                    st.tracker.layers[l].visual_token_mask.copy(),
+                    st.tracker.layers[l].budget,
+                )
+                for l in st.full_layers
+            },
+            "seq_len": st.tracker.seq_len,
+            "tracker_visual": st.tracker.visual_token_mask.copy(),
+            "orig": None if st.orig is None else {l: a.copy() for l, a in st.orig.items()},
+        }
+
+    def _pol_restore(self, st: "_PolicyState", snap: dict[str, Any]) -> None:
+        _restore_dynamic_cache(st.cache, snap["cache"])
+        for l, (scores, mask, vm, budget) in snap["layers"].items():
+            layer = st.tracker.layers[l]
+            layer.scores = scores.copy()
+            layer.evicted_mask = mask.copy()
+            layer.visual_token_mask = vm.copy()
+            layer.budget = budget
+        st.tracker.seq_len = snap["seq_len"]
+        st.tracker.visual_token_mask = snap["tracker_visual"].copy()
+        st.orig = None if snap["orig"] is None else {l: a.copy() for l, a in snap["orig"].items()}
+        st.P = snap["P"]
+
+    def _pol_digests(self, st: "_PolicyState") -> tuple[str, str]:
+        return _policy_digests(st.tracker, st.full_layers, st.orig)
+
+    def _pol_digest(self, st: "_PolicyState") -> str:
+        """Policy digest (decision + scores + visual masks + seq_len), bit-for-bit over raw bytes."""
+        return self._pol_digests(st)[1]
+
+    CPU_POLICY_LABEL = "cpu_policy_mtp_k1_reference_not_vllm"
+
+    def _speculative_policy_mtp_greedy(
+        self,
+        kind: str,
+        prompt_ids: Sequence[int],
+        max_new_tokens: int,
+        draft_override: Any = None,
+        record_trace: bool = False,
+        t0: float | None = None,
+    ) -> dict[str, Any]:
+        """Verifier-backed CPU speculation with policy state (H2O tracker or STARLIGHT controller).
+
+        Each committed token is fed exactly once; drafts are verified by a 2-row block ONLY on
+        eviction-free steps. Otherwise the pending token is fed alone and counted as fallback_steps.
+        A reject restores cache and policy state bit-for-bit, then refeeds the pending token.
+        Every target forward is counted in verifier_calls.
+        """
+        if not self.is_official_hf_hooked or getattr(self.model, "mtp_module", None) is None:
+            raise RuntimeError("policy speculation requires the official hooked checkpoint with its MTP head")
+        if type(max_new_tokens) is not int or max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be a positive integer")
+        ids = [int(t) for t in prompt_ids]
+        if not ids:
+            raise ValueError("prompt_ids must be non-empty")
+        vocab = self.config.vocab_size
+        stops: set[int] = set(self.eos_token_ids) if self.stop_at_eos else set()
+        t_start = time.perf_counter() if t0 is None else t0
+        first_commit_ms: float | None = None
+        st = self._pol_new_state(kind, len(ids))
+        trace: list[dict[str, Any]] = []
+        samples: list[int] = []
+        counters = {"proposed": 0, "accepted": 0, "rejected": 0, "verifier_calls": 0, "fallback_steps": 0}
+
+        def _record(via: str) -> None:
+            if record_trace:
+                dec_d, pol_d = self._pol_digests(st)
+                trace.append({"P": st.P, "via": via, "decision_digest": dec_d, "policy_digest": pol_d})
+
+        def _sample() -> None:
+            samples.extend(self._pol_phys(st, l) for l in st.full_layers)
+
+        emitted: list[int] = []
+        stop_reason = "max_new_tokens"
+        logits, mtp = self._pol_prefill(st, ids)
+        counters["verifier_calls"] += 1
+        _record("prefill")
+        pending = int(torch.argmax(logits).item())
+        draft = int(torch.argmax(mtp).item())
+        while True:
+            if pending in stops:
+                stop_reason = "eos"
+                break
+            emitted.append(pending)
+            if first_commit_ms is None:
+                first_commit_ms = (time.perf_counter() - t_start) * 1000.0
+            if len(emitted) >= max_new_tokens:
+                break
+            proposal = draft
+            if draft_override is not None:
+                proposal = int(draft_override(draft, counters["proposed"], len(emitted)))
+            if not 0 <= proposal < vocab:
+                raise ValueError("draft proposal outside the vocabulary")
+            if self._pol_block_is_eviction_free(st):
+                counters["proposed"] += 1  # counted only when the draft is actually verified
+                snap = self._pol_snapshot(st)
+                full_logits, last_logits, last_mtp = self._pol_block(st, pending, proposal)
+                counters["verifier_calls"] += 1
+                if proposal == int(torch.argmax(full_logits[0]).item()):
+                    counters["accepted"] += 1
+                    _sample()
+                    _sample()
+                    _record("accept_block")
+                    if proposal in stops:
+                        stop_reason = "eos"  # verified EOS: stop, never emitted
+                        break
+                    emitted.append(proposal)
+                    if len(emitted) >= max_new_tokens:
+                        break
+                    pending = int(torch.argmax(last_logits).item())
+                    draft = int(torch.argmax(last_mtp).item())
+                else:
+                    counters["rejected"] += 1
+                    self._pol_restore(st, snap)
+                    logits, mtp = self._pol_single(st, pending)
+                    counters["verifier_calls"] += 1
+                    _sample()
+                    _record("refeed")
+                    pending = int(torch.argmax(logits).item())
+                    draft = int(torch.argmax(mtp).item())
+            else:
+                counters["fallback_steps"] += 1
+                logits, mtp = self._pol_single(st, pending)
+                counters["verifier_calls"] += 1
+                _sample()
+                _record("fallback")
+                pending = int(torch.argmax(logits).item())
+                draft = int(torch.argmax(mtp).item())
+
+        tokens = emitted[:max_new_tokens]
+        kv_bytes = 0
+        for layer in st.cache.layers:
+            keys = getattr(layer, "keys", None)
+            if keys is not None:
+                kv_bytes += int(keys.numel() * keys.element_size()) + int(
+                    layer.values.numel() * layer.values.element_size())
+        proposed = counters["proposed"]
+        accepted = counters["accepted"]
+        return {
+            "label": self.CPU_POLICY_LABEL,
+            "kind": kind,
+            "tokens": tokens,
+            "committed": len(tokens),
+            "proposed": proposed,
+            "accepted": accepted,
+            "rejected": counters["rejected"],
+            "verifier_calls": counters["verifier_calls"],
+            "fallback_steps": counters["fallback_steps"],
+            "stop_reason": stop_reason,
+            "acceptance_rate": (accepted / proposed) if proposed else None,
+            "first_commit_ms": first_commit_ms,
+            "kv_bytes_allocated": kv_bytes,
+            "budget_total": st.budget_total,
+            "retained_samples": samples,
+            "trace": trace if record_trace else None,
             "speed_claim": None,
         }
 
@@ -1441,6 +2054,7 @@ class RealSevenArmEngine:
         da_spans: Sequence[tuple[str, int, int]],
         grounding_positions: dict[int, tuple[str, ...]],
         enabled: Sequence[str],
+        structural: dict[int, tuple[str, ...]] | None = None,
     ) -> tuple[dict[int, torch.Tensor], dict[int, np.ndarray], list[StarlightLayerPlan]]:
         """One decode step of STARLIGHT Stage 1 over every full-attention layer (CPU reference).
 
@@ -1463,21 +2077,29 @@ class RealSevenArmEngine:
                     f"{prev.shape[0]} tracked vs {k_len - 1} cached entries"
                 )
             orig = np.asarray(compact_orig_positions(prev, None, appended=appended_position), dtype=np.int64)
-            da_slots = da_protection_from_spans(da_spans, orig) if "da" in enabled_t else {}
+            # S-1 (auditor HIGH): ALL signals are computed on every arm. The candidate set must not
+            # depend on the ablation; an ablation only removes protection as a veto (below).
+            da_slots = da_protection_from_spans(da_spans, orig)
             grounding_spans = [
                 (label, pos, pos + 1) for pos, labels in grounding_positions.items() for label in labels
             ]
-            gr_slots = da_protection_from_spans(grounding_spans, orig) if "grounding" in enabled_t else {}
+            gr_slots = da_protection_from_spans(grounding_spans, orig)
+            structural_spans = [
+                (label, pos, pos + 1) for pos, labels in (structural or {}).items() for label in labels
+            ]
+            st_slots = da_protection_from_spans(structural_spans, orig)
             if k_len <= budget_total:
                 candidates: list[int] = []  # within budget: nothing to evict
             else:
-                n_protected = len(set(da_slots) | set(gr_slots))
+                # Effective H2O budget from the FULL protected union (all sources, ablation-independent).
+                n_protected = len(set(da_slots) | set(gr_slots) | set(st_slots))
                 effective = budget_total - n_protected if n_protected <= budget_total else 0
                 keep = tracker.keep_mask_without_protection(l_idx, k_len, effective)
                 candidates = np.flatnonzero(~keep).tolist()
             plan = plan_starlight_layer(
                 layer=l_idx, length=k_len, budget=budget_total, h2o_candidates=candidates,
-                signals={"da": da_slots, "grounding": gr_slots}, enabled_signals=enabled_t,
+                signals={"da": da_slots, "grounding": gr_slots, "structural": st_slots},
+                enabled_signals=enabled_t,
             )
             retained = np.asarray(plan.retained, dtype=np.int64)
             plans_tensor[l_idx] = torch.as_tensor(retained, dtype=torch.long, device=self.device)
@@ -1516,10 +2138,14 @@ class RealSevenArmEngine:
                     "h2o_candidate": d.h2o_candidate,
                     "da_protected": any(sig.startswith("da:") for sig in d.signals_fired),
                     "grounding_protected": any(sig.startswith("grounding:") for sig in d.signals_fired),
+                    "structural_protected": any(sig.startswith("structural:") for sig in d.signals_fired),
                     "decision": d.decision,
                     "reason_code": d.reason_code,
                 })
-            n_protected = sum(1 for e in entries if e["da_protected"] or e["grounding_protected"])
+            n_protected = sum(
+                1 for e in entries
+                if e["da_protected"] or e["grounding_protected"] or e["structural_protected"]
+            )
             records.append({
                 "step": step,
                 "phase": "decode",
@@ -1611,6 +2237,21 @@ class RealSevenArmEngine:
             "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH",
         }
 
+        # ITER2 Stage 2(a): the serving-style mtp arm runs verifier-backed CPU speculation on
+        # text-only requests of the official checkpoint. Image requests keep the scaffold path.
+        if self._mtp_text_speculation_route(image_present):
+            return self._execute_mtp_speculative_text(
+                request_id=request_id, full_prompt=full_prompt, max_new_tokens=max_new_tokens,
+                t0=t0, arch_status=arch_status, gates=gates,
+            )
+        # ITER2 Stage 2(b): h2o_mtp / starlight_s1_mtp on text-only official requests run policy-state
+        # speculation (eviction-free blocks only). Image or evidence-pool requests keep the diagnostic path.
+        if self._policy_text_speculation_route(image_present, evidence_pool):
+            return self._execute_policy_mtp_speculative_text(
+                request_id=request_id, full_prompt=full_prompt, max_new_tokens=max_new_tokens,
+                t0=t0, arch_status=arch_status, gates=gates,
+            )
+
         starlight_active = self.starlight_signals is not None
         tracker = (
             self._get_or_create_h2o_tracker(request_id, reset=True)
@@ -1657,6 +2298,7 @@ class RealSevenArmEngine:
         starlight_next_orig: dict[int, np.ndarray] = {}
         starlight_records: list[dict[str, Any]] = []
         starlight_structural: set[int] = set()
+        starlight_structural_labels: dict[int, tuple[str, ...]] = {}
         starlight_structural_evicted = 0
         starlight_cache_mismatch_steps = 0
         if starlight_active:
@@ -1669,10 +2311,12 @@ class RealSevenArmEngine:
             starlight_text_positions = np.asarray(
                 [i for i, t in enumerate(full_prompt) if t not in visual_ids], dtype=np.int64,
             )
-            starlight_structural = {
-                i for i, t in enumerate(full_prompt)
-                if t in (self.config.vision_start_token_id, self.config.vision_end_token_id)
-            }
+            for i, t in enumerate(full_prompt):
+                if t == self.config.vision_start_token_id:
+                    starlight_structural_labels[i] = ("vision_start",)
+                elif t == self.config.vision_end_token_id:
+                    starlight_structural_labels[i] = ("vision_end",)
+            starlight_structural = set(starlight_structural_labels)
             if "da" in starlight_enabled:
                 # SCRIPTED DIAGNOSTIC DA scope, anchored to the prefill. Only GLOBAL (sink, question) and
                 # FOCUS spans protect; the LOCAL window is a mask-only scope and does not protect.
@@ -1725,6 +2369,8 @@ class RealSevenArmEngine:
         mtp_proposed_total = 0
         mtp_matched_total = 0
         pending_mtp_candidate: int | None = None
+        # S-2: physical full-attention cache length after each DECODE forward (prefill excluded).
+        retained_decode_samples: list[int] = []
 
         # Prefill forward pass. Reference MTP candidate is evaluated at the
         # next target token's absolute 3-axis RoPE position, never position 0.
@@ -1773,6 +2419,11 @@ class RealSevenArmEngine:
             for l_idx, attn_w in prefill_out["attention_matrices"].items():
                 tracker.update_attention_scores(l_idx, attn_w[0].float().cpu().numpy())
 
+        if self._policy_trace is not None and tracker is not None:
+            dec_d, pol_d = _policy_digests(
+                tracker, self.config.full_attention_layers, starlight_orig if starlight_active else None)
+            self._policy_trace.append({"P": len(full_prompt), "via": "prefill",
+                                       "decision_digest": dec_d, "policy_digest": pol_d})
         if ecrd_proc is not None:
             logits_np0 = logits[0].float().cpu().numpy()
             reweighted_np0 = ecrd_proc(tokens_generated, logits_np0)
@@ -1844,6 +2495,7 @@ class RealSevenArmEngine:
                 h2o_eviction_plans, starlight_next_orig, step_plans = self._starlight_build_step_plans(
                     tracker, k_lens, starlight_orig, curr_len - 1, starlight_budget,
                     starlight_da_spans, starlight_grounding, starlight_enabled,
+                    structural=starlight_structural_labels,
                 )
                 starlight_summaries.append(summarize_plans(step_plans))
                 step_records, step_structural = self._starlight_step_records(
@@ -1914,6 +2566,7 @@ class RealSevenArmEngine:
                 past_kv = out["past_key_values"]
                 recurrent_s = out["recurrent_states"]
                 step_logits = out["logits"][0]
+                retained_decode_samples.extend(self._full_layer_physical_lengths(past_kv))
                 for layer_telem in out["layer_telemetries"]:
                     n_entries = layer_telem.get("da_measured_masked_entry_count")
                     if n_entries is None:
@@ -1938,10 +2591,17 @@ class RealSevenArmEngine:
                             cache_len = past_kv.layers[l_idx].keys.shape[2]
                         else:
                             cache_len = past_kv[l_idx][0].shape[2]
+                        # ITER2 D4 S-4: test-only injection point (always 0 in production runs).
+                        cache_len += self._test_cache_len_offset
                         if cache_len != len(starlight_next_orig[l_idx]):
                             starlight_cache_mismatch_steps += 1
                     starlight_orig = starlight_next_orig
 
+                if self._policy_trace is not None and tracker is not None:
+                    dec_d, pol_d = _policy_digests(
+                        tracker, self.config.full_attention_layers, starlight_orig if starlight_active else None)
+                    self._policy_trace.append({"P": len(full_prompt) + step, "via": "decode",
+                                               "decision_digest": dec_d, "policy_digest": pol_d})
                 for telem in out["layer_telemetries"]:
                     if "physical_bytes_freed" in telem:
                         total_physical_freed += telem["physical_bytes_freed"]
@@ -2048,6 +2708,11 @@ class RealSevenArmEngine:
                 "architectural_status": arch_status,
                 "is_official_hf_hooked": self.is_official_hf_hooked,
                 "forward_path_executed": forward_path_executed,
+                "retained_entries_per_layer": _retained_entries_summary(
+                    retained_decode_samples,
+                    unit="per_decode_step_full_attention_layer",
+                    n_layers=len(self.config.full_attention_layers),
+                ),
                 # R5-5: serving-style arms never speculate. The verifier-backed reference is a separate helper.
                 "speculation_executed": False,
                 "arm_label": (
@@ -2065,6 +2730,8 @@ class RealSevenArmEngine:
                 "vllm_backend_status": "MOCKED_PYTORCH_FALLBACK" if not self.has_vllm_backend else "ATTACHED_VLLM_0_29_0",
                 "pretrained_weights": self.pretrained_weight_summary,
                 "kv_memory_accounting": {
+                    # S-8 (lead ruling): every memory field states its coverage.
+                    "scope": "per decode step, prefill cache unbounded",
                     "legacy_field": "physical_kv_bytes_freed",
                     "classification": "SUM_OF_KV_TENSOR_FOOTPRINT_DELTAS_NOT_GPU_VRAM_SAVING",
                     "compaction_tensor_byte_deltas_sum": total_physical_freed,
@@ -2182,6 +2849,17 @@ class RealSevenArmEngine:
         )
         if starlight_active:
             summary = combine_summaries(starlight_summaries)
+            # Lead decision Q4: not fail-closed. A missing or unusable grounding declaration is flagged,
+            # and the arm reports the degraded configuration it actually ran.
+            grounding_missing = (
+                "grounding" in starlight_enabled and starlight_grounding_status != "ACTIVE"
+            )
+            if not grounding_missing:
+                arm_status = "nominal"
+            elif "da" in starlight_enabled:
+                arm_status = "degraded_to_h2o_plus_da"
+            else:
+                arm_status = "degraded_to_h2o_only"
             grounding_by_evidence: dict[str, int] = {}
             for labels in starlight_grounding.values():
                 for eid in labels:
@@ -2199,6 +2877,8 @@ class RealSevenArmEngine:
                     "SCRIPTED_DIAGNOSTIC_NOT_MODEL_DECLARED" if "da" in starlight_enabled else "DISABLED_ABLATION"
                 ),
                 "grounding_signal_status": starlight_grounding_status,
+                "grounding_declaration_missing": grounding_missing,
+                "arm_status": arm_status,
                 "grounding_evidence_verdicts": starlight_verdicts,
                 "grounding_protected_by_evidence": grounding_by_evidence,
                 "candidate_basis": "H2O keep set over all positions with NO internal protection, at budget - protected",
@@ -2212,6 +2892,9 @@ class RealSevenArmEngine:
                 "recurrent_exemption_label": "RECURRENT_STATE_NOT_TOKEN_ADDRESSABLE_KV",
                 "steps": summary["steps"],
                 "status_counts": summary["status_counts"],
+                # ITER2 D4 S-3: an INFEASIBLE step keeps the physical KV above budget (no eviction).
+                "kv_budget_violated": summary["kv_budget_violated_layers"] > 0,
+                "kv_budget_violated_layers": summary["kv_budget_violated_layers"],
                 "infeasible_steps": summary["status_counts"].get(STATUS_INFEASIBLE, 0),
                 "evicted_total": summary["evicted_total"],
                 "retained_total": summary["retained_total"],

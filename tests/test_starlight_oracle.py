@@ -57,7 +57,7 @@ def _pool(request_id, keywords, eid="ev_the"):
     return pool
 
 
-def _run(arm, pool=None, record=True, budget=16, ratio=0.2, new=10, request_id="oracle_run"):
+def _run(arm, pool=None, record=True, budget=16, ratio=0.2, new=10, request_id="oracle_run", prompt=None):
     torch_seed()
     engine = RealSevenArmEngine(
         method_arm=arm, device="cpu", config=_cfg(), stop_at_eos=False, h2o_min_budget=budget,
@@ -65,7 +65,7 @@ def _run(arm, pool=None, record=True, budget=16, ratio=0.2, new=10, request_id="
     )
     try:
         return engine.execute_request(
-            request_id=request_id, prompt_token_ids=PROMPT, image_present=False,
+            request_id=request_id, prompt_token_ids=PROMPT if prompt is None else prompt, image_present=False,
             max_new_tokens=new, evidence_pool=pool,
         )
     finally:
@@ -110,7 +110,7 @@ def test_I1_I2_eligibility_formula_and_protection_recomputed_from_records():
     checked = 0
     for rec in _records(result):
         for e in rec["entries"]:
-            protected = e["da_protected"] or e["grounding_protected"]
+            protected = e["da_protected"] or e["grounding_protected"] or e["structural_protected"]
             eligible = e["h2o_candidate"] and not protected  # I-1 recomputed from the record
             assert (e["decision"] == "EVICT") == eligible, e
             assert not (e["decision"] == "EVICT" and protected), e  # I-2
@@ -204,11 +204,20 @@ def test_HC12_gdn_layers_are_exempt_and_labelled_and_absent_from_records():
     assert {rec["layer"] for rec in _records(result)} == {3, 7}
 
 
-def test_HC13_structural_vision_tokens_are_measured_and_policy_marked_unratified():
-    result = _run("starlight_s1", pool=_pool("oracle_run", ["the"]))
+def test_HC13_vision_start_and_end_are_protected_and_never_evicted():
+    # ITER2 D4 I-8 / HC13: the prompt carries vision_start (501) at position 10 and vision_end (502)
+    # at position 21, under budget pressure (22 tokens, budget 16). Both must be protected by the
+    # structural source and never evicted; the policy stays labelled as an unratified lead decision.
+    prompt = list(range(100, 110)) + [501] + list(range(110, 120)) + [502] + list(range(120, 130))
+    result = _run("starlight_s1", pool=_pool("oracle_run", ["the"]), prompt=prompt)
     s = result.telemetry["starlight"]
-    assert isinstance(s["structural_tokens_evicted"], int)
-    assert s["structural_policy"] == "NOT_RATIFIED_A4_POLICY_DEPENDENT"
+    assert s["structural_policy"] == "PROTECTED_LEAD_DECISION_Q2"
+    assert s["structural_tokens_evicted"] == 0
+    assert s["protected_count_by_source"]["structural"] > 0, "structural protection never fired"
+    entries = [e for r in _records(result) for e in r["entries"]]
+    protected_positions = {e["position"] for e in entries if e["structural_protected"]}
+    assert {10, 21} <= protected_positions
+    assert not [e for e in entries if e["position"] in (10, 21) and e["decision"] == "EVICT"]
 
 
 def test_HC14_cache_length_counter_matches_retained_count_every_step():
