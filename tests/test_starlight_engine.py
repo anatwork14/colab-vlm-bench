@@ -123,14 +123,20 @@ def test_grounding_h2o_conflict_is_vetoed_not_evicted():
     assert plan.retained == (0, 1, 2, 3, 5, 9)
 
 
-def test_protection_exceeding_budget_is_infeasible_and_protected_stay():
+def test_protection_exceeding_budget_is_infeasible_and_nothing_is_evicted():
+    # ITER2 D4 S-3 (auditor HIGH, lead ruling): when INFEASIBLE, evict NOTHING in that step.
     engine = _engine("starlight_s1")
     tracker = _scored_tracker([1] * 10)
     _, _, plans = _step(engine, tracker, length=10, budget=6, da_spans=[("sink_global", 0, 7)])
     plan = plans[0]
     assert plan.status == STATUS_INFEASIBLE
-    assert plan.retained == tuple(range(7))          # protected 7 > budget 6: reported, not hidden
-    assert plan.evicted == (7, 8, 9)                 # only unprotected candidates are evicted
+    assert plan.infeasible_reason == "protected_exceeds_budget"
+    assert plan.evicted == ()                        # was (7, 8, 9) before S-3: now nothing evicted
+    assert plan.retained == tuple(range(10))         # all protected and all other entries retained
+    assert plan.kv_budget_violated is True           # 10 retained > budget 6, reported explicitly
+    unprotected_candidates = [d for d in plan.decisions if d.h2o_candidate and not d.internally_protected]
+    assert unprotected_candidates, "fixture must contain H2O candidates that would have been evicted"
+    assert all(d.reason_code == "INFEASIBLE_NO_EVICTION" for d in unprotected_candidates)
 
 
 def test_within_budget_has_no_candidates_and_no_eviction():

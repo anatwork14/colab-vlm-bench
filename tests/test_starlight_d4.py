@@ -139,3 +139,24 @@ def test_no_grounding_ablation_is_nominal_without_any_evidence():
     s = _run("starlight_s1_no_grounding", pool=None).telemetry["starlight"]
     assert s["arm_status"] == "nominal"
     assert s["grounding_declaration_missing"] is False  # grounding is not part of this arm
+
+
+# --- ITER2 D4 S-3: INFEASIBLE evicts nothing, is flagged in the summary --------------------
+
+def test_s3_infeasible_step_is_flagged_in_summary_and_evicts_nothing():
+    from vlmbench.infrastructure.starlight import plan_starlight_layer, summarize_plans
+
+    plan = plan_starlight_layer(
+        layer=3, length=10, budget=6, h2o_candidates=[5, 6, 7, 8, 9],
+        signals={"da": {0: ("sink_global",), 1: ("sink_global",), 2: ("sink_global",),
+                        3: ("sink_global",), 4: ("sink_global",), 5: ("sink_global",),
+                        6: ("sink_global",)}},
+        enabled_signals=("da",),
+    )
+    assert plan.status == "INFEASIBLE_PROTECTED_EXCEEDS_BUDGET"
+    assert plan.evicted == ()
+    assert plan.kv_budget_violated is True
+    summary = summarize_plans([plan])
+    assert summary["kv_budget_violated_layers"] == 1
+    assert summary["evicted_total"] == 0
+    assert summary["status_counts"] == {"INFEASIBLE_PROTECTED_EXCEEDS_BUDGET": 1}
