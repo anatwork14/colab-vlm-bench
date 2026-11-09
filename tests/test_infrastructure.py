@@ -47,14 +47,16 @@ def test_h2o_score_accumulation_and_budget():
 
     retained, metrics = tracker.compute_eviction_plan(0, current_length=seq_len)
     assert len(retained) == seq_len
-    # 50% budget of 10 tokens = 5 retained tokens
-    assert metrics["retained_tokens"] == 5
-    assert metrics["evicted_tokens"] == 5
+    # R4-1: 2 sinks are protected and outside the budget. Unprotected = 8, budget = int(8 * 0.5) = 4.
+    # Retained = 2 + 4 = 6 (was 5 when the sinks sat inside the budget).
+    assert metrics["retained_tokens"] == 6
+    assert metrics["evicted_tokens"] == 4
     # First 2 system tokens permanently protected
     assert retained[0] and retained[1]
     # Recent tokens retained
     assert retained[-1]
-    assert "logical_selection_fraction" in metrics
+    assert "per_step_evicted_slot_rate" in metrics
+    assert "logical_selection_fraction" not in metrics  # R4-1: ambiguous name removed
     assert metrics["kv_bytes_freed"] == "NOT_MEASURED_LOGICAL_MASK_ONLY"
 
 
@@ -418,7 +420,7 @@ def test_seven_arm_engine_all_arms_suite():
         if "h2o" in arm:
             assert "final_h2o" in res.verification_trace
             assert res.verification_trace["final_h2o"]["retained_tokens"] > 0
-            assert "logical_selection_fraction" in res.verification_trace["final_h2o"]
+            assert "per_step_evicted_slot_rate" in res.verification_trace["final_h2o"]
         if "da" in arm:
             assert "final_da_read_ratio" in res.verification_trace
         if "ecrd" in arm:
@@ -427,7 +429,9 @@ def test_seven_arm_engine_all_arms_suite():
 
 
 def test_h2o_visual_protection_not_miscounted_as_heavy_hitters():
-    """Visual protected keys can exceed target budget; none is HH-selected."""
+    """Visual protected keys sit OUTSIDE the budget (R4-1). The budget caps unprotected tokens only,
+    and no protected token is ever counted as a score-selected heavy hitter.
+    (Changed in R4-1: this test previously accepted that protected keys could exceed the budget.)"""
     tracker = H2OCacheTracker(
         H2OConfig(budget_ratio=0.2, recent_ratio=0.25, min_budget=4,
                   protect_system_tokens=2, protect_visual_tokens=True),
@@ -443,10 +447,13 @@ def test_h2o_visual_protection_not_miscounted_as_heavy_hitters():
     kept, metrics = tracker.compute_eviction_plan(0, current_length=20)
     assert np.all(kept[5:10]), "Protected visual evidence must stay resident"
     assert kept[0] and kept[1], "Sink tokens must stay resident"
-    assert metrics["heavy_hitters"] == 0, (
-        "Protected visual tokens cannot be counted as score-selected heavy hitters"
-    )
+    # R4-1: heavy hitters are now real score-selected UNPROTECTED tokens. Protected visual tokens
+    # must never be counted among them. Budget 4 minus recent 1 leaves 3 heavy hitters.
+    assert metrics["heavy_hitters"] == metrics["budget"] - metrics["recent_tokens"] == 3
     assert metrics["retained_tokens"] > metrics["heavy_hitters"]
+    assert int(kept.sum()) == metrics["protected_tokens"] + metrics["budget"]
+    unprotected_retained = metrics["retained_tokens"] - metrics["protected_tokens"]
+    assert unprotected_retained <= metrics["budget"], "budget caps unprotected retained tokens"
 
 
 def test_h2o_heavy_hitters_report_only_actual_score_selected_candidates():
@@ -460,10 +467,13 @@ def test_h2o_heavy_hitters_report_only_actual_score_selected_candidates():
         0, np.arange(10, dtype=np.float32)[None, None, :]
     )
     kept, metrics = tracker.compute_eviction_plan(0, current_length=10)
-    # 5 total capacity: 2 sink + 1 recent + 2 score-selected heavy hitters.
-    assert metrics["retained_tokens"] == 5
-    assert metrics["heavy_hitters"] == 2
-    assert int(kept.sum()) == 5
+    # R4-1: 2 sinks outside the budget. Unprotected = 8, budget 4 = 1 recent + 3 score-selected.
+    # Highest scores among candidates 2..8 are 8, 7, 6; recent window is position 9.
+    assert metrics["retained_tokens"] == 6
+    assert metrics["heavy_hitters"] == 3
+    assert int(kept.sum()) == 6
+    assert kept[0] and kept[1] and kept[6] and kept[7] and kept[8] and kept[9]
+    assert not kept[2:6].any()
 
 
 # --- P7 engine regression tests (2026-11-09 audit, base cfccc4b) ---
@@ -530,23 +540,27 @@ def test_p7_h2o_budget_does_not_decay_under_repeated_compaction():
     tracker = H2OCacheTracker(H2OConfig(budget_ratio=0.5, min_budget=32), num_layers=1, num_kv_heads=1)
     tracker.initialize_budget(0, prefill_length=300)
     counts = _h2o_decode_steps(tracker, 0, start_len=300, steps=8)
-    assert counts == [150] * 8, f"retained count decayed: {counts}"
+    # R4-1 changed text-only totals: budget = int((300 - 4 sinks) * 0.5) = 148, plus 4 protected sinks.
+    # Was [150]*8 when sinks sat inside the budget. Still fixed, not decaying.
+    assert counts == [152] * 8, f"retained count decayed: {counts}"
 
 
 def test_p7_h2o_zero_eviction_while_within_budget():
     tracker = H2OCacheTracker(H2OConfig(budget_ratio=0.5, min_budget=4), num_layers=1, num_kv_heads=1)
-    tracker.initialize_budget(0, prefill_length=20)  # budget 10
+    tracker.initialize_budget(0, prefill_length=20)  # 4 sinks protected; budget = int(16 * 0.5) = 8
     tracker.update_attention_scores(0, np.ones((1, 1, 10), dtype=np.float32))
-    for length in (5, 9, 10):
+    for length in (5, 9, 12):  # unprotected 1, 5, 8 <= 8
         keep, m = tracker.compute_eviction_plan(0, current_length=length)
         assert keep.all() and m["evicted_tokens"] == 0, f"evicted within budget at length {length}"
-    keep, m = tracker.compute_eviction_plan(0, current_length=11)
-    assert int(keep.sum()) == 10 and m["evicted_tokens"] == 1
+    # R4-1: 13 tokens = 4 protected + 9 unprotected > budget 8 -> exactly one unprotected eviction
+    keep, m = tracker.compute_eviction_plan(0, current_length=13)
+    assert int(keep.sum()) == 12 and m["evicted_tokens"] == 1
 
 
 def test_p7_h2o_protected_saturation_is_explicit():
-    """Protected visual+sink tokens count inside the budget. When they alone reach it,
-    the plan keeps every protected token plus the newest token, and says so."""
+    """R4-1 (replaces the round-2 saturation semantics, which let retained exceed the budget):
+    protected sinks+visual are OUTSIDE the budget. Budget = int((30 - 22) * 0.5) = 4 unprotected slots.
+    Total retained = 22 protected + 4 unprotected = 26. No saturation state exists any more."""
     tracker = H2OCacheTracker(
         H2OConfig(budget_ratio=0.5, recent_ratio=0.2, min_budget=4,
                   protect_system_tokens=2, protect_visual_tokens=True),
@@ -557,10 +571,10 @@ def test_p7_h2o_protected_saturation_is_explicit():
     tracker.initialize_budget(0, prefill_length=30)  # budget 15 < 22 protected
     tracker.update_attention_scores(0, np.ones((1, 1, 30), dtype=np.float32))
     keep, m = tracker.compute_eviction_plan(0, current_length=30)
-    assert m["protected_saturated"] is True
+    assert "protected_saturated" not in m
     assert keep[:2].all() and keep[4:24].all() and keep[-1]
-    assert int(keep.sum()) == 23  # 22 protected + newest token, no heavy hitters
-    assert m["heavy_hitters"] == 0
+    assert int(keep.sum()) == 26  # 22 protected + 4 unprotected (budget)
+    assert m["heavy_hitters"] == 3 and m["budget"] == 4
 
 
 def test_p7_h2o_unsaturated_protected_keeps_total_budget():
@@ -572,7 +586,8 @@ def test_p7_h2o_unsaturated_protected_keeps_total_budget():
     visual[5:9] = [True] * 4
     tracker.set_visual_tokens(visual)
     counts = _h2o_decode_steps(tracker, 0, start_len=40, steps=6, seed=3)
-    assert counts == [20] * 6
+    # R4-1: 6 protected (2 sinks + 4 visual) sit outside the budget; unprotected budget = 17.
+    assert counts == [23] * 6
 
 
 # --- P7 round 2: ECRD keyword matching must be word-bounded (audit wF:p9) ---
@@ -626,3 +641,91 @@ def test_p7_adapter_da_numbers_carry_scope_label():
     res = InfrastructureRunner(target_backend="pytorch").run_method_verification("da_base", max_tokens=4)
     assert "final_da_read_ratio" in res.verification_trace
     assert res.verification_trace["final_da_label"] == "SYNTHETIC_PROMPT_MASK_STATS_NOT_DECODE_ONLY_DIAGNOSTIC"
+
+
+# --- R4-1 (lead round 4, auditor H2O HIGH): protected tokens outside the budget ---
+
+def _r4_decode_with_identity(tracker, layer_idx, prefill_len, steps, seed=0):
+    """Engine-like decode that tracks the ORIGINAL position of every physical slot."""
+    rng = np.random.RandomState(seed)
+    ids = np.arange(prefill_len)
+    tracker.update_attention_scores(layer_idx, rng.rand(1, prefill_len, prefill_len).astype(np.float32))
+    next_id = prefill_len
+    history = []
+    for _ in range(steps):
+        keep, m = tracker.compute_eviction_plan(layer_idx, current_length=len(ids) + 1)
+        ids = np.append(ids, next_id)
+        next_id += 1
+        idx = np.where(keep)[0]
+        tracker.compact_layer_state(layer_idx, idx)
+        ids = ids[idx]
+        tracker.update_attention_scores(layer_idx, rng.rand(1, 1, len(idx)).astype(np.float32))
+        history.append((ids.copy(), m))
+    return history
+
+
+def _r4_image_tracker(prefill_len=340, visual=range(20, 320)):
+    tracker = H2OCacheTracker(
+        H2OConfig(budget_ratio=0.5, recent_ratio=0.2, min_budget=32,
+                  protect_system_tokens=4, protect_visual_tokens=True),
+        num_layers=1, num_kv_heads=1)
+    mask = [False] * prefill_len
+    for p in visual:
+        mask[p] = True
+    tracker.set_visual_tokens(mask)
+    tracker.initialize_budget(0, prefill_length=prefill_len)
+    return tracker, set(visual)
+
+
+def test_r4_budget_is_computed_from_unprotected_prefill_length():
+    tracker, _ = _r4_image_tracker()
+    # protected at prefill = 4 sinks + 300 visual = 304; unprotected = 36; budget = max(32, int(36*0.5)) = 32
+    assert tracker.layers[0].budget == 32
+    assert tracker.layers[0].budget != max(32, int(340 * 0.5)), "budget must not use the full prefill length"
+
+
+def test_r4_text_tokens_survive_on_image_prompt_across_many_decode_steps():
+    """Round-3 code kept 0 prompt-text tokens from step 2 on this prompt (auditor simulation)."""
+    tracker, visual = _r4_image_tracker()
+    text_prefill = {p for p in range(340) if p not in visual and p >= 4}  # non-sink text positions
+    history = _r4_decode_with_identity(tracker, 0, prefill_len=340, steps=40)
+    for step, (ids, m) in enumerate(history, start=1):
+        kept_text = text_prefill & set(ids.tolist())
+        assert len(kept_text) > 0, f"no prompt text token survived at decode step {step}"
+
+
+def test_r4_retained_unprotected_never_exceeds_budget_and_total_is_protected_plus_budget():
+    tracker, visual = _r4_image_tracker()
+    budget = tracker.layers[0].budget
+    protected_ids = visual | {0, 1, 2, 3}
+    history = _r4_decode_with_identity(tracker, 0, prefill_len=340, steps=40)
+    for step, (ids, m) in enumerate(history, start=1):
+        kept = set(ids.tolist())
+        unprotected_kept = kept - protected_ids
+        assert len(unprotected_kept) <= budget, f"step {step}: {len(unprotected_kept)} > budget {budget}"
+        if m["evicted_tokens"] > 0:  # steady state: retained = protected + budget exactly
+            assert len(kept) == len(protected_ids) + budget, f"step {step}: total {len(kept)}"
+
+
+def test_r4_protected_tokens_are_never_evicted():
+    tracker, visual = _r4_image_tracker()
+    protected_ids = visual | {0, 1, 2, 3}
+    history = _r4_decode_with_identity(tracker, 0, prefill_len=340, steps=40)
+    for step, (ids, _) in enumerate(history, start=1):
+        assert protected_ids <= set(ids.tolist()), f"protected token evicted at step {step}"
+
+
+def test_r4_per_step_rate_is_named_per_step_and_cumulative_is_not_in_plan():
+    tracker, _ = _r4_image_tracker()
+    _, m = tracker.compute_eviction_plan(0, current_length=341)
+    assert "per_step_evicted_slot_rate" in m and "logical_selection_fraction" not in m
+    assert m["protected_tokens"] == 304 and m["budget"] == 32
+
+
+# --- R4-2: h2o.py header must say the MTP transaction is used only by the synthetic adapter ---
+
+def test_r4_h2o_module_header_scopes_mtp_transaction_to_synthetic_adapter():
+    import vlmbench.infrastructure.h2o as h2o_mod
+    doc = h2o_mod.__doc__
+    assert "synthetic" in doc.lower()
+    assert "not used by the real engine" in doc.lower()

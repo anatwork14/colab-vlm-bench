@@ -1,32 +1,34 @@
 """Real PyTorch Neural Model & Official Transformers Hooking Engine for Seven-Arm Benchmarking.
 
-Closes the gap between synthetic policy harnesses and production neural execution:
-1. Official Pretrained Architecture & Hooking (P0-01):
-   - Hooks official Hugging Face `Qwen3_5ForConditionalGeneration` (473 base VL tensors,
-     852,985,920 parameters) and `Qwen35MTPModule` (15 MTP tensors, 20,452,864 parameters)
-     achieving 100% tensor coverage (488/488 tensors) and 100% parameter coverage.
-   - Verifies one-step logits parity (max_abs_logits_diff == 0.0) against unhooked official HF model.
-   - Retains lightweight reference scaffold strictly labeled as `PARTIALLY_WEIGHTED_PYTORCH_REFERENCE`
-     or `PYTORCH_ARCHITECTURAL_SCAFFOLD_UNWEIGHTED` when unhooked.
-2. Genuine Multimodal Inference Per Arm (P0-02):
-   - Processes real image bytes (`000000039769.png`) through official `AutoProcessor`
-     (`pixel_values`, `image_grid_thw`, `mm_token_type_ids`) and ViT vision encoder
-     for every arm (`base`, `h2o_base`, `da_base`, `ecrd_base`, `mtp`, `h2o_mtp`, `da_mtp`).
+What this module does, and what it does NOT establish (see docs/engine/P7_ENGINE_AUDIT_20261109.md):
+1. Official checkpoint loading (P0-01):
+   - Loads the official HF `Qwen3_5ForConditionalGeneration` and the `Qwen35MTPModule` head.
+   - Tensor and parameter coverage are computed at load time and reported in
+     `pretrained_weight_summary`. A full-coverage load is required for `is_official_hf_hooked`.
+   - Partial coverage keeps the scaffold labels (`PARTIALLY_WEIGHTED_PYTORCH_REFERENCE`) and
+     never reports the real-forward gate as PASS.
+2. Multimodal inputs per arm (P0-02):
+   - Processes real image bytes through the official `AutoProcessor` and the ViT encoder for
+     the arms that take an image.
    - Records `visual_encoder_trace` (`pixel_values_shape`, `visual_token_embeddings_count`).
-3. Physical KV Cache Reclamation (H2O):
-   - Computes real softmax attention weights from model forward passes.
-   - Executes physical tensor slicing/compaction on CUDA/CPU KV caches (`DynamicLayer`).
-   - Exempts DeltaNet recurrent states (`LinearAttentionLayer`) and protects visual tokens.
-4. Declarative Attention Cost Accounting (P1-03):
+3. H2O KV eviction (physical compaction on full-attention layers):
+   - Computes attention weights from forward passes and compacts `DynamicCache` tensors.
+   - DeltaNet recurrent layers are exempt. Protected (sink and visual) tokens sit outside the budget.
+   - Reports retained and evicted slots. No physical VRAM saving is measured.
+4. Declarative attention (DA) cost accounting:
    - Injects 2D boolean read masks into attention logits before softmax.
-   - Labels sparsity metric strictly as `attention_mask_restriction_ratio` (logical mask restriction
-     estimate), never claiming physical KV-read saving or HBM traffic reduction
-     (`physical_kv_bytes_freed = 0`, `100%` KV residency preserved).
-5. Production ECRD Logits Processing & MTP Speculative Rollback:
-   - Full-vocabulary [B, 248320] ECRD logits processor (`is_argmax_invariant() -> False`).
-   - Authentic 15-tensor MTP drafting, verification, and bit-exact `DynamicCache` rollback.
-6. Multi-Request Concurrency Isolation (CCU > 1):
-   - Independent request slots and thread-local hook contexts ensuring zero state pollution.
+   - Reports `attention_mask_restriction_ratio` as a logical estimate. No KV-read saving or HBM
+     traffic reduction is claimed.
+5. MTP (multi-token prediction) in this module:
+   - The serving-style `mtp` arm proposes drafts for diagnostics only and commits none. It does not
+     verify them. Its candidate-vs-target agreement is not an acceptance rate.
+   - Verifier-derived greedy k=1 acceptance and KV/DeltaNet-state rollback exist only in
+     `RealSevenArmEngine._speculative_mtp_greedy_k1`. It is labelled
+     `cpu_greedy_k1_reference_not_vllm_mtp`. `execute_request` does not call it.
+   - Native vLLM MTP is not verified here.
+6. ECRD logits processing: a full-vocabulary logits processor (`is_argmax_invariant() -> False`).
+7. Concurrency: a CPU test covers one H2O arm against sequential runs. Hook context is thread-local
+   and the official forward is serialised on a lock. Broader isolation is NOT proven.
 """
 from __future__ import annotations
 
@@ -192,6 +194,7 @@ def _install_seven_arm_attention_hooks(hf_model: Any, hook_ctx: _HookStepContext
                 value_rep = modeling_qwen3_5.repeat_kv(value_states, mod.num_key_value_groups)
 
                 attn_logits = torch.matmul(query_states, key_rep.transpose(2, 3)) * mod.scaling
+                da_masked_neg: torch.Tensor | None = None
                 if attention_mask is not None:
                     if attention_mask.shape[-1] != k_len:
                         raise ValueError(
@@ -209,16 +212,32 @@ def _install_seven_arm_attention_hooks(hf_model: Any, hook_ctx: _HookStepContext
                     else:
                         da_mask_slice = da_mask
                     mask_expanded = da_mask_slice.unsqueeze(0).unsqueeze(0)
-                    attn_logits = attn_logits.masked_fill(~mask_expanded, -1e9)
+                    da_masked_neg = ~mask_expanded
+                    attn_logits = attn_logits.masked_fill(da_masked_neg, -1e9)
 
                 attn_weights = nn.functional.softmax(
                     attn_logits, dim=-1, dtype=torch.float32
                 ).to(query_states.dtype)
 
+                # R4-3: MEASURE the post-softmax weight on every masked (head, query, key) entry.
+                # This is what DA_MASKING_EXERCISED is allowed to rest on, not the constructed mask.
+                da_measured: dict[str, Any] = {}
+                if da_masked_neg is not None:
+                    neg_entries = da_masked_neg.expand_as(attn_weights)
+                    n_masked_entries = int(neg_entries.sum().item())
+                    da_measured = {
+                        "da_measured_masked_entry_count": n_masked_entries,
+                        "da_measured_masked_weight_max": (
+                            float(attn_weights.masked_select(neg_entries).max().item())
+                            if n_masked_entries else None
+                        ),
+                    }
+
                 if hasattr(hook_ctx, "attention_matrices"):
                     hook_ctx.attention_matrices[l_idx] = attn_weights.detach()
                 if hasattr(hook_ctx, "layer_telemetries"):
                     hook_ctx.layer_telemetries[l_idx] = {
+                        **da_measured,
                         "kv_seq_len": k_len,
                         "attention_mask_len": None if attention_mask is None else int(attention_mask.shape[-1]),
                         "attention_mask_len_received": mask_len_received,
@@ -554,6 +573,21 @@ class Qwen35NeuralModel(nn.Module):
             )
             self.visual_merger = nn.Linear(self.config.hidden_size, self.config.hidden_size, bias=True)
 
+    @property
+    def hf_forward_active(self) -> bool:
+        """True when forward() runs the attached official HF model (R4-4).
+
+        A config.json checkpoint attaches the HF model even when coverage is partial. Cache layout
+        and decode position handling must follow THIS flag, not the qualification flag.
+        """
+        return self.hf_model is not None and self.hook_ctx is not None
+
+    @property
+    def forward_path_label(self) -> str:
+        if not self.hf_forward_active:
+            return "scaffold_reference"
+        return "official_hf_hooked" if self.is_official_hf_hooked else "official_hf_partial_coverage_UNQUALIFIED"
+
     def load_pretrained_weights(
         self,
         checkpoint_dir: str | Path,
@@ -772,7 +806,7 @@ class Qwen35NeuralModel(nn.Module):
         """
         if type(logits_to_keep) is not int or logits_to_keep < 1:
             raise ValueError("logits_to_keep must be a positive integer")
-        if self.hf_model is not None and self.hook_ctx is not None:
+        if self.hf_forward_active:
             from transformers.models.qwen3_5 import modeling_qwen3_5
 
             lock = self._hf_lock or threading.Lock()
@@ -820,6 +854,7 @@ class Qwen35NeuralModel(nn.Module):
                         layer_telemetries.append({"type": "recurrent_deltanet", "kv_bytes_allocated": 0, "physical_bytes_freed": 0})
 
                 return {
+                    "forward_path": self.forward_path_label,
                     "logits": logits,
                     "full_logits": out.logits.float(),
                     "mtp_logits": mtp_logits,
@@ -878,6 +913,7 @@ class Qwen35NeuralModel(nn.Module):
             mtp_logits = self.lm_head(mtp_hidden)
 
         return {
+            "forward_path": self.forward_path_label,
             "logits": logits,
             "mtp_logits": mtp_logits,
             "past_key_values": new_past_kv,
@@ -888,6 +924,32 @@ class Qwen35NeuralModel(nn.Module):
 
 
 DA_DECODE_ONLY_LABEL = "decode_only_scripted_da_diagnostic"
+
+
+def _round_or_none(value: float | None, ndigits: int = 4) -> float | None:
+    return None if value is None else round(value, ndigits)
+
+
+def _da_masking_gate(
+    method_arm: str,
+    restriction_ratio: float | None,
+    measured_masked_entries: int | None,
+    measured_masked_weight_max: float | None,
+) -> str:
+    """DA_MASKING_EXERCISED verdict (R4-3).
+
+    PASS needs all three: a constructed restriction (> 0), masked entries MEASURED in the hooked
+    forward, and every measured masked weight exactly 0.0. A constructed mask alone never passes.
+    """
+    if "da" not in method_arm:
+        return "NOT_APPLICABLE"
+    if restriction_ratio is not None and restriction_ratio == 0.0:
+        return "NOT_EXERCISED_NO_RESTRICTED_READS"
+    if restriction_ratio is None or not measured_masked_entries or measured_masked_weight_max is None:
+        return "NOT_MEASURED_NO_HOOKED_DECODE_STEP"
+    if measured_masked_weight_max != 0.0:
+        return "FAIL_MASKED_KEY_RECEIVED_ATTENTION"
+    return "PASS"
 
 
 def _da_scripted_tags(
@@ -935,11 +997,11 @@ class RealExecutionResult:
     tpot_ms: float
     physical_kv_bytes_allocated: int
     physical_kv_bytes_freed: int
-    logical_selection_fraction: float
-    attention_read_restriction_ratio: float
+    per_step_evicted_slot_rate: float | None  # H2O: last decode step only; None if no H2O step ran
+    attention_read_restriction_ratio: float | None  # None when no decode step built a DA mask
     grounded_citations: list[dict[str, Any]]
     mtp_acceptance_rate: float | None  # None = not verified (serving arm); see _speculative_mtp_greedy_k1
-    attention_mask_restriction_ratio: float = 0.0
+    attention_mask_restriction_ratio: float | None = None
     gates: dict[str, str] = field(default_factory=dict)
     telemetry: dict[str, Any] = field(default_factory=dict)
 
@@ -1415,11 +1477,15 @@ class RealSevenArmEngine:
 
         total_physical_freed = 0
         final_allocated_bytes = 0
-        final_logical_fraction = 0.0
-        h2o_last_step_evicted_slots = 0
-        h2o_last_step_total_slots = 0
-        final_da_restriction_ratio = 0.0
-        final_da_causal_area_ratio = 0.0
+        # H2O telemetry: None until a measurement exists (never a literal zero).
+        h2o_per_step_rate: float | None = None
+        h2o_cumulative_evicted_slots: int | None = None  # None until a decode step runs
+        h2o_slots_at_prefill: int | None = None
+        h2o_last_step_retained_slots: int | None = None
+        final_da_restriction_ratio: float | None = None  # None until a decode step builds a mask
+        final_da_causal_area_ratio: float | None = None
+        da_measured_masked_entries: int | None = None    # None = no hooked decode measurement
+        da_measured_weight_max: float | None = None
         mtp_proposed_total = 0
         mtp_matched_total = 0
         pending_mtp_candidate: int | None = None
@@ -1454,10 +1520,13 @@ class RealSevenArmEngine:
         if "mtp" in self.method_arm:
             pending_mtp_candidate = int(torch.argmax(prefill_out["mtp_logits"][0, 0]).item())
 
+        forward_path_executed = prefill_out["forward_path"]
+
         # Fix each full-attention layer's H2O budget from the PREFILL length, once.
         if tracker is not None:
             for l_idx in self.config.full_attention_layers:
                 tracker.initialize_budget(l_idx, len(full_prompt))
+            h2o_slots_at_prefill = len(self.config.full_attention_layers) * len(full_prompt)
 
         # Feed prefill attention scores into H2O tracker
         if tracker is not None:
@@ -1480,7 +1549,7 @@ class RealSevenArmEngine:
 
             # Determine active physical KV cache length for attention layers
             first_attn_layer = self.config.full_attention_layers[0]
-            if self.is_official_hf_hooked and past_kv is not None:
+            if self.model.hf_forward_active and past_kv is not None:
                 phys_kv_len = past_kv.layers[first_attn_layer].keys.shape[2] + 1
             elif past_kv is not None and past_kv[first_attn_layer] is not None:
                 phys_kv_len = past_kv[first_attn_layer][0].shape[2] + 1
@@ -1518,10 +1587,11 @@ class RealSevenArmEngine:
             # 2. H2O physical eviction plans for full-attention layers coordinated with physical KV length
             h2o_eviction_plans: dict[int, torch.Tensor] = {}
             if tracker is not None:
-                h2o_last_step_evicted_slots = 0
-                h2o_last_step_total_slots = 0
+                step_evicted = 0
+                step_total = 0
+                step_retained = 0
                 for l_idx in self.config.full_attention_layers:
-                    if self.is_official_hf_hooked and past_kv is not None:
+                    if self.model.hf_forward_active and past_kv is not None:
                         k_phys_len = past_kv.layers[l_idx].keys.shape[2] + 1
                     elif past_kv is not None and past_kv[l_idx] is not None:
                         k_phys_len = past_kv[l_idx][0].shape[2] + 1
@@ -1530,18 +1600,18 @@ class RealSevenArmEngine:
                     retained, metrics = tracker.compute_eviction_plan(l_idx, current_length=k_phys_len)
                     retained_indices = torch.where(torch.from_numpy(retained))[0].to(self.device)
                     h2o_eviction_plans[l_idx] = retained_indices
-                    h2o_last_step_evicted_slots += metrics["evicted_tokens"]
-                    h2o_last_step_total_slots += metrics["total_tokens"]
-                # Report the full-attention-layer token-slot fraction, NOT the
-                # last layer's ratio (layers may have different compacted lengths).
-                final_logical_fraction = (
-                    h2o_last_step_evicted_slots / h2o_last_step_total_slots
-                    if h2o_last_step_total_slots else 0.0
-                )
+                    step_evicted += metrics["evicted_tokens"]
+                    step_total += metrics["total_tokens"]
+                    step_retained += metrics["retained_tokens"]
+                # Per-step rate over full-attention layers (last step only), plus cumulative
+                # evicted slots over all steps. Layers may have different compacted lengths.
+                h2o_cumulative_evicted_slots = (h2o_cumulative_evicted_slots or 0) + step_evicted
+                h2o_last_step_retained_slots = step_retained
+                h2o_per_step_rate = step_evicted / step_total if step_total else 0.0
 
             # Compute 3D RoPE position_ids for decode step when using official HF model
             step_pos_ids: torch.Tensor | None = None
-            if self.is_official_hf_hooked:
+            if self.model.hf_forward_active:
                 step_pos_ids = torch.full((3, 1, 1), curr_len - 1, device=self.device, dtype=torch.long)
                 if rope_deltas is not None:
                     step_pos_ids = step_pos_ids + rope_deltas.view(1, 1, 1)
@@ -1567,6 +1637,16 @@ class RealSevenArmEngine:
                 past_kv = out["past_key_values"]
                 recurrent_s = out["recurrent_states"]
                 step_logits = out["logits"][0]
+                for layer_telem in out["layer_telemetries"]:
+                    n_entries = layer_telem.get("da_measured_masked_entry_count")
+                    if n_entries is None:
+                        continue
+                    da_measured_masked_entries = (da_measured_masked_entries or 0) + int(n_entries)
+                    w_max = layer_telem.get("da_measured_masked_weight_max")
+                    if w_max is not None:
+                        da_measured_weight_max = (
+                            w_max if da_measured_weight_max is None else max(da_measured_weight_max, w_max)
+                        )
 
                 if tracker is not None:
                     for l_idx, attn_w in out["attention_matrices"].items():
@@ -1614,22 +1694,27 @@ class RealSevenArmEngine:
         # verifier-derived CPU reference lives in _speculative_mtp_greedy_k1 and is
         # labelled cpu_greedy_k1_reference_not_vllm_mtp.
         mtp_acc_rate: float | None = None
-        mtp_proposal_match_rate = (
+        # Candidate-vs-committed-target agreement. NOT an acceptance rate: no draft is committed
+        # or verified by a speculative step in this serving arm (R4-2).
+        mtp_proposal_target_agreement = (
             mtp_matched_total / mtp_proposed_total if mtp_proposed_total else None
         )
-        if "da" in self.method_arm:
-            # G4: DA counts as exercised only when a real decode read was restricted.
-            gates["DA_MASKING_EXERCISED"] = (
-                "PASS" if final_da_restriction_ratio > 0.0 else "NOT_EXERCISED_NO_RESTRICTED_READS"
-            )
-        else:
-            gates["DA_MASKING_EXERCISED"] = "NOT_APPLICABLE"
+        # R4-3: PASS only from measured zero masked weights plus a constructed restriction.
+        gates["DA_MASKING_EXERCISED"] = _da_masking_gate(
+            self.method_arm, final_da_restriction_ratio,
+            da_measured_masked_entries, da_measured_weight_max,
+        )
         if "mtp" in self.method_arm:
             gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] = (
                 "PASS" if mtp_proposed_total > 0 else "INSUFFICIENT_TOKENS"
             )
 
         # Decode semantic text when official tokenizer is attached
+        h2o_final_retained_fraction = (
+            h2o_last_step_retained_slots / h2o_slots_at_prefill
+            if h2o_last_step_retained_slots is not None and h2o_slots_at_prefill
+            else None
+        )
         decoded_str = ""
         if self.tokenizer is not None and hasattr(self.tokenizer, "decode"):
             try:
@@ -1651,7 +1736,7 @@ class RealSevenArmEngine:
             tpot_ms=tpot_ms,
             physical_kv_bytes_allocated=final_allocated_bytes,
             physical_kv_bytes_freed=total_physical_freed,
-            logical_selection_fraction=final_logical_fraction,
+            per_step_evicted_slot_rate=h2o_per_step_rate,
             attention_read_restriction_ratio=final_da_restriction_ratio,
             attention_mask_restriction_ratio=final_da_restriction_ratio,
             grounded_citations=citations,
@@ -1666,6 +1751,7 @@ class RealSevenArmEngine:
                 "device": self.device,
                 "architectural_status": arch_status,
                 "is_official_hf_hooked": self.is_official_hf_hooked,
+                "forward_path_executed": forward_path_executed,
                 "vllm_backend_status": "MOCKED_PYTORCH_FALLBACK" if not self.has_vllm_backend else "ATTACHED_VLLM_0_29_0",
                 "pretrained_weights": self.pretrained_weight_summary,
                 "kv_memory_accounting": {
@@ -1679,10 +1765,12 @@ class RealSevenArmEngine:
                     "warning": "Each decode step's index_select size delta is added. The total is NOT a peak or allocated/reserved VRAM delta, and may count repeated reductions.",
                 },
                 "h2o_logical_selection_accounting": {
-                    "classification": "LAST_STEP_FULL_ATTENTION_LAYER_SLOT_WEIGHTED",
-                    "evicted_token_slots": h2o_last_step_evicted_slots,
-                    "total_token_slots": h2o_last_step_total_slots,
-                    "logical_selection_fraction": final_logical_fraction,
+                    "budget_basis": "unprotected_prefill_tokens_fixed_per_layer",
+                    "protected_outside_budget": True,
+                    "per_step_evicted_slot_rate": h2o_per_step_rate,  # last decode step only
+                    "cumulative_evicted_slots": h2o_cumulative_evicted_slots,  # all decode steps, full-attention layers
+                    "cumulative_total_slots_at_prefill": h2o_slots_at_prefill,  # full-attention layers x prompt length
+                    "final_retained_fraction": h2o_final_retained_fraction,  # retained after last step / prefill slots
                     "physical_vram_saving_claimed": False,
                     "protected_vision_tokens_in_prompt": int(
                         sum(1 for t in full_prompt if t in (
@@ -1691,15 +1779,13 @@ class RealSevenArmEngine:
                             self.config.vision_end_token_id,
                         ))
                     ),
-                    # Budget includes protected tokens (documented protocol). With a protected
-                    # vision block the budget is dominated by protected positions, so KV savings
-                    # are ~0 and these h2o arms are NOT multimodal KV-compression evidence.
+                    # R4-1: protected tokens sit OUTSIDE the budget. The budget caps text tokens only.
                     "multimodal_kv_compression_evidence": False if (
                         any(t == self.config.image_token_id for t in full_prompt)
                     ) else "NOT_APPLICABLE_NO_VISION_TOKENS",
                     "limitation": (
-                        "Protected vision block (sinks + visual tokens) counts inside the fixed budget; "
-                        "KV retention savings on VLM prompts are ~0 (see evicted_token_slots/total_token_slots). "
+                        "Protected sinks and visual tokens are never evicted and sit outside the fixed budget; "
+                        "the budget caps text tokens only. No physical VRAM saving was measured. "
                         "h2o_* arms are not evidence of multimodal KV compression."
                     ),
                     "unprotected_original_h2o_variant": "NOT_IMPLEMENTED_OWNER_DECISION",
@@ -1708,10 +1794,17 @@ class RealSevenArmEngine:
                     "classification": "REFERENCE_DRAFT_NO_PERSISTENT_MTP_KV_NO_SPECULATIVE_SERVING",
                     "position_ids_are_absolute": self.is_official_hf_hooked,
                     "persistent_mtp_kv_history": False,
-                    "proposal_match_rate_publishable": False,
+                    "proposal_target_agreement_publishable": False,
+                    "proposal_target_agreement_is_acceptance": False,
                     "proposals_verified": mtp_proposed_total,
                     "proposals_matching_target": mtp_matched_total,
-                    "proposal_match_rate": mtp_proposal_match_rate,
+                    "proposal_target_agreement_diagnostic": mtp_proposal_target_agreement,
+                    "cpu_greedy_k1_reference": {
+                        "label": self.CPU_GREEDY_K1_LABEL,
+                        "run_in_this_request": False,
+                        "entry_point": "RealSevenArmEngine._speculative_mtp_greedy_k1",
+                        "note": "Verifier-derived acceptance exists only in that helper; this serving arm does not call it.",
+                    },
                     "committed_draft_tokens": 0,
                     "native_target_verifier_executed": False,
                     "speculative_speedup_claimed": False,
@@ -1729,21 +1822,33 @@ class RealSevenArmEngine:
                     if "ecrd" in self.method_arm else None
                 ),
                 "da_cost_accounting": {
-                    "attention_mask_restriction_ratio": round(final_da_restriction_ratio, 4),
-                    "decode_last_query_allowed_key_ratio": round(1.0 - final_da_restriction_ratio, 4),
-                    "full_causal_mask_area_restriction_ratio": round(final_da_causal_area_ratio, 4),
+                    "attention_mask_restriction_ratio": _round_or_none(final_da_restriction_ratio),
+                    "decode_last_query_allowed_key_ratio": (
+                        None if final_da_restriction_ratio is None else round(1.0 - final_da_restriction_ratio, 4)
+                    ),
+                    "full_causal_mask_area_restriction_ratio": _round_or_none(final_da_causal_area_ratio),
+                    "measured_masked_entry_count": da_measured_masked_entries,
+                    "measured_masked_weight_max": da_measured_weight_max,
+                    "measured_source": (
+                        "hooked_forward_post_softmax" if da_measured_masked_entries is not None
+                        else "NOT_MEASURED_NO_HOOKED_DECODE_STEP"
+                    ),
                     "focus_visual_evidence_kept": bool(image_present),
                     "da_scope_provenance": "SCRIPTED_SEGMENT_DIAGNOSTIC_NOT_MODEL_DECLARED",
                     "result_label": DA_DECODE_ONLY_LABEL,
-                    "nontrivial_masking_exercised": bool(final_da_restriction_ratio > 0.0),
+                    "nontrivial_masking_exercised": (
+                        None if final_da_restriction_ratio is None else bool(final_da_restriction_ratio > 0.0)
+                    ),
                     "prefill_masked": False,
                     "deviations_from_scripted_geometry": (
                         ["question_span_global"] if da_question_start is not None else []
                     ),
                     "original_paper_protocol_qualified": False,
                     "physical_kv_bytes_freed": 0 if "da" in self.method_arm else total_physical_freed,
-                    "kv_residency_preserved_ratio": 1.0 if "da" in self.method_arm else round(1.0 - final_logical_fraction, 4),
-                    "kv_residency_preserved_pct": 100.0 if "da" in self.method_arm else round((1.0 - final_logical_fraction) * 100.0, 2),
+                    "kv_residency_preserved_ratio": 1.0 if "da" in self.method_arm else (
+                        round(h2o_final_retained_fraction, 4) if h2o_final_retained_fraction is not None else None),
+                    "kv_residency_preserved_pct": 100.0 if "da" in self.method_arm else (
+                        round(h2o_final_retained_fraction * 100.0, 2) if h2o_final_retained_fraction is not None else None),
                     "physical_kv_read_saving_claimed": False,
                     "hbm_traffic_reduction_claimed": False,
                     "accounting_note": (

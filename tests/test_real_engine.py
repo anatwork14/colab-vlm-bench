@@ -211,7 +211,7 @@ def test_h2o_sequence_above_min_budget_physical_eviction():
 
     # Compaction must have physically triggered and freed bytes
     assert res.physical_kv_bytes_freed > 0, "H2O must physically free bytes when seq_len > min_budget"
-    assert res.logical_selection_fraction > 0.0
+    assert res.per_step_evicted_slot_rate > 0.0
     assert res.physical_kv_bytes_allocated > 0
     engine.close()
 
@@ -260,7 +260,7 @@ def test_all_seven_arms_real_neural_forward_and_gates():
 
         if "h2o" in arm:
             assert res.physical_kv_bytes_freed >= 0
-            assert res.logical_selection_fraction >= 0.0
+            assert res.per_step_evicted_slot_rate >= 0.0
         if "da" in arm:
             # Small prompts may genuinely have zero exclusion: do not demand
             # a positive sparsity measurement where no selective read is needed.
@@ -596,8 +596,13 @@ def test_p7_h2o_decode_mask_aligned_with_compacted_kv_official():
         return out
 
     engine.model.forward = _spy
-    res = engine.execute_request("p7_h2o_mask_align", max_new_tokens=5, image_present=True)
-    assert res.telemetry["h2o_logical_selection_accounting"]["evicted_token_slots"] > 0, (
+    # R4-1: protected image tokens sit outside the budget, so a short question would never
+    # compact (about 3 text tokens < budget 32). A long question makes unprotected text exceed
+    # the budget so compaction actually happens.
+    long_question = " ".join(["Describe every object in the living room, its colour and position."] * 12)
+    res = engine.execute_request("p7_h2o_mask_align", max_new_tokens=5, image_present=True,
+                                 question=long_question)
+    assert res.telemetry["h2o_logical_selection_accounting"]["cumulative_evicted_slots"] > 0, (
         "compaction must actually occur for this check to be meaningful")
     decode_steps = captured[1:]
     assert decode_steps
@@ -724,6 +729,10 @@ def test_p7_r3_da_constructed_official_case_masks_real_reads_to_exact_zero():
 
     assert res.attention_mask_restriction_ratio > 0.0, "constructed case did not restrict any read"
     assert res.gates["DA_MASKING_EXERCISED"] == "PASS"
+    # R4-3: PASS must come from weights MEASURED in the hooked forward, not from the constructed mask.
+    measured = res.telemetry["da_cost_accounting"]
+    assert measured["measured_masked_entry_count"] > 0
+    assert measured["measured_masked_weight_max"] == 0.0
 
     checked_masked = 0
     for call in calls[1:]:
@@ -758,3 +767,161 @@ def test_p7_r3_h2o_telemetry_states_multimodal_compression_limitation():
     assert "protected" in acct["limitation"].lower()
     assert acct["unprotected_original_h2o_variant"] == "NOT_IMPLEMENTED_OWNER_DECISION"
     engine.close()
+
+
+def test_r4_h2o_telemetry_has_explicit_cumulative_fields():
+    """R4-1: the ambiguous per-step 'logical_selection_fraction' is replaced by explicitly named
+    cumulative fields plus a clearly per-step rate. Still no physical VRAM saving is claimed."""
+    cfg = _p7_small_cfg()
+    prompt = list(range(10, 50))
+    engine = RealSevenArmEngine(method_arm="h2o_base", config=cfg, device="cpu")
+    try:
+        res = engine.execute_request("r4_h2o_fields", prompt_token_ids=prompt,
+                                     max_new_tokens=6, image_present=False)
+    finally:
+        engine.close()
+    assert not hasattr(res, "logical_selection_fraction")
+    acc = res.telemetry["h2o_logical_selection_accounting"]
+    assert "logical_selection_fraction" not in acc
+    assert isinstance(acc["per_step_evicted_slot_rate"], float)
+    assert acc["cumulative_total_slots_at_prefill"] == len(cfg.full_attention_layers) * len(prompt)
+    assert isinstance(acc["cumulative_evicted_slots"], int) and acc["cumulative_evicted_slots"] >= 0
+    assert isinstance(acc["final_retained_fraction"], float)
+    assert acc["physical_vram_saving_claimed"] is False
+    assert "no physical" in acc["limitation"].lower() or "not measured" in acc["limitation"].lower()
+
+
+# --- R4-2 (lead round 4, auditor MEDIUM): MTP labels and documentation claims ---
+
+def test_r4_serving_mtp_arm_reports_target_agreement_not_acceptance():
+    """The serving-style mtp arm never verifies or commits drafts. Its candidate-vs-target
+    agreement must not be named like an acceptance rate, and it must point at the CPU reference
+    label without claiming the reference ran in this request."""
+    cfg = _p7_small_cfg()
+    engine = RealSevenArmEngine(method_arm="mtp", config=cfg, device="cpu")
+    try:
+        res = engine.execute_request("r4_mtp_labels", prompt_token_ids=list(range(10, 30)),
+                                     max_new_tokens=6, image_present=False)
+    finally:
+        engine.close()
+    diag = res.telemetry["mtp_candidate_diagnostic"]
+    assert "proposal_match_rate" not in diag, "name reads like an acceptance rate"
+    assert "proposal_target_agreement_diagnostic" in diag
+    assert diag["proposal_target_agreement_is_acceptance"] is False
+    assert diag["committed_draft_tokens"] == 0
+    assert res.mtp_acceptance_rate is None
+    ref = diag["cpu_greedy_k1_reference"]
+    assert ref["label"] == "cpu_greedy_k1_reference_not_vllm_mtp"
+    assert ref["run_in_this_request"] is False
+
+
+def test_r4_engine_module_docstring_makes_no_unverified_mtp_or_concurrency_claims():
+    import vlmbench.infrastructure.real_engine as re_mod
+    doc = re_mod.__doc__
+    assert "488" not in doc, "hard-coded tensor counts must be dropped or derived"
+    assert "15,220" not in doc and "852,985,920" not in doc and "20,452,864" not in doc
+    assert "bit-exact" not in doc.lower(), "rollback is only in _speculative_mtp_greedy_k1"
+    assert "zero state pollution" not in doc.lower()
+    assert "_speculative_mtp_greedy_k1" in doc, "docstring must say where verification lives"
+
+
+# --- R4-3 (lead round 4, auditor MEDIUM): DA gate must rest on measured masked weights ---
+
+def test_r4_da_gate_requires_measured_zero_masked_weights():
+    from vlmbench.infrastructure.real_engine import _da_masking_gate
+    assert _da_masking_gate("base", 0.5, 10, 0.0) == "NOT_APPLICABLE"
+    assert _da_masking_gate("da_base", 0.0, 0, None) == "NOT_EXERCISED_NO_RESTRICTED_READS"
+    assert _da_masking_gate("da_base", None, None, None) == "NOT_MEASURED_NO_HOOKED_DECODE_STEP"
+    assert _da_masking_gate("da_base", 0.4, None, None) == "NOT_MEASURED_NO_HOOKED_DECODE_STEP"
+    assert _da_masking_gate("da_base", 0.4, 0, None) == "NOT_MEASURED_NO_HOOKED_DECODE_STEP"
+    assert _da_masking_gate("da_base", 0.4, 7, 1e-9) == "FAIL_MASKED_KEY_RECEIVED_ATTENTION"
+    assert _da_masking_gate("da_base", 0.4, 7, 0.0) == "PASS"
+
+
+def test_r4_da_scaffold_path_never_passes_the_gate():
+    """The scaffold forward has no hook, so no masked weight is measured and the gate cannot pass."""
+    cfg = _p7_small_cfg()
+    engine = RealSevenArmEngine(method_arm="da_base", config=cfg, device="cpu")
+    try:
+        prompt = [cfg.vision_start_token_id] + [cfg.image_token_id] * 8 + [cfg.vision_end_token_id] + list(range(10, 40))
+        res = engine.execute_request("r4_da_scaffold", prompt_token_ids=prompt,
+                                     max_new_tokens=4, image_present=False)
+    finally:
+        engine.close()
+    assert res.attention_mask_restriction_ratio is not None and res.attention_mask_restriction_ratio > 0.0
+    assert res.gates["DA_MASKING_EXERCISED"] != "PASS"
+    assert res.gates["DA_MASKING_EXERCISED"] == "NOT_MEASURED_NO_HOOKED_DECODE_STEP"
+    assert res.telemetry["da_cost_accounting"]["measured_masked_entry_count"] is None
+
+
+def test_r4_max_new_tokens_one_reports_none_not_literal_zero():
+    cfg = _p7_small_cfg()
+    eng_da = RealSevenArmEngine(method_arm="da_base", config=cfg, device="cpu")
+    try:
+        res_da = eng_da.execute_request("r4_one_da", prompt_token_ids=list(range(10, 30)),
+                                        max_new_tokens=1, image_present=True)
+    finally:
+        eng_da.close()
+    assert res_da.attention_read_restriction_ratio is None
+    assert res_da.attention_mask_restriction_ratio is None
+    da = res_da.telemetry["da_cost_accounting"]
+    assert da["attention_mask_restriction_ratio"] is None
+    assert da["decode_last_query_allowed_key_ratio"] is None
+    assert da["full_causal_mask_area_restriction_ratio"] is None
+    assert da["nontrivial_masking_exercised"] is None
+    assert res_da.gates["DA_MASKING_EXERCISED"].startswith("NOT_MEASURED")
+
+    eng_h2o = RealSevenArmEngine(method_arm="h2o_base", config=cfg, device="cpu")
+    try:
+        res_h = eng_h2o.execute_request("r4_one_h2o", prompt_token_ids=list(range(10, 50)),
+                                        max_new_tokens=1, image_present=False)
+    finally:
+        eng_h2o.close()
+    assert res_h.per_step_evicted_slot_rate is None
+    acc = res_h.telemetry["h2o_logical_selection_accounting"]
+    assert acc["per_step_evicted_slot_rate"] is None
+    assert acc["cumulative_evicted_slots"] is None
+    assert acc["final_retained_fraction"] is None
+
+
+# --- R4-4 (lead round 4, auditor LOW): the forward path must be named as it actually ran ---
+
+def test_r4_forward_path_telemetry_names_the_path_that_ran(monkeypatch):
+    """A config.json checkpoint attaches the official HF model even when coverage is partial, and
+    the forward runs that model. The telemetry must say so, and the gate must not claim PASS."""
+    from pathlib import Path
+    from vlmbench.infrastructure import real_engine as re_mod
+
+    ckpt = Path("/mnt/ssd/genos2/research_workspace/models/Qwen/Qwen3.5-0.8B")
+    if not (ckpt / "config.json").is_file():
+        pytest.skip(f"Official Qwen3.5-0.8B checkpoint not present at {ckpt}")
+
+    real_loader = re_mod._load_official_hf_bundle
+
+    def degraded_loader(ckpt_path, device):
+        bundle = real_loader(ckpt_path, device=device)
+        degraded = dict(bundle)  # copy: do not mutate the cached bundle shared by other tests
+        degraded["summary"] = {**bundle["summary"], "tensor_coverage_ratio": 0.5}
+        return degraded
+
+    monkeypatch.setattr(re_mod, "_load_official_hf_bundle", degraded_loader)
+    engine = RealSevenArmEngine(method_arm="base", device="cpu", checkpoint_dir=ckpt)
+    try:
+        assert engine.is_official_hf_hooked is False
+        assert engine.model.hf_model is not None
+        res = engine.execute_request("r4_partial_path", prompt_token_ids=[10, 11, 12],
+                                     max_new_tokens=2, image_present=False)
+    finally:
+        engine.close()
+    assert res.telemetry["forward_path_executed"] == "official_hf_partial_coverage_UNQUALIFIED"
+    assert res.gates["REAL_MODEL_FORWARD_PASS"] == "PARTIAL_COVERAGE_NOT_QUALIFIED"
+
+
+def test_r4_forward_path_telemetry_on_scaffold_reference():
+    engine = RealSevenArmEngine(method_arm="base", config=_p7_small_cfg(), device="cpu")
+    try:
+        res = engine.execute_request("r4_scaffold_path", prompt_token_ids=[10, 11, 12],
+                                     max_new_tokens=2, image_present=False)
+    finally:
+        engine.close()
+    assert res.telemetry["forward_path_executed"] == "scaffold_reference"
