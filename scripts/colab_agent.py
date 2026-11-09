@@ -70,9 +70,8 @@ def verify_session(name: str) -> str:
 
 
 def verify_drive(path: str) -> str:
-    if (not path.startswith("/content/drive/MyDrive/")
-            or ".." in Path(path).parts or path.endswith("/")):
-        raise ValueError("Drive root must be a persistent MyDrive subdirectory")
+    if (path != "/content/drive/MyDrive" and not path.startswith("/content/drive/MyDrive/")) or ".." in Path(path).parts or path.endswith("/"):
+        raise ValueError("Drive root must be /content/drive/MyDrive or a persistent MyDrive subdirectory")
     return path
 
 
