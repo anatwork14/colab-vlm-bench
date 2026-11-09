@@ -90,19 +90,31 @@ def require_cpu_for_hf_intake() -> None:
     """Block expensive downloads/rendering if an accelerator is attached."""
     import shutil
     import subprocess
-    if not shutil.which("nvidia-smi"):
-        raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: nvidia-smi unavailable")
+    from pathlib import Path
+    if shutil.which("nvidia-smi"):
+        try:
+            probe = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: GPU probe failed") from exc
+        if probe.returncode != 0:
+            raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: GPU probe failed")
+        if probe.stdout.strip():
+            raise RuntimeError("GPU_SESSION_REFUSED_FOR_PREPARE: download and render on CPU Colab")
+        return
+
+    # When nvidia-smi binary is not installed (e.g. standard CPU container):
+    # Verify no NVIDIA driver, character devices, or CUDA runtime are present.
+    if Path("/proc/driver/nvidia").exists() or Path("/dev/nvhost-ctrl").exists():
+        raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: NVIDIA driver present but nvidia-smi missing")
     try:
-        probe = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=10, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: GPU probe failed") from exc
-    if probe.returncode != 0:
-        raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: GPU probe failed")
-    if probe.stdout.strip():
-        raise RuntimeError("GPU_SESSION_REFUSED_FOR_PREPARE: download and render on CPU Colab")
+        import torch
+        if torch.cuda.is_available():
+            raise RuntimeError("GPU_SESSION_REFUSED_FOR_PREPARE: download and render on CPU Colab")
+    except ImportError:
+        pass
 
 
 def prepare(job: dict) -> dict:
