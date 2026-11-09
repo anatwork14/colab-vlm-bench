@@ -61,7 +61,8 @@ def test_fixed_serving_and_natural_eos_quality_have_distinct_payloads():
 @pytest.mark.parametrize("count,status", [(256, "PASS_MEASURED"),
                                           (255, "PARTIAL_FAILURE"),
                                           (None, "PARTIAL_FAILURE")])
-def test_serving_pass_checks_actual_usage_and_records_contract(tmp_path, monkeypatch, count, status):
+@pytest.mark.parametrize("dataset", ["memlens", "amber"])
+def test_serving_pass_checks_actual_usage_and_records_contract(tmp_path, monkeypatch, count, status, dataset):
     import asyncio
     import json
 
@@ -69,7 +70,10 @@ def test_serving_pass_checks_actual_usage_and_records_contract(tmp_path, monkeyp
 
     from vlmbench import bench
 
-    row = {"id": "one", "messages": [{"role": "user", "content": "Question"}]}
+    row = {"id": "one", "track": "amber_serving" if dataset == "amber" else "derived_serving",
+           "model_token_counts": {"qwen35_08b": {"verified_by": "vllm_effective_token_accounting",
+                                                  "effective_total_tokens": 512}},
+           "messages": [{"role": "user", "content": "Question"}]}
     monkeypatch.setattr(bench, "exact_bin_pool", lambda *a, **kw: [row])
     monkeypatch.setattr(bench, "sample_unique", lambda *a: [row])
     class Sampler:
@@ -97,8 +101,8 @@ def test_serving_pass_checks_actual_usage_and_records_contract(tmp_path, monkeyp
     cfg = {"performance": {"max_bin_relative_error": .05, "request_timeout_s": 1,
                            "cell_timeout_s": 1, "output_tokens": 256},
            "serving": {"max_model_len": 32768, "port": 8000}}
-    cell = {"model": "qwen35_08b", "dataset": "memlens", "mode": "base",
-            "input_length": 128, "output_tokens": 256, "concurrency": 1,
+    cell = {"model": "qwen35_08b", "dataset": dataset, "mode": "base",
+            "input_length": None if dataset == "amber" else 128, "output_tokens": 256, "concurrency": 1,
             "requests": 1, "warmup": 0, "seed": 42, "repetition": 0}
     result = asyncio.run(bench.run_performance_cell(
         cfg, cell, [row], tmp_path / "local", tmp_path / "drive", "qwen35_08b", "sha"))

@@ -182,7 +182,7 @@ def test_remote_actions_never_infer_gpu_approval_or_extra_models(tmp_path, monke
 def test_pipeline_prepare_resumes_same_manifest_without_extra_hf_download(tmp_path, monkeypatch):
     # This test exercises manifest reuse on a CPU session, independent of the
     # developer host's physical accelerators. The GPU refusal has its own test.
-    monkeypatch.setattr("shutil.which", lambda cmd: None)
+    monkeypatch.setattr(agent_pipeline, "require_cpu_for_hf_intake", lambda: None)
     p = {
         "root": tmp_path, "model_root": tmp_path / "model",
         "dataset_root": tmp_path / "dataset",

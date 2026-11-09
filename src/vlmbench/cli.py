@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .artifacts import atomic_json, sha256, staged_copy, sync_files
 from .config import cell_id, fingerprint, load_config, plan_summary, planned_cells, selected_scope
+from .execution_safety import require_compute_approval
 from .datasets import normalize_memlens, normalize_mmlong
 from .engine import a100_inventory, server_argv, start_server, stop_server, wait_ready
 from .quality import import_official, score_proxy
@@ -23,7 +24,7 @@ from .methods import manifest_from_path, plan as methods_plan, native_mode_or_bl
 from .hallucination import read_annotations, score_evidence_annotations
 
 from .derivation import generate_candidates, annotate_with_backend
-from .preflight import (PreflightError, assess_resources, checkpoint_inventory,
+from .preflight import (assess_resources, checkpoint_inventory,
                         host_resources, serving_readiness)
 
 
@@ -41,6 +42,7 @@ def _persist_error(root: Path, drive_root: Path, tag: str, message: str) -> None
 
 
 def run_job(args) -> int:
+    require_compute_approval(getattr(args, "owner_approved_compute", None))
     cfg = load_config(args.config, execution=True)
     model = next((m for m in cfg["models"] if m["id"] == args.model), None)
     ds = next((d for d in cfg["datasets"] if d["id"] == args.dataset), None)
@@ -247,7 +249,8 @@ def run_job(args) -> int:
             "expected_method": args.mode,
             "mtp_method_qualification": "NEEDS_BACKEND_TRACE_REVIEW" if args.mode == "mtp" else "NA",
         })
-        rows = (load_jsonl(derived_path, dataset=ds["id"], track="derived_serving")
+        rows = (load_jsonl(derived_path, dataset=ds["id"],
+                          track="amber_serving" if ds["id"] == "amber" else "derived_serving")
                 if not args.quality else [])
         cells = [x for x in planned_cells(cfg)
                  if x["model"] == args.model and x["dataset"] == args.dataset and x["mode"] == args.mode]
@@ -336,11 +339,12 @@ def main(argv=None):
     annotation = sub.add_parser("annotate-serving")
     annotation.add_argument("--input", required=True, type=Path)
     annotation.add_argument("--output", required=True, type=Path)
-    annotation.add_argument("--dataset", required=True, choices=["memlens", "mmlongbench_doc"])
+    annotation.add_argument("--dataset", required=True, choices=["memlens", "mmlongbench_doc", "amber"])
     annotation.add_argument("--model-id", required=True)
     annotation.add_argument("--checkpoint", required=True)
     annotation.add_argument("--base-url", default="http://127.0.0.1:8000")
     annotation.add_argument("--limit", type=int, default=0)
+    annotation.add_argument("--approve-paid", dest="owner_approved_compute", action="store_true")
 
     methods = sub.add_parser("methods-plan", help="Plan all seven method arms (CPU only, no inference)")
     methods.add_argument("--config", required=True, type=Path)
@@ -362,9 +366,10 @@ def main(argv=None):
     job.add_argument("--config", required=True, type=Path)
     job.add_argument("--model", required=True)
     job.add_argument("--mode", choices=["base", "mtp"], required=True)
-    job.add_argument("--dataset", choices=["memlens", "mmlongbench_doc"], required=True)
+    job.add_argument("--dataset", choices=["memlens", "mmlongbench_doc", "amber"], required=True)
     job.add_argument("--max-cells", type=int, default=0)
     job.add_argument("--quality", action="store_true")
+    job.add_argument("--approve-paid", dest="owner_approved_compute", action="store_true")
 
     report = sub.add_parser("report")
     report.add_argument("--config", required=True, type=Path)
@@ -398,7 +403,7 @@ def main(argv=None):
             raise ValueError("Unknown method in seven-arm manifest")
         try:
             mode = native_mode_or_block(args.method)
-        except MethodUnqualified as exc:
+        except MethodUnqualified:
             receipt = blocked_method_receipt(args.method, args.model, args.dataset)
             if args.blocked_out is not None:
                 atomic_json(args.blocked_out, receipt)
@@ -434,10 +439,11 @@ def main(argv=None):
                                              args.dataset, args.max_images), indent=2))
         return 0
     if args.command == "annotate-serving":
+        require_compute_approval(args.owner_approved_compute)
         print(json.dumps(annotate_with_backend(args.input, args.output,
                                              args.dataset, args.model_id,
                                              args.checkpoint, args.base_url,
-                                             args.limit), indent=2))
+                                             args.limit, owner_approved_compute=True), indent=2))
         return 0
     if args.command == "run-job":
         return run_job(args)

@@ -8,10 +8,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import stat
 import sys
-import traceback
 import zipfile
 from pathlib import Path
 
@@ -33,6 +33,9 @@ def _extract_source(job: dict) -> None:
     if not ARCHIVE.is_file() or not JOB_FILE.is_file():
         raise FileNotFoundError("Agent source archive/job file not uploaded")
     expected = job["bundle_sha256"]
+    if (not re.fullmatch(r"[0-9a-f]{40}", str(job.get("repo_sha", "")))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(expected))):
+        raise ValueError("Invalid source provenance digest")
     if hashlib.sha256(ARCHIVE.read_bytes()).hexdigest() != expected:
         raise ValueError("Source ZIP digest does not match host job")
     checkout = CHECKOUT / str(job["repo_sha"])
@@ -63,11 +66,11 @@ def _summary_bundle(result: dict) -> None:
 def main() -> int:
     job = json.loads(JOB_FILE.read_text(encoding="utf8"))
     try:
+        if job["action"] in ("annotate", "benchmark") and job.get(
+                "owner_approved_compute", False) is not True:
+            raise PermissionError("Remote GPU job lacks owner-approved compute flag")
         checkout = _extract_source(job)
         os.environ["VLMBENCH_SOURCE_SHA"] = job["repo_sha"]
-        if job["action"] in ("annotate", "benchmark") and not job.get(
-                "owner_approved_compute", False):
-            raise PermissionError("Remote GPU job lacks owner-approved compute flag")
         env = dict(os.environ)
         env["PYTHONPATH"] = str(checkout / "src") + os.pathsep + env.get("PYTHONPATH", "")
         INNER.unlink(missing_ok=True)
@@ -84,6 +87,7 @@ def main() -> int:
         result = {
             "status": "ACTION_COMPLETED", "action": job["action"],
             "repo_sha": job["repo_sha"], "outcome": info,
+            "bundle_sha256": job["bundle_sha256"], "invocation_id": job["invocation_id"],
         }
         # Include small runbook directly when action is report.
         if job["action"] == "report":
@@ -97,6 +101,7 @@ def main() -> int:
         failure = {
             "status": "ACTION_FAILED", "action": job.get("action"),
             "repo_sha": job.get("repo_sha"),
+            "bundle_sha256": job.get("bundle_sha256"), "invocation_id": job.get("invocation_id"),
             "error_type": type(exc).__name__, "error": str(exc)[:1000],
         }
         _atomic_result(failure)

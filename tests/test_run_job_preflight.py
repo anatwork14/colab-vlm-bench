@@ -37,7 +37,7 @@ def _prepare(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "start_server", forbidden)
     args = SimpleNamespace(
         config=CONFIG, model="qwen35_08b", mode="base",
-        dataset="memlens", quality=False, max_cells=6,
+        dataset="memlens", quality=False, max_cells=6, owner_approved_compute=True,
     )
     return cfg, args
 

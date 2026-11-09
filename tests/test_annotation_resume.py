@@ -52,19 +52,19 @@ def test_annotation_bounded_gpu_call_budget_and_resumes(tmp_path, monkeypatch):
     output = tmp_path / "annotated.jsonl"
 
     first = annotate_with_backend(input_file, output, "memlens", "qwen35_08b",
-                                  "/tmp/fake_model", "http://127.0.0.1:8000", limit=2)
+                                  "/tmp/fake_model", "http://127.0.0.1:8000", limit=2, owner_approved_compute=True)
     assert first["http_requests_this_invocation"] == 2
     assert first["verified_total"] == 2
     assert first["status"] == "PARTIAL_ANNOTATED"
     second = annotate_with_backend(input_file, output, "memlens", "qwen35_08b",
-                                   "/tmp/fake_model", "http://127.0.0.1:8000", limit=5)
+                                   "/tmp/fake_model", "http://127.0.0.1:8000", limit=5, owner_approved_compute=True)
     assert second["http_requests_this_invocation"] == 5
     assert second["verified_before"] == 2
     assert second["verified_total"] == 7
     assert second["status"] == "ANNOTATED"
     assert len(sent) == 7
     again = annotate_with_backend(input_file, output, "memlens", "qwen35_08b",
-                                  "/tmp/fake_model", "http://127.0.0.1:8000", limit=2)
+                                  "/tmp/fake_model", "http://127.0.0.1:8000", limit=2, owner_approved_compute=True)
     assert again["http_requests_this_invocation"] == 0
     assert len(sent) == 7
     assert json.loads((tmp_path / "annotated.jsonl.state.json").read_text())["status"] == "ANNOTATED"

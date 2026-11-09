@@ -13,6 +13,9 @@ def main():
     jobp=Path("/content/vlmbench_job.json")
     for p in (archive,camp,jobp):
         if not p.is_file(): raise FileNotFoundError(p)
+    job=json.loads(jobp.read_text(encoding="utf8"))
+    if job.get("owner_approved_compute") is not True:
+        raise PermissionError("GPU execution requires owner_approved_compute=True")
     checkout=Path("/content/vlmbench_source")
     checkout.mkdir(parents=True,exist_ok=True)
     with zipfile.ZipFile(archive) as z:
@@ -20,7 +23,6 @@ def main():
             p=Path(info.filename)
             if p.is_absolute() or ".." in p.parts: raise ValueError("Unsafe source archive")
         z.extractall(checkout)
-    job=json.loads(jobp.read_text(encoding="utf8"))
     cfg=json.loads(camp.read_text(encoding="utf8"))
     if cfg.get("dry_run",True) or job["campaign_id"]!=cfg["campaign_id"]:
         raise RuntimeError("GPU job refused: config mismatch or dry run")
@@ -30,7 +32,7 @@ def main():
     os.environ["VLMBENCH_SOURCE_SHA"]=job["source_sha"]
     cmd=[sys.executable,"-m","vlmbench.cli","run-job","--config",str(camp),
          "--model",job["model"],"--mode",job["mode"],
-         "--dataset",job["dataset"],"--max-cells",str(job["max_cells"])]
+         "--dataset",job["dataset"],"--max-cells",str(job["max_cells"]),"--approve-paid"]
     if job["quality"]: cmd.append("--quality")
     try:
         subprocess.run(cmd,check=True)

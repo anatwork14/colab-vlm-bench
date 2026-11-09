@@ -2,6 +2,7 @@
 # Authenticated local Linux/macOS controller. Never allocates/stops billable sessions.
 set -euo pipefail
 SESSION=""; CONFIG=""; MODEL=""; MODE=""; DATASET=""; MAX_CELLS=0; QUALITY=0; PUBLISH=0
+APPROVE_PAID=0
 while (($#)); do
   case "$1" in
     --session) SESSION="$2"; shift 2;;
@@ -12,9 +13,11 @@ while (($#)); do
     --max-cells) MAX_CELLS="$2"; shift 2;;
     --quality) QUALITY=1; shift;;
     --publish) PUBLISH=1; shift;;
+    --approve-paid) APPROVE_PAID=1; shift;;
     *) echo "Unrecognized option: $1" >&2; exit 2;;
   esac
 done
+(( APPROVE_PAID )) || { echo "GPU execution requires --approve-paid" >&2; exit 2; }
 [[ -n "$SESSION" && -f "$CONFIG" && -n "$MODEL" && -n "$MODE" && -n "$DATASET" ]] || {
   echo "Usage: bash scripts/colab_controller.sh --session NAME --config LOCAL.json --model MODEL_ID --mode base|mtp --dataset memlens|mmlongbench_doc [--max-cells N] [--quality] [--publish]" >&2; exit 2;
 }
@@ -36,7 +39,7 @@ assert sys.argv[4] in [x["id"] for x in cfg["datasets"]]
 assert int(sys.argv[5]) >= 0
 print(json.dumps({"campaign_id":cfg["campaign_id"],"model":sys.argv[2],
     "mode":sys.argv[3],"dataset":sys.argv[4],"max_cells":int(sys.argv[5]),
-    "quality":sys.argv[6]=="1",
+    "quality":sys.argv[6]=="1", "owner_approved_compute": True,
     "source_sha":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip()}))
 PY
 colab status -s "$SESSION"

@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -127,6 +128,7 @@ def remote_job(args: argparse.Namespace) -> None:
         archive = directory / "source.zip"
         bundle_sha = make_bundle(archive)
         job = {
+            "invocation_id": uuid.uuid4().hex,
             "schema_version": 1,
             "action": args.action, "session": session, "drive_root": drive,
             "model": args.model, "dataset": args.dataset, "phase": args.phase,
@@ -135,6 +137,7 @@ def remote_job(args: argparse.Namespace) -> None:
             "mode": args.mode, "quality": args.quality,
             "model_revision": args.model_revision,
             "dataset_revision": args.dataset_revision,
+            "source_mode": args.source_mode, "source_map": args.source_map,
             "repo_sha": sha, "bundle_sha256": bundle_sha,
             "owner_approved_compute": bool(args.approve_paid),
         }
@@ -149,7 +152,7 @@ def remote_job(args: argparse.Namespace) -> None:
             command(["colab", "exec", "-s", session, "-f",
                      "scripts/colab_agent_remote.py"], dry_run=args.dry_run)
         finally:
-            target = REPO / "agent_artifacts" / session
+            target = REPO / "agent_artifacts" / session / job["invocation_id"]
             if not args.dry_run:
                 target.mkdir(parents=True, exist_ok=True)
                 # Download status EVEN when remote execution failed; no raw data.
@@ -162,6 +165,16 @@ def remote_job(args: argparse.Namespace) -> None:
                                  str(target / name)])
                     except subprocess.CalledProcessError:
                         print(f"Remote artifact unavailable: {remote}", file=sys.stderr)
+        if not args.dry_run:
+            try:
+                result = json.loads((target / "last_result.json").read_text(encoding="utf8"))
+            except (OSError, ValueError):
+                raise RuntimeError("Missing or invalid remote result; inspect invocation artifacts") from None
+            if not isinstance(result, dict) or result.get("status") != "ACTION_COMPLETED":
+                raise RuntimeError("Remote action failed; inspect invocation artifacts")
+            for key in ("invocation_id", "action", "repo_sha", "bundle_sha256"):
+                if result.get(key) != job[key]:
+                    raise RuntimeError(f"Remote result provenance mismatch: {key}")
 
 
 def main(argv=None) -> int:
@@ -193,13 +206,15 @@ def main(argv=None) -> int:
         sp.add_argument("--drive-root", default=DRIVE_DEFAULT)
         sp.add_argument("--model", choices=["qwen35_08b", "qwen35_4b"],
                         default="qwen35_08b")
-        sp.add_argument("--dataset", choices=["memlens", "mmlongbench_doc"],
+        sp.add_argument("--dataset", choices=["memlens", "mmlongbench_doc", "amber"],
                         default="memlens")
         sp.add_argument("--phase", choices=["pilot", "full"], default="pilot")
         sp.add_argument("--qa-limit", type=int, default=0)
         sp.add_argument("--max-per-bin", type=int, default=192)
         sp.add_argument("--model-revision")
         sp.add_argument("--dataset-revision")
+        sp.add_argument("--source-mode", choices=["historical", "hf"], default="historical")
+        sp.add_argument("--source-map", help="Reviewed Drive JSON with pinned source SHA256 inventory")
         sp.add_argument("--max-requests", type=int, default=8)
         sp.add_argument("--max-cells", type=int, default=1)
         sp.add_argument("--mode", choices=["base", "mtp"], default="base")
