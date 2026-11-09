@@ -1,3 +1,5 @@
+> **SUPERSEDED FOR MTP/DA RESEARCH CLAIMS (2026-11-09).** The original acceptance percentages and 18.95% mask target in this historical report cannot be used as Qwen MTP or original DA observations. See [source-aligned MTP/DA audit](../docs/MTP_DA_UPSTREAM_CONTRACT_AUDIT.md) for the corrected fail-closed scope. This report remains a historical receipt, NOT a current speculative-serving qualification.
+
 # STARLIGHT Benchmark System Readiness Report — Seven-Arm Official Hooked Neural Engine
 
 **Date:** 2026-11-09
