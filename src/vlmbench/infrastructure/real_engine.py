@@ -1339,6 +1339,7 @@ class RealSevenArmEngine:
         prompt_ids: Sequence[int],
         max_new_tokens: int,
         draft_override: Any = None,
+        t0: float | None = None,
     ) -> dict[str, Any]:
         """CPU greedy k=1 speculative decoding with the official MTP head (reference, NOT vLLM MTP).
 
@@ -1385,16 +1386,27 @@ class RealSevenArmEngine:
                 logits_to_keep=keep,
             )
 
+        stops: set[int] = set(self.eos_token_ids) if self.stop_at_eos else set()
+        t_start = time.perf_counter() if t0 is None else t0
+        first_commit_ms: float | None = None
+        verifier_calls = 0
         with torch.no_grad():
             out = _feed(ids, 0, 1)
+            verifier_calls += 1  # prefill is a target forward
             cache_len = len(ids)  # tokens currently in the cache; `pending` is not yet fed
             pending = int(torch.argmax(out["logits"][0]).item())
             draft = int(torch.argmax(out["mtp_logits"][0, 0]).item())
 
             emitted: list[int] = []
             proposed = accepted = rejected = 0
-            while len(emitted) < max_new_tokens:
+            stop_reason = "max_new_tokens"
+            while True:
+                if pending in stops:
+                    stop_reason = "eos"  # EOS is never emitted into the output
+                    break
                 emitted.append(pending)
+                if first_commit_ms is None:
+                    first_commit_ms = (time.perf_counter() - t_start) * 1000.0
                 if len(emitted) >= max_new_tokens:
                     break
                 proposal = draft
@@ -1405,11 +1417,16 @@ class RealSevenArmEngine:
                 proposed += 1
                 snap = _snapshot_dynamic_cache(cache)
                 v = _feed([pending, proposal], cache_len, 2)
+                verifier_calls += 1
                 target_after_pending = int(torch.argmax(v["full_logits"][0, 0]).item())
                 if proposal == target_after_pending:
                     accepted += 1
-                    emitted.append(proposal)
                     cache_len += 2
+                    if proposal in stops:
+                        # The verifier agreed the next target token is EOS: stop, do not emit it.
+                        stop_reason = "eos"
+                        break
+                    emitted.append(proposal)
                     if len(emitted) >= max_new_tokens:
                         break
                     pending = int(torch.argmax(v["logits"][0]).item())
@@ -1418,19 +1435,114 @@ class RealSevenArmEngine:
                     rejected += 1
                     _restore_dynamic_cache(cache, snap)
                     v1 = _feed([pending], cache_len, 1)
+                    verifier_calls += 1
                     cache_len += 1
                     pending = int(torch.argmax(v1["logits"][0]).item())
                     draft = int(torch.argmax(v1["mtp_logits"][0, 0]).item())
 
+        kv_bytes = 0
+        for layer in cache.layers:
+            keys = getattr(layer, "keys", None)
+            if keys is not None:
+                kv_bytes += int(keys.numel() * keys.element_size()) + int(
+                    layer.values.numel() * layer.values.element_size())
         return {
             "label": self.CPU_GREEDY_K1_LABEL,
             "tokens": emitted[:max_new_tokens],
+            "committed": len(emitted[:max_new_tokens]),
             "proposed": proposed,
             "accepted": accepted,
             "rejected": rejected,
+            "verifier_calls": verifier_calls,
+            "stop_reason": stop_reason,
             "acceptance_rate": (accepted / proposed) if proposed else None,
+            "first_commit_ms": first_commit_ms,
+            "kv_bytes_allocated": kv_bytes,
             "speed_claim": None,
         }
+
+    MTP_TEXT_SPECULATION_GATE = "CPU_REFERENCE_SPECULATION_EXECUTED_NOT_VLLM"
+
+    def _mtp_text_speculation_route(self, image_present: bool) -> bool:
+        """True when the mtp arm must run verifier-backed speculation (official, text-only)."""
+        return (
+            self.method_arm == "mtp"
+            and self.is_official_hf_hooked
+            and not image_present
+            and getattr(self.model, "mtp_module", None) is not None
+        )
+
+    def _execute_mtp_speculative_text(
+        self,
+        *,
+        request_id: str,
+        full_prompt: list[int],
+        max_new_tokens: int,
+        t0: float,
+        arch_status: str,
+        gates: dict[str, str],
+    ) -> "RealExecutionResult":
+        """Serving-style mtp arm: committed tokens come from the verifier (CPU reference, not vLLM)."""
+        spec = self._speculative_mtp_greedy_k1(full_prompt, max_new_tokens, t0=t0)
+        tokens = list(spec["tokens"])
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        ttft_ms = spec["first_commit_ms"] if spec["first_commit_ms"] is not None else total_ms
+        tpot_ms = (total_ms - ttft_ms) / (len(tokens) - 1) if len(tokens) > 1 else total_ms
+        output_str = ""
+        if self.tokenizer is not None and hasattr(self.tokenizer, "decode"):
+            try:
+                output_str = str(self.tokenizer.decode(tokens, skip_special_tokens=True)).strip()
+            except Exception:
+                output_str = ""
+        if not output_str:
+            output_str = f"Decoded {len(tokens)} committed tokens via mtp"
+        gates = dict(gates)
+        gates["MTP_CORRECTNESS_PASS"] = self.MTP_TEXT_SPECULATION_GATE
+        gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] = "PASS" if spec["proposed"] > 0 else "INSUFFICIENT_TOKENS"
+        speculation = {
+            "label": spec["label"],
+            "method_variant": "text_only_official_mtp_k1_verifier",
+            "proposed": spec["proposed"],
+            "accepted": spec["accepted"],
+            "rejected": spec["rejected"],
+            "verifier_calls": spec["verifier_calls"],
+            "committed": spec["committed"],
+            "stop_reason": spec["stop_reason"],
+            "acceptance_rate": spec["acceptance_rate"],
+            "speed_claim": None,
+        }
+        return RealExecutionResult(
+            method_arm=self.method_arm,
+            tokens_generated=tokens,
+            output_text=output_str,
+            total_latency_ms=total_ms,
+            ttft_ms=ttft_ms,
+            tpot_ms=tpot_ms,
+            physical_kv_bytes_allocated=spec["kv_bytes_allocated"],
+            physical_kv_bytes_freed=0,  # no eviction policy on this arm
+            per_step_evicted_slot_rate=None,
+            attention_read_restriction_ratio=None,
+            attention_mask_restriction_ratio=None,
+            grounded_citations=[],
+            mtp_acceptance_rate=spec["acceptance_rate"],
+            gates=gates,
+            telemetry={
+                "request_id": request_id,
+                "model_id": self.config.model_id,
+                "device": self.device,
+                "architectural_status": arch_status,
+                "is_official_hf_hooked": self.is_official_hf_hooked,
+                "measurement_label": "cpu_pytorch_reference_not_vllm",
+                "speculation_executed": True,
+                "arm_label": "mtp_cpu_speculative_reference_text_only_not_vllm",
+                "speculation": speculation,
+                "generation": {
+                    "stop_at_eos": self.stop_at_eos,
+                    "eos_token_ids": list(self.eos_token_ids),
+                    "stop_reason": spec["stop_reason"],
+                },
+            },
+        )
 
     def _starlight_build_step_plans(
         self,
@@ -1621,6 +1733,14 @@ class RealSevenArmEngine:
             "VLLM_SCHEDULER_CONCURRENCY_PASS": "GATED_NATIVE_VLLM_LOAD_TEST_REQUIRED",
             "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH",
         }
+
+        # ITER2 Stage 2(a): the serving-style mtp arm runs verifier-backed CPU speculation on
+        # text-only requests of the official checkpoint. Image requests keep the scaffold path.
+        if self._mtp_text_speculation_route(image_present):
+            return self._execute_mtp_speculative_text(
+                request_id=request_id, full_prompt=full_prompt, max_new_tokens=max_new_tokens,
+                t0=t0, arch_status=arch_status, gates=gates,
+            )
 
         starlight_active = self.starlight_signals is not None
         tracker = (

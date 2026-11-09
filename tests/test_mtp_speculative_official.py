@@ -143,9 +143,13 @@ def test_r3_multi_call_isolation_matches_fresh_greedy(engine, prompt):
     assert spec2["proposed"] > 0
 
 
-def test_r3_execute_request_mtp_arm_reports_no_verified_acceptance(engine, prompt):
-    """The serving-style mtp arm does not run a verifier, so acceptance must be None, not 0.0."""
+def test_r3_execute_request_mtp_arm_reports_verifier_derived_acceptance(engine, prompt):
+    """ITER2 Stage 2(a) (disclosed change): the mtp arm on text-only official requests now runs the
+    verifier, so acceptance is derived from verifier counts (accepted / proposed), never a literal.
+    Gate is the CPU-reference label, not a serving PASS."""
     res = engine.execute_request("r3_mtp_arm", prompt_token_ids=prompt,
                                  max_new_tokens=4, image_present=False)
-    assert res.mtp_acceptance_rate is None
-    assert res.gates["MTP_CORRECTNESS_PASS"] == "GATED_NATIVE_MTP_VERIFIER_REQUIRED"
+    spec = res.telemetry["speculation"]
+    expected = spec["accepted"] / spec["proposed"] if spec["proposed"] else None
+    assert res.mtp_acceptance_rate == expected
+    assert res.gates["MTP_CORRECTNESS_PASS"] == "CPU_REFERENCE_SPECULATION_EXECUTED_NOT_VLLM"
