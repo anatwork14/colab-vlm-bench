@@ -219,8 +219,9 @@ def test_inferc_speculative_route_reports_its_starlight_policy_and_budget(star_e
 # ITER3 R2 (lead ruling F-1): the shared retained set makes the per-layer lengths identical, so this
 # must now COMPLETE. It was a strict xfail in ITER3 B2 (the defect); the xfail is removed.
 def test_F1_protected_veto_that_differs_across_layers_completes(star_engine, prompt, monkeypatch):
-    # A DA focus span over prompt position 16. Position 16 is evicted by H2O on layer 3 only (measured),
-    # so protection vetoes that candidate on one layer and not on the others.
+    # A DA focus span over prompt position 16. ITER3 R2: under the SHARED retained set, position 16 is a
+    # candidate on every full-attention layer (measured), so the veto is applied identically on all of them.
+    # The earlier per-layer defect (veto on layer 3 only) can no longer occur; this test checks completion.
     real_new_state = star_engine._pol_new_state
 
     def with_focus_span_on_16(kind, prompt_len):

@@ -36,10 +36,20 @@ Tests: `tests/test_starlight_policy.py` (14), `tests/test_starlight_signals.py` 
 
 - Total budget per full-attention layer: `B = max(min_budget, int(prefill_len * budget_ratio))`,
   fixed from the prefill length, as H2O fixes its budget.
-- Protection is computed per layer for the current physical cache, including the new token.
+- Protection is computed per layer for the current physical cache, including the new token. Protected
+  original positions are layer-independent, so the protected slots agree across full-attention layers.
 - If `length <= B`, there are no candidates and nothing is evicted. This is the no-eviction case.
 - Otherwise, the H2O keep set is computed at `B_eff = B - |protected|` over ALL entries with no
-  H2O-internal protection (`keep_mask_without_protection`). Candidates are its complement.
+  H2O-internal protection. Candidates are its complement.
+- **ITER3 R2 — LABELLED DEVIATION FROM PER-LAYER H2O (lead ruling F-1).** The keep set is ONE set shared by
+  all full-attention layers: `H2OCacheTracker.keep_mask_shared` ranks positions by the MEAN over full-attention
+  layers of each layer's head-mean score. It is not per-layer H2O (`h2o_base`, `h2o_mtp` keep per-layer
+  selection and are unchanged). Reason: with per-layer candidates, one layer could veto an entry another layer
+  evicted, giving different retained lengths per layer and a crash (BACKEND_INTERFACE.md, F-1). With one shared
+  retained set, the mask and KV lengths cannot desynchronise. The engine raises if full-attention lengths or
+  protected slots differ across layers. Ablations use the same rule, so they stay matched to each other.
+  Consequence: STARLIGHT decisions differ from per-layer H2O decisions on the same prompt, and the comparison
+  between STARLIGHT and H2O arms measures this shared-set rule as well as protection.
 - The controller then vetoes the candidates that are protected. Retained = keep ∪ protected, so
   `|retained| = B_eff + |protected ∩ H2O_keep_complement| <= B`.
 - H2O's own sink and visual protection are disabled under STARLIGHT. The controller owns it.

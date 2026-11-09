@@ -88,43 +88,55 @@ def test_M3_policy_restore_that_skips_tracker_is_detected_by_digest_check(star_e
 
 
 def test_M4_plans_that_ignore_da_protection_are_detected_by_the_protection_spy(star_engine, prompt, monkeypatch):
-    # Detector check on the MUTANT only. The protected run cannot serve as a baseline here: a protected
-    # entry that H2O would evict on some full-attention layers but not others triggers the per-layer
-    # length defect F-1 (see test_iter3_b2_mtp_rollback.py::test_F1_*). Clean protection correctness is
-    # covered by test_pinv_speculation_never_evicts_a_protected_position.
+    # Unmutated baseline FIRST, then the mutant, on the same injected DA span.
     #
-    # On this 19-token prompt, H2O without protection evicts exactly prompt position 16 on layer 3
-    # (measured), so the injected DA focus span covers position 16. Without the mutation the spy would
-    # see that position protected; with it, the plan evicts it and the spy must fire.
+    # ITER3 R2 re-derivation (lead ruling F-1, shared retained set): the injected span was position 16,
+    # which the per-layer H2O rule evicted on layer 3 only. Under the SHARED candidate set, position 16
+    # is a candidate on every full-attention layer, so the mutant is no longer detected through
+    # position 16 (measured: the mutant's only eviction on this 19-token prompt is generated position 23,
+    # evicted on every full-attention layer at each eviction step; default DA protection already keeps
+    # the other candidates). The span therefore moves to position 23. The spy checks protection
+    # for every position, so generated positions are covered by the same rule.
     real_new_state = star_engine._pol_new_state
+    protected_pos = 23
 
-    def with_focus_span_on_16(kind, prompt_len):
+    def with_focus_span(kind, prompt_len):
         st = real_new_state(kind, prompt_len)
-        st.da_spans = tuple(st.da_spans) + (("focus:mid", 16, 17),)
+        st.da_spans = tuple(st.da_spans) + (("focus:mid", protected_pos, protected_pos + 1),)
         return st
 
     real_build = star_engine._starlight_build_step_plans
-    violations: list[tuple[int, int]] = []
-    stats = {"evicted_unprotected": 0}
     real_apply = star_engine._pol_apply
 
-    def spy(st, plans, next_orig):
-        protected = _protected_prompt_positions(st)
-        for l in st.full_layers:
-            before = {int(p) for p in st.orig[l]}
-            kept = {int(st.orig[l][i]) for i in plans[l] if i < len(st.orig[l])}
-            removed = before - kept
-            stats["evicted_unprotected"] += len(removed - protected)
-            violations.extend((l, p) for p in removed & protected)
-        return real_apply(st, plans, next_orig)
+    def run(mutant: bool):
+        violations: list[tuple[int, int]] = []
+        stats = {"evicted_unprotected": 0}
 
-    def ignore_da(tracker, k_lens, orig, row_pos, budget, da_spans, grounding, enabled, **kw):
-        # Mutation: the DA scopes are dropped from the protection inputs; the H2O candidates are unchanged.
-        return real_build(tracker, k_lens, orig, row_pos, budget, [], grounding, enabled, **kw)
+        def spy(st, plans, next_orig):
+            protected = _protected_prompt_positions(st)
+            for l in st.full_layers:
+                before = {int(p) for p in st.orig[l]}
+                kept = {int(st.orig[l][i]) for i in plans[l] if i < len(st.orig[l])}
+                removed = before - kept
+                stats["evicted_unprotected"] += len(removed - protected)
+                violations.extend((l, p) for p in removed & protected)
+            return real_apply(st, plans, next_orig)
 
-    monkeypatch.setattr(star_engine, "_pol_new_state", with_focus_span_on_16)
-    monkeypatch.setattr(star_engine, "_pol_apply", spy)
-    monkeypatch.setattr(star_engine, "_starlight_build_step_plans", ignore_da)
-    _spec(star_engine, "starlight", prompt, N, draft_override=None)
+        def ignore_da(tracker, k_lens, orig, row_pos, budget, da_spans, grounding, enabled, **kw):
+            # Mutation: the DA scopes are dropped from the protection inputs; the H2O candidates are unchanged.
+            return real_build(tracker, k_lens, orig, row_pos, budget, [] if mutant else da_spans,
+                              grounding, enabled, **kw)
+
+        with monkeypatch.context() as mp:
+            mp.setattr(star_engine, "_pol_new_state", with_focus_span)
+            mp.setattr(star_engine, "_pol_apply", spy)
+            mp.setattr(star_engine, "_starlight_build_step_plans", ignore_da)
+            _spec(star_engine, "starlight", prompt, N, draft_override=None)
+        return violations, stats
+
+    base_violations, base_stats = run(mutant=False)
+    assert base_stats["evicted_unprotected"] > 0, "baseline would be vacuous: nothing was evicted"
+    assert base_violations == [], f"baseline must pass first: protected position evicted {base_violations[:5]}"
+    violations, stats = run(mutant=True)
     assert stats["evicted_unprotected"] > 0, "mutation test would be vacuous: nothing was evicted"
     assert violations, "M4 not detected: a protected position was evicted and the spy did not fire"
