@@ -925,3 +925,270 @@ def test_r4_forward_path_telemetry_on_scaffold_reference():
     finally:
         engine.close()
     assert res.telemetry["forward_path_executed"] == "scaffold_reference"
+
+
+# --- R5-1 (auditor R4 §2): no-eviction oracle. With the budget covering the whole sequence,
+# h2o_base must be token-identical to base on the same official prompt. ---
+
+_R5_TEXT = ("The capital of France is Paris. The capital of Germany is Berlin. "
+            "The capital of Italy is")
+
+
+def _r5_official_ckpt():
+    from pathlib import Path
+    ckpt = Path("/mnt/ssd/genos2/research_workspace/models/Qwen/Qwen3.5-0.8B")
+    if not (ckpt / "config.json").is_file():
+        pytest.skip(f"Official Qwen3.5-0.8B checkpoint not present at {ckpt}")
+    return ckpt
+
+
+def test_r5_no_eviction_oracle_text_official_checkpoint():
+    ckpt = _r5_official_ckpt()
+    base = RealSevenArmEngine(method_arm="base", device="cpu", checkpoint_dir=ckpt)
+    try:
+        prompt = list(base.tokenizer.encode(_R5_TEXT))
+        res_base = base.execute_request("r5_base_text", prompt_token_ids=prompt,
+                                        max_new_tokens=8, image_present=False)
+    finally:
+        base.close()
+    # min_budget covers prompt + output, so nothing may be evicted.
+    h2o = RealSevenArmEngine(method_arm="h2o_base", device="cpu", checkpoint_dir=ckpt,
+                             h2o_budget_ratio=1.0, h2o_min_budget=len(prompt) + 16)
+    try:
+        res_h2o = h2o.execute_request("r5_h2o_text", prompt_token_ids=prompt,
+                                      max_new_tokens=8, image_present=False)
+    finally:
+        h2o.close()
+    acc = res_h2o.telemetry["h2o_logical_selection_accounting"]
+    assert acc["cumulative_evicted_slots"] == 0, "oracle is vacuous unless nothing is evicted"
+    assert res_h2o.tokens_generated == res_base.tokens_generated
+
+
+def test_r5_no_eviction_oracle_image_official_checkpoint():
+    ckpt = _r5_official_ckpt()
+    long_q = " ".join(["Describe the living room in detail."] * 3)
+    base = RealSevenArmEngine(method_arm="base", device="cpu", checkpoint_dir=ckpt)
+    try:
+        res_base = base.execute_request("r5_base_img", max_new_tokens=8, image_present=True,
+                                        question=long_q)
+    finally:
+        base.close()
+    h2o = RealSevenArmEngine(method_arm="h2o_base", device="cpu", checkpoint_dir=ckpt,
+                             h2o_budget_ratio=1.0, h2o_min_budget=4096)
+    try:
+        res_h2o = h2o.execute_request("r5_h2o_img", max_new_tokens=8, image_present=True,
+                                      question=long_q)
+    finally:
+        h2o.close()
+    acc = res_h2o.telemetry["h2o_logical_selection_accounting"]
+    assert acc["cumulative_evicted_slots"] == 0, "oracle is vacuous unless nothing is evicted"
+    assert res_h2o.tokens_generated == res_base.tokens_generated
+
+
+def test_r5_ratio_one_alone_still_evicts_generated_tokens():
+    """Documents the semantics behind the oracle: the budget is fixed from the PREFILL length, so
+    ratio 1.0 alone is NOT no-eviction. Generated tokens overflow the budget at the first decode step."""
+    ckpt = _r5_official_ckpt()
+    h2o = RealSevenArmEngine(method_arm="h2o_base", device="cpu", checkpoint_dir=ckpt,
+                             h2o_budget_ratio=1.0)
+    try:
+        # Long enough that max(min_budget=32, prefill) is the prefill length, not the 32 floor.
+        prompt = list(h2o.tokenizer.encode(_R5_TEXT * 3))
+        assert len(prompt) > 40
+        res = h2o.execute_request("r5_ratio_one", prompt_token_ids=prompt,
+                                  max_new_tokens=8, image_present=False)
+    finally:
+        h2o.close()
+    assert res.telemetry["h2o_logical_selection_accounting"]["cumulative_evicted_slots"] > 0
+
+
+# --- R5-2 (auditor R4 §2): text-side retention next to the total retention ---
+
+def test_r5_text_side_retention_fields_are_consistent_and_labelled():
+    cfg = _p7_small_cfg()
+    vision = [cfg.vision_start_token_id] + [cfg.image_token_id] * 8 + [cfg.vision_end_token_id]
+    prompt = vision + list(range(10, 40))
+    engine = RealSevenArmEngine(method_arm="h2o_base", config=cfg, device="cpu",
+                                h2o_min_budget=4)
+    try:
+        res = engine.execute_request("r5_text_side", prompt_token_ids=prompt,
+                                     max_new_tokens=6, image_present=False)
+    finally:
+        engine.close()
+    acc = res.telemetry["h2o_logical_selection_accounting"]
+    assert acc["unprotected_prefill_slots"] > 0
+    assert isinstance(acc["unprotected_retained_slots_last_step"], int)
+    assert acc["text_side_retained_fraction"] == pytest.approx(
+        acc["unprotected_retained_slots_last_step"] / acc["unprotected_prefill_slots"])
+    assert acc["text_side_retained_fraction"] < 1.0, "eviction must be visible on the text side"
+    assert acc["total_retention_near_1_expected_on_vlm_prompts"] is True
+    assert "EXPECTED" in acc["total_retention_interpretation"]
+    assert "text_side_retained_fraction" in acc["total_retention_interpretation"]
+
+
+def test_r5_text_side_fields_are_none_before_any_decode_step():
+    cfg = _p7_small_cfg()
+    engine = RealSevenArmEngine(method_arm="h2o_base", config=cfg, device="cpu")
+    try:
+        res = engine.execute_request("r5_text_side_none", prompt_token_ids=list(range(10, 50)),
+                                     max_new_tokens=1, image_present=False)
+    finally:
+        engine.close()
+    acc = res.telemetry["h2o_logical_selection_accounting"]
+    assert acc["unprotected_retained_slots_last_step"] is None
+    assert acc["text_side_retained_fraction"] is None
+
+
+# --- R5-3 (auditor R4 §2): name the variant, document every deviation, keep arm IDs ---
+
+def test_r5_h2o_arm_reports_method_variant_and_keeps_arm_ids():
+    from pathlib import Path
+    assert RealSevenArmEngine.SUPPORTED_ARMS == frozenset((
+        "base", "h2o_base", "da_base", "ecrd_base", "mtp", "h2o_mtp", "da_mtp"))
+    cfg = _p7_small_cfg()
+    engine = RealSevenArmEngine(method_arm="h2o_base", config=cfg, device="cpu")
+    try:
+        res = engine.execute_request("r5_variant", prompt_token_ids=list(range(10, 50)),
+                                     max_new_tokens=3, image_present=False)
+    finally:
+        engine.close()
+    acc = res.telemetry["h2o_logical_selection_accounting"]
+    assert acc["method_variant"] == "h2o_visual_anchor_text_budget"
+    assert acc["method_variant_is_upstream_h2o"] is False
+
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "H2O_DEVIATIONS.md").read_text(encoding="utf8")
+    for required in ("h2o_visual_anchor_text_budget", "min_budget", "per KV head",
+                     "NOT_IMPLEMENTED_OWNER_DECISION", "sinks", "protected", "ratio"):
+        assert required in doc, f"H2O_DEVIATIONS.md must mention {required!r}"
+
+
+# --- R5-4 (auditor A2-11): natural EOS stop, identical across ALL arms (protocol methods.py:
+# quality track native_full_context, natural_eos True). ---
+
+_R5_ALL_ARMS = ["base", "h2o_base", "da_base", "ecrd_base", "mtp", "h2o_mtp", "da_mtp"]
+
+
+def _r5_force_eos_at_call(engine, call_index, eos_id):
+    """Add a large bias to the EOS logit on forward call `call_index` (0 = prefill, k = decode step k)."""
+    orig_forward = engine.model.forward
+    counter = {"n": 0}
+
+    def _forced(*args, **kwargs):
+        out = orig_forward(*args, **kwargs)
+        if counter["n"] == call_index:
+            logits = out["logits"].clone()
+            logits[:, eos_id] += 1e4
+            out["logits"] = logits
+        counter["n"] += 1
+        return out
+
+    engine.model.forward = _forced
+
+
+@pytest.mark.parametrize("arm", _R5_ALL_ARMS)
+def test_r5_forced_eos_stops_every_arm_with_the_unforced_prefix(arm):
+    cfg = _p7_small_cfg()
+    prompt = list(range(10, 30))
+    eos = cfg.eos_token_id
+    torch.manual_seed(1234)
+    unforced_engine = RealSevenArmEngine(method_arm=arm, config=cfg, device="cpu")
+    try:
+        unforced = unforced_engine.execute_request(f"r5_unforced_{arm}", prompt_token_ids=prompt,
+                                                   max_new_tokens=8, image_present=False).tokens_generated
+    finally:
+        unforced_engine.close()
+    assert len(unforced) == 8 and eos not in unforced, "precondition: EOS must not occur naturally"
+
+    torch.manual_seed(1234)
+    engine = RealSevenArmEngine(method_arm=arm, config=cfg, device="cpu")
+    _r5_force_eos_at_call(engine, call_index=3, eos_id=eos)
+    try:
+        res = engine.execute_request(f"r5_forced_{arm}", prompt_token_ids=prompt,
+                                     max_new_tokens=8, image_present=False)
+    finally:
+        engine.close()
+    assert res.tokens_generated == unforced[:3], "EOS must stop the stream after the prefix, EOS excluded"
+    gen = res.telemetry["generation"]
+    assert gen["stop_reason"] == "eos"
+    assert gen["eos_token_ids"] == [eos]
+    assert gen["eos_token_excluded_from_output"] is True
+
+
+def test_r5_forced_eos_on_prefill_token_gives_empty_output():
+    cfg = _p7_small_cfg()
+    torch.manual_seed(1234)
+    engine = RealSevenArmEngine(method_arm="base", config=cfg, device="cpu")
+    _r5_force_eos_at_call(engine, call_index=0, eos_id=cfg.eos_token_id)
+    try:
+        res = engine.execute_request("r5_eos_prefill", prompt_token_ids=list(range(10, 30)),
+                                     max_new_tokens=8, image_present=False)
+    finally:
+        engine.close()
+    assert res.tokens_generated == []
+    assert res.telemetry["generation"]["stop_reason"] == "eos"
+
+
+def test_r5_stop_at_eos_false_keeps_fixed_length_for_latency_runs():
+    cfg = _p7_small_cfg()
+    torch.manual_seed(1234)
+    engine = RealSevenArmEngine(method_arm="base", config=cfg, device="cpu", stop_at_eos=False)
+    _r5_force_eos_at_call(engine, call_index=3, eos_id=cfg.eos_token_id)
+    try:
+        res = engine.execute_request("r5_fixed_len", prompt_token_ids=list(range(10, 30)),
+                                     max_new_tokens=8, image_present=False)
+    finally:
+        engine.close()
+    assert len(res.tokens_generated) == 8
+    assert res.telemetry["generation"]["stop_at_eos"] is False
+    assert res.telemetry["generation"]["stop_reason"] == "max_new_tokens"
+
+
+def test_r5_official_checkpoint_eos_comes_from_pinned_config():
+    ckpt = _r5_official_ckpt()
+    engine = RealSevenArmEngine(method_arm="base", device="cpu", checkpoint_dir=ckpt)
+    try:
+        assert engine.eos_token_ids == (248044,)
+    finally:
+        engine.close()
+
+
+# --- R5-5 (auditor R4 §4): label the serving-style mtp arms as diagnostics, no speculation ---
+
+@pytest.mark.parametrize("arm", ["mtp", "h2o_mtp", "da_mtp"])
+def test_r5_serving_mtp_arms_are_labelled_diagnostic_without_speculation(arm):
+    cfg = _p7_small_cfg()
+    engine = RealSevenArmEngine(method_arm=arm, config=cfg, device="cpu")
+    try:
+        res = engine.execute_request(f"r5_label_{arm}", prompt_token_ids=list(range(10, 30)),
+                                     max_new_tokens=3, image_present=False)
+    finally:
+        engine.close()
+    assert res.method_arm == arm, "arm IDs are unchanged"
+    assert res.telemetry["speculation_executed"] is False
+    assert res.telemetry["arm_label"] == "mtp_serving_arm_diagnostic_no_speculation"
+    assert res.mtp_acceptance_rate is None
+
+
+def test_r5_non_mtp_arm_reports_no_speculation_without_mtp_label():
+    cfg = _p7_small_cfg()
+    engine = RealSevenArmEngine(method_arm="base", config=cfg, device="cpu")
+    try:
+        res = engine.execute_request("r5_label_base", prompt_token_ids=list(range(10, 30)),
+                                     max_new_tokens=3, image_present=False)
+    finally:
+        engine.close()
+    assert res.telemetry["speculation_executed"] is False
+    assert res.telemetry["arm_label"] == "non_speculative_arm"
+
+
+# --- R5-6 (auditor R4 §5.6): stale names in docs ---
+
+def test_r5_docs_do_not_use_stale_proposal_match_rate_name():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "docs"
+    for name in ("MTP_DA_UPSTREAM_CONTRACT_AUDIT.md", "NUMERIC_INTEGRITY_AUDIT_20261109.md"):
+        text = (root / name).read_text(encoding="utf8")
+        assert "proposal_match_rate" not in text, f"{name} still uses the retired name"
+        assert "mtp_acceptance_rate=0" not in text, f"{name} still states acceptance 0 (now None)"
+    mtp_doc = (root / "MTP_DA_UPSTREAM_CONTRACT_AUDIT.md").read_text(encoding="utf8")
+    assert "proposal_target_agreement_diagnostic" in mtp_doc

@@ -1031,6 +1031,9 @@ class RealSevenArmEngine:
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         h2o_budget_ratio: float = 0.5,
         target_backend: str = "pytorch",
+        h2o_min_budget: int = 32,
+        stop_at_eos: bool = True,
+        eos_token_ids: Sequence[int] | None = None,
         tokenizer: Any | None = None,
         checkpoint_dir: str | Path | None = None,
     ):
@@ -1039,6 +1042,12 @@ class RealSevenArmEngine:
 
         self.method_arm = method_arm
         self.config = config or Qwen35ModelConfig.qwen35_08b()
+        # Protocol (methods.py quality track, native_full_context): natural EOS stop. Latency
+        # runs must pass stop_at_eos=False explicitly. EOS defaults to the pinned config's id.
+        self.stop_at_eos = bool(stop_at_eos)
+        self.eos_token_ids: tuple[int, ...] = tuple(
+            int(t) for t in (eos_token_ids if eos_token_ids is not None else (self.config.eos_token_id,))
+        )
         self.device = device
         self.backend = target_backend
         self.tokenizer = tokenizer
@@ -1080,7 +1089,9 @@ class RealSevenArmEngine:
 
         # Arm-specific components
         self.h2o_trackers: dict[str, H2OCacheTracker] = {}
-        self.h2o_config = H2OConfig(budget_ratio=h2o_budget_ratio)
+        # min_budget is the floor of the per-layer budget. With a fixed budget it can dominate on
+        # short prompts (see docs/H2O_DEVIATIONS.md). Default 32 is unsourced and kept as-is.
+        self.h2o_config = H2OConfig(budget_ratio=h2o_budget_ratio, min_budget=h2o_min_budget)
         self.da_fsm = DAFSM() if "da" in self.method_arm else None
         self.da_mask_gen = DAMaskGenerator() if "da" in self.method_arm else None
         self.ecrd_processors: dict[str, ECRDLogitsProcessor] = {}
@@ -1482,6 +1493,8 @@ class RealSevenArmEngine:
         h2o_cumulative_evicted_slots: int | None = None  # None until a decode step runs
         h2o_slots_at_prefill: int | None = None
         h2o_last_step_retained_slots: int | None = None
+        h2o_unprotected_prefill_slots: int | None = None
+        h2o_last_step_unprotected_retained: int | None = None
         final_da_restriction_ratio: float | None = None  # None until a decode step builds a mask
         final_da_causal_area_ratio: float | None = None
         da_measured_masked_entries: int | None = None    # None = no hooked decode measurement
@@ -1527,6 +1540,10 @@ class RealSevenArmEngine:
             for l_idx in self.config.full_attention_layers:
                 tracker.initialize_budget(l_idx, len(full_prompt))
             h2o_slots_at_prefill = len(self.config.full_attention_layers) * len(full_prompt)
+            h2o_unprotected_prefill_slots = sum(
+                tracker.unprotected_count(l_idx, len(full_prompt))
+                for l_idx in self.config.full_attention_layers
+            )
 
         # Feed prefill attention scores into H2O tracker
         if tracker is not None:
@@ -1539,11 +1556,17 @@ class RealSevenArmEngine:
             current_token = int(np.argmax(reweighted_np0))
         else:
             current_token = int(torch.argmax(logits[0]).item())
-        tokens_generated.append(current_token)
+        stop_reason = "max_new_tokens"
+        if self.stop_at_eos and current_token in self.eos_token_ids:
+            stop_reason = "eos"  # EOS is never emitted into the output
+        else:
+            tokens_generated.append(current_token)
 
         # Autoregressive generation loop for up to max_new_tokens
         curr_len = len(full_prompt) + 1
         for step in range(1, max_new_tokens):
+            if stop_reason == "eos":
+                break
             step_t0 = time.perf_counter()
             next_input = torch.tensor([[current_token]], device=self.device, dtype=torch.long)
 
@@ -1590,6 +1613,7 @@ class RealSevenArmEngine:
                 step_evicted = 0
                 step_total = 0
                 step_retained = 0
+                step_unprotected_retained = 0
                 for l_idx in self.config.full_attention_layers:
                     if self.model.hf_forward_active and past_kv is not None:
                         k_phys_len = past_kv.layers[l_idx].keys.shape[2] + 1
@@ -1603,10 +1627,12 @@ class RealSevenArmEngine:
                     step_evicted += metrics["evicted_tokens"]
                     step_total += metrics["total_tokens"]
                     step_retained += metrics["retained_tokens"]
+                    step_unprotected_retained += metrics["unprotected_retained"]
                 # Per-step rate over full-attention layers (last step only), plus cumulative
                 # evicted slots over all steps. Layers may have different compacted lengths.
                 h2o_cumulative_evicted_slots = (h2o_cumulative_evicted_slots or 0) + step_evicted
                 h2o_last_step_retained_slots = step_retained
+                h2o_last_step_unprotected_retained = step_unprotected_retained
                 h2o_per_step_rate = step_evicted / step_total if step_total else 0.0
 
             # Compute 3D RoPE position_ids for decode step when using official HF model
@@ -1668,6 +1694,10 @@ class RealSevenArmEngine:
             else:
                 current_token = int(torch.argmax(step_logits).item())
 
+            if self.stop_at_eos and current_token in self.eos_token_ids:
+                stop_reason = "eos"  # shared check for every arm; EOS is not emitted
+                break
+
             # 5. P0 source-correct MTP PROPOSAL DIAGNOSTIC, not speculative serving.
             # Qwen3.5's single trained MTP layer proposes t+2 from h(t) and
             # the embedding of target-selected t+1. Verify that proposal only
@@ -1715,6 +1745,11 @@ class RealSevenArmEngine:
             if h2o_last_step_retained_slots is not None and h2o_slots_at_prefill
             else None
         )
+        h2o_text_side_retained_fraction = (
+            h2o_last_step_unprotected_retained / h2o_unprotected_prefill_slots
+            if h2o_last_step_unprotected_retained is not None and h2o_unprotected_prefill_slots
+            else None
+        )
         decoded_str = ""
         if self.tokenizer is not None and hasattr(self.tokenizer, "decode"):
             try:
@@ -1752,6 +1787,20 @@ class RealSevenArmEngine:
                 "architectural_status": arch_status,
                 "is_official_hf_hooked": self.is_official_hf_hooked,
                 "forward_path_executed": forward_path_executed,
+                # R5-5: serving-style arms never speculate. The verifier-backed reference is a separate helper.
+                "speculation_executed": False,
+                "arm_label": (
+                    "mtp_serving_arm_diagnostic_no_speculation" if "mtp" in self.method_arm
+                    else "non_speculative_arm"
+                ),
+                "generation": {
+                    "stop_at_eos": self.stop_at_eos,
+                    "eos_token_ids": list(self.eos_token_ids),
+                    "stop_reason": stop_reason,
+                    "generated_token_count": len(tokens_generated),
+                    "eos_token_excluded_from_output": True,
+                    "protocol_reference": "methods.py quality track natural_eos=True; latency runs set stop_at_eos=False",
+                },
                 "vllm_backend_status": "MOCKED_PYTORCH_FALLBACK" if not self.has_vllm_backend else "ATTACHED_VLLM_0_29_0",
                 "pretrained_weights": self.pretrained_weight_summary,
                 "kv_memory_accounting": {
@@ -1765,12 +1814,24 @@ class RealSevenArmEngine:
                     "warning": "Each decode step's index_select size delta is added. The total is NOT a peak or allocated/reserved VRAM delta, and may count repeated reductions.",
                 },
                 "h2o_logical_selection_accounting": {
+                    "method_variant": "h2o_visual_anchor_text_budget",
+                    "method_variant_is_upstream_h2o": False,
+                    "upstream_variant_status": "NOT_IMPLEMENTED_OWNER_DECISION",
                     "budget_basis": "unprotected_prefill_tokens_fixed_per_layer",
                     "protected_outside_budget": True,
                     "per_step_evicted_slot_rate": h2o_per_step_rate,  # last decode step only
                     "cumulative_evicted_slots": h2o_cumulative_evicted_slots,  # all decode steps, full-attention layers
                     "cumulative_total_slots_at_prefill": h2o_slots_at_prefill,  # full-attention layers x prompt length
                     "final_retained_fraction": h2o_final_retained_fraction,  # retained after last step / prefill slots
+                    "unprotected_prefill_slots": h2o_unprotected_prefill_slots,  # text-side population at prefill
+                    "unprotected_retained_slots_last_step": h2o_last_step_unprotected_retained,
+                    "text_side_retained_fraction": h2o_text_side_retained_fraction,
+                    "total_retention_near_1_expected_on_vlm_prompts": True,
+                    "total_retention_interpretation": (
+                        "EXPECTED on VLM prompts: the protected visual block is kept whole, so the total "
+                        "final_retained_fraction is near 1.0 by construction. Use text_side_retained_fraction "
+                        "for any text-side retention statement. Not a KV-compression result."
+                    ),
                     "physical_vram_saving_claimed": False,
                     "protected_vision_tokens_in_prompt": int(
                         sum(1 for t in full_prompt if t in (

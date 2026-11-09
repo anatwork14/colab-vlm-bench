@@ -729,3 +729,18 @@ def test_r4_h2o_module_header_scopes_mtp_transaction_to_synthetic_adapter():
     doc = h2o_mod.__doc__
     assert "synthetic" in doc.lower()
     assert "not used by the real engine" in doc.lower()
+
+
+# --- R5-1: tracker no-eviction oracle (protection off, budget covers the sequence) ---
+
+def test_r5_protection_off_full_budget_returns_full_mask_every_step():
+    tracker = H2OCacheTracker(
+        H2OConfig(budget_ratio=1.0, min_budget=1000, protect_visual_tokens=False,
+                  protect_system_tokens=0),
+        num_layers=1, num_kv_heads=1)
+    tracker.initialize_budget(0, prefill_length=50)
+    tracker.update_attention_scores(0, np.random.RandomState(0).rand(1, 50, 50).astype(np.float32))
+    for length in (50, 51, 77, 300, 999):
+        keep, m = tracker.compute_eviction_plan(0, current_length=length)
+        assert keep.all() and keep.shape == (length,), f"length {length}"
+        assert m["evicted_tokens"] == 0 and m["unprotected_retained"] == length

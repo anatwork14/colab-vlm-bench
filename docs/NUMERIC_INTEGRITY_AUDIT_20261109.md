@@ -24,7 +24,7 @@
 
 ## Number-level definitions required by the paper
 
-- `mtp_proposal_match_rate` = ordinary target matches / eligible reference MTP proposals, **diagnostic only**; not speculative acceptance. The current reference head has no persistent MTP history and cannot be used for production acceptance-rate publication.
+- `proposal_target_agreement_diagnostic` = ordinary target matches / eligible reference MTP proposals, **diagnostic only**; not speculative acceptance. The current reference head has no persistent MTP history and cannot be used for production acceptance-rate publication.
 - `mtp_acceptance_rate` = accepted, **committed speculative** tokens / truly proposed tokens. Cannot be reported until a native correct verifier exists. An internal compatibility value of zero when there is **no speculative serving** is a *no-attempt sentinel*, NOT an observation that the pretrained MTP head has 0% acceptance.
 - `attention_mask_restriction_ratio` = disallowed keys / total eligible keys **in the final decode query row**, when all methods use the same logical prompt. This is not bytes read or time saved. `full_causal_mask_area_restriction_ratio` is distinct: excluded cells / all causal cells of a hypothetical prefill-style matrix.
 - `heavy_hitters` must count only newly score-selected keys, **not** visual/system-protected keys. `logical_selection_fraction` is now aggregated across all full-attention layers using the number of KV token-slots in the last decode step; older last-layer-only figures are historical.
