@@ -882,3 +882,46 @@ def test_r4_max_new_tokens_one_reports_none_not_literal_zero():
     assert acc["per_step_evicted_slot_rate"] is None
     assert acc["cumulative_evicted_slots"] is None
     assert acc["final_retained_fraction"] is None
+
+
+# --- R4-4 (lead round 4, auditor LOW): the forward path must be named as it actually ran ---
+
+def test_r4_forward_path_telemetry_names_the_path_that_ran(monkeypatch):
+    """A config.json checkpoint attaches the official HF model even when coverage is partial, and
+    the forward runs that model. The telemetry must say so, and the gate must not claim PASS."""
+    from pathlib import Path
+    from vlmbench.infrastructure import real_engine as re_mod
+
+    ckpt = Path("/mnt/ssd/genos2/research_workspace/models/Qwen/Qwen3.5-0.8B")
+    if not (ckpt / "config.json").is_file():
+        pytest.skip(f"Official Qwen3.5-0.8B checkpoint not present at {ckpt}")
+
+    real_loader = re_mod._load_official_hf_bundle
+
+    def degraded_loader(ckpt_path, device):
+        bundle = real_loader(ckpt_path, device=device)
+        degraded = dict(bundle)  # copy: do not mutate the cached bundle shared by other tests
+        degraded["summary"] = {**bundle["summary"], "tensor_coverage_ratio": 0.5}
+        return degraded
+
+    monkeypatch.setattr(re_mod, "_load_official_hf_bundle", degraded_loader)
+    engine = RealSevenArmEngine(method_arm="base", device="cpu", checkpoint_dir=ckpt)
+    try:
+        assert engine.is_official_hf_hooked is False
+        assert engine.model.hf_model is not None
+        res = engine.execute_request("r4_partial_path", prompt_token_ids=[10, 11, 12],
+                                     max_new_tokens=2, image_present=False)
+    finally:
+        engine.close()
+    assert res.telemetry["forward_path_executed"] == "official_hf_partial_coverage_UNQUALIFIED"
+    assert res.gates["REAL_MODEL_FORWARD_PASS"] == "PARTIAL_COVERAGE_NOT_QUALIFIED"
+
+
+def test_r4_forward_path_telemetry_on_scaffold_reference():
+    engine = RealSevenArmEngine(method_arm="base", config=_p7_small_cfg(), device="cpu")
+    try:
+        res = engine.execute_request("r4_scaffold_path", prompt_token_ids=[10, 11, 12],
+                                     max_new_tokens=2, image_present=False)
+    finally:
+        engine.close()
+    assert res.telemetry["forward_path_executed"] == "scaffold_reference"
