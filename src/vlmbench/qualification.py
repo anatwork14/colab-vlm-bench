@@ -153,11 +153,12 @@ def qualify_amber_assets(
             query_disc_member = _find_zip_member(namelist, "query_discriminative.json")
             annotations_member = _find_zip_member(namelist, "annotations.json")
 
+            official_code_dir = archive_path.parent.parent / "official_code"
             found_files = {
-                "query_all": query_all_member,
-                "query_generative": query_gen_member,
-                "query_discriminative": query_disc_member,
-                "annotations": annotations_member,
+                "query_all": query_all_member or (str(official_code_dir / "data/query/query_all.json") if (official_code_dir / "data/query/query_all.json").is_file() else None),
+                "query_generative": query_gen_member or (str(official_code_dir / "data/query/query_generative.json") if (official_code_dir / "data/query/query_generative.json").is_file() else None),
+                "query_discriminative": query_disc_member or (str(official_code_dir / "data/query/query_discriminative.json") if (official_code_dir / "data/query/query_discriminative.json").is_file() else None),
+                "annotations": annotations_member or (str(official_code_dir / "data/annotations.json") if (official_code_dir / "data/annotations.json").is_file() else None),
             }
 
             missing = [k for k, v in found_files.items() if v is None]
@@ -173,9 +174,12 @@ def qualify_amber_assets(
                 }
 
             # Inspect query contents
-            assert query_all_member is not None
-            with zf.open(query_all_member) as fp:
-                query_all_data = json.load(fp)
+            if query_all_member is not None:
+                with zf.open(query_all_member) as fp:
+                    query_all_data = json.load(fp)
+            else:
+                with open(found_files["query_all"], "r", encoding="utf8") as fp:
+                    query_all_data = json.load(fp)
 
             if isinstance(query_all_data, dict):
                 valid_key = next((k for k in ("queries", "data") if k in query_all_data), None)
@@ -191,9 +195,12 @@ def qualify_amber_assets(
                 raise AmberError("Empty query items list in AMBER archive")
 
             # Check annotation contents
-            assert annotations_member is not None
-            with zf.open(annotations_member) as fp:
-                ann_data = json.load(fp)
+            if annotations_member is not None:
+                with zf.open(annotations_member) as fp:
+                    ann_data = json.load(fp)
+            else:
+                with open(found_files["annotations"], "r", encoding="utf8") as fp:
+                    ann_data = json.load(fp)
 
             if isinstance(ann_data, dict) and "annotations" in ann_data:
                 ann_items = ann_data["annotations"]
