@@ -1247,7 +1247,8 @@ class RealSevenArmEngine:
         elif self.is_pretrained:
             arch_status = "PARTIALLY_WEIGHTED_PYTORCH_REFERENCE"
             seven_arm_gate = "GATED_OFFICIAL_HF_HOOK_REQUIRED"
-            mm_gate = "PASS" if (self.has_vision_encoder and image_present) else "GATED_PRETRAINED_CHECKPOINT_REQUIRED"
+            # Partial reference weights never qualify a real multimodal forward (R3-1).
+            mm_gate = "PARTIAL_COVERAGE_NOT_QUALIFIED"
         else:
             arch_status = "PYTORCH_ARCHITECTURAL_SCAFFOLD_UNWEIGHTED"
             seven_arm_gate = "GATED_PRETRAINED_CHECKPOINT_REQUIRED"
@@ -1256,7 +1257,12 @@ class RealSevenArmEngine:
         gates = {
             "POLICY_HARNESS_PASS": "PASS",
             "ACTUAL_BACKEND_HOOK_PASS": "PASS" if self.has_vllm_backend else "GATED_VLLM_BACKEND_ATTACHMENT_REQUIRED",
-            "REAL_MODEL_FORWARD_PASS": "PASS" if self.is_pretrained else "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+            # PASS only with official HF hooking (tensor+parameter coverage 1.0, parity verified).
+            "REAL_MODEL_FORWARD_PASS": (
+                "PASS" if self.is_official_hf_hooked
+                else "PARTIAL_COVERAGE_NOT_QUALIFIED" if self.is_pretrained
+                else "GATED_PRETRAINED_CHECKPOINT_REQUIRED"
+            ),
             "REAL_MULTIMODAL_INFERENCE_PASS": mm_gate,
             "SEVEN_ARM_PRETRAINED_PASS": seven_arm_gate,
             "MTP_CORRECTNESS_PASS": "GATED_NATIVE_MTP_VERIFIER_REQUIRED" if "mtp" in self.method_arm else "NOT_APPLICABLE",
