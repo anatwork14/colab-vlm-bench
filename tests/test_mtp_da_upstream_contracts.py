@@ -112,5 +112,8 @@ def test_da_does_not_fit_target_sparsity():
         assert 0.0 <= cost["full_causal_mask_area_restriction_ratio"] <= 1.0
         assert 0.0 <= cost["attention_mask_restriction_ratio"] <= 1.0
         assert cost["focus_visual_evidence_kept"] is False
+        assert result.attention_mask_restriction_ratio > 0.0, (
+            "The deliberately long input must exercise nontrivial scripted masking"
+        )
     finally:
         engine.close()
