@@ -194,6 +194,7 @@ def _install_seven_arm_attention_hooks(hf_model: Any, hook_ctx: _HookStepContext
                 value_rep = modeling_qwen3_5.repeat_kv(value_states, mod.num_key_value_groups)
 
                 attn_logits = torch.matmul(query_states, key_rep.transpose(2, 3)) * mod.scaling
+                da_masked_neg: torch.Tensor | None = None
                 if attention_mask is not None:
                     if attention_mask.shape[-1] != k_len:
                         raise ValueError(
@@ -211,16 +212,32 @@ def _install_seven_arm_attention_hooks(hf_model: Any, hook_ctx: _HookStepContext
                     else:
                         da_mask_slice = da_mask
                     mask_expanded = da_mask_slice.unsqueeze(0).unsqueeze(0)
-                    attn_logits = attn_logits.masked_fill(~mask_expanded, -1e9)
+                    da_masked_neg = ~mask_expanded
+                    attn_logits = attn_logits.masked_fill(da_masked_neg, -1e9)
 
                 attn_weights = nn.functional.softmax(
                     attn_logits, dim=-1, dtype=torch.float32
                 ).to(query_states.dtype)
 
+                # R4-3: MEASURE the post-softmax weight on every masked (head, query, key) entry.
+                # This is what DA_MASKING_EXERCISED is allowed to rest on, not the constructed mask.
+                da_measured: dict[str, Any] = {}
+                if da_masked_neg is not None:
+                    neg_entries = da_masked_neg.expand_as(attn_weights)
+                    n_masked_entries = int(neg_entries.sum().item())
+                    da_measured = {
+                        "da_measured_masked_entry_count": n_masked_entries,
+                        "da_measured_masked_weight_max": (
+                            float(attn_weights.masked_select(neg_entries).max().item())
+                            if n_masked_entries else None
+                        ),
+                    }
+
                 if hasattr(hook_ctx, "attention_matrices"):
                     hook_ctx.attention_matrices[l_idx] = attn_weights.detach()
                 if hasattr(hook_ctx, "layer_telemetries"):
                     hook_ctx.layer_telemetries[l_idx] = {
+                        **da_measured,
                         "kv_seq_len": k_len,
                         "attention_mask_len": None if attention_mask is None else int(attention_mask.shape[-1]),
                         "attention_mask_len_received": mask_len_received,
@@ -892,6 +909,32 @@ class Qwen35NeuralModel(nn.Module):
 DA_DECODE_ONLY_LABEL = "decode_only_scripted_da_diagnostic"
 
 
+def _round_or_none(value: float | None, ndigits: int = 4) -> float | None:
+    return None if value is None else round(value, ndigits)
+
+
+def _da_masking_gate(
+    method_arm: str,
+    restriction_ratio: float | None,
+    measured_masked_entries: int | None,
+    measured_masked_weight_max: float | None,
+) -> str:
+    """DA_MASKING_EXERCISED verdict (R4-3).
+
+    PASS needs all three: a constructed restriction (> 0), masked entries MEASURED in the hooked
+    forward, and every measured masked weight exactly 0.0. A constructed mask alone never passes.
+    """
+    if "da" not in method_arm:
+        return "NOT_APPLICABLE"
+    if restriction_ratio is not None and restriction_ratio == 0.0:
+        return "NOT_EXERCISED_NO_RESTRICTED_READS"
+    if restriction_ratio is None or not measured_masked_entries or measured_masked_weight_max is None:
+        return "NOT_MEASURED_NO_HOOKED_DECODE_STEP"
+    if measured_masked_weight_max != 0.0:
+        return "FAIL_MASKED_KEY_RECEIVED_ATTENTION"
+    return "PASS"
+
+
 def _da_scripted_tags(
     anchor_len: int, phys_len: int, n_visual: int, image_present: bool,
     question_start: int | None = None,
@@ -938,10 +981,10 @@ class RealExecutionResult:
     physical_kv_bytes_allocated: int
     physical_kv_bytes_freed: int
     per_step_evicted_slot_rate: float | None  # H2O: last decode step only; None if no H2O step ran
-    attention_read_restriction_ratio: float
+    attention_read_restriction_ratio: float | None  # None when no decode step built a DA mask
     grounded_citations: list[dict[str, Any]]
     mtp_acceptance_rate: float | None  # None = not verified (serving arm); see _speculative_mtp_greedy_k1
-    attention_mask_restriction_ratio: float = 0.0
+    attention_mask_restriction_ratio: float | None = None
     gates: dict[str, str] = field(default_factory=dict)
     telemetry: dict[str, Any] = field(default_factory=dict)
 
@@ -1419,11 +1462,13 @@ class RealSevenArmEngine:
         final_allocated_bytes = 0
         # H2O telemetry: None until a measurement exists (never a literal zero).
         h2o_per_step_rate: float | None = None
-        h2o_cumulative_evicted_slots = 0
+        h2o_cumulative_evicted_slots: int | None = None  # None until a decode step runs
         h2o_slots_at_prefill: int | None = None
         h2o_last_step_retained_slots: int | None = None
-        final_da_restriction_ratio = 0.0
-        final_da_causal_area_ratio = 0.0
+        final_da_restriction_ratio: float | None = None  # None until a decode step builds a mask
+        final_da_causal_area_ratio: float | None = None
+        da_measured_masked_entries: int | None = None    # None = no hooked decode measurement
+        da_measured_weight_max: float | None = None
         mtp_proposed_total = 0
         mtp_matched_total = 0
         pending_mtp_candidate: int | None = None
@@ -1541,7 +1586,7 @@ class RealSevenArmEngine:
                     step_retained += metrics["retained_tokens"]
                 # Per-step rate over full-attention layers (last step only), plus cumulative
                 # evicted slots over all steps. Layers may have different compacted lengths.
-                h2o_cumulative_evicted_slots += step_evicted
+                h2o_cumulative_evicted_slots = (h2o_cumulative_evicted_slots or 0) + step_evicted
                 h2o_last_step_retained_slots = step_retained
                 h2o_per_step_rate = step_evicted / step_total if step_total else 0.0
 
@@ -1573,6 +1618,16 @@ class RealSevenArmEngine:
                 past_kv = out["past_key_values"]
                 recurrent_s = out["recurrent_states"]
                 step_logits = out["logits"][0]
+                for layer_telem in out["layer_telemetries"]:
+                    n_entries = layer_telem.get("da_measured_masked_entry_count")
+                    if n_entries is None:
+                        continue
+                    da_measured_masked_entries = (da_measured_masked_entries or 0) + int(n_entries)
+                    w_max = layer_telem.get("da_measured_masked_weight_max")
+                    if w_max is not None:
+                        da_measured_weight_max = (
+                            w_max if da_measured_weight_max is None else max(da_measured_weight_max, w_max)
+                        )
 
                 if tracker is not None:
                     for l_idx, attn_w in out["attention_matrices"].items():
@@ -1625,13 +1680,11 @@ class RealSevenArmEngine:
         mtp_proposal_target_agreement = (
             mtp_matched_total / mtp_proposed_total if mtp_proposed_total else None
         )
-        if "da" in self.method_arm:
-            # G4: DA counts as exercised only when a real decode read was restricted.
-            gates["DA_MASKING_EXERCISED"] = (
-                "PASS" if final_da_restriction_ratio > 0.0 else "NOT_EXERCISED_NO_RESTRICTED_READS"
-            )
-        else:
-            gates["DA_MASKING_EXERCISED"] = "NOT_APPLICABLE"
+        # R4-3: PASS only from measured zero masked weights plus a constructed restriction.
+        gates["DA_MASKING_EXERCISED"] = _da_masking_gate(
+            self.method_arm, final_da_restriction_ratio,
+            da_measured_masked_entries, da_measured_weight_max,
+        )
         if "mtp" in self.method_arm:
             gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] = (
                 "PASS" if mtp_proposed_total > 0 else "INSUFFICIENT_TOKENS"
@@ -1749,13 +1802,23 @@ class RealSevenArmEngine:
                     if "ecrd" in self.method_arm else None
                 ),
                 "da_cost_accounting": {
-                    "attention_mask_restriction_ratio": round(final_da_restriction_ratio, 4),
-                    "decode_last_query_allowed_key_ratio": round(1.0 - final_da_restriction_ratio, 4),
-                    "full_causal_mask_area_restriction_ratio": round(final_da_causal_area_ratio, 4),
+                    "attention_mask_restriction_ratio": _round_or_none(final_da_restriction_ratio),
+                    "decode_last_query_allowed_key_ratio": (
+                        None if final_da_restriction_ratio is None else round(1.0 - final_da_restriction_ratio, 4)
+                    ),
+                    "full_causal_mask_area_restriction_ratio": _round_or_none(final_da_causal_area_ratio),
+                    "measured_masked_entry_count": da_measured_masked_entries,
+                    "measured_masked_weight_max": da_measured_weight_max,
+                    "measured_source": (
+                        "hooked_forward_post_softmax" if da_measured_masked_entries is not None
+                        else "NOT_MEASURED_NO_HOOKED_DECODE_STEP"
+                    ),
                     "focus_visual_evidence_kept": bool(image_present),
                     "da_scope_provenance": "SCRIPTED_SEGMENT_DIAGNOSTIC_NOT_MODEL_DECLARED",
                     "result_label": DA_DECODE_ONLY_LABEL,
-                    "nontrivial_masking_exercised": bool(final_da_restriction_ratio > 0.0),
+                    "nontrivial_masking_exercised": (
+                        None if final_da_restriction_ratio is None else bool(final_da_restriction_ratio > 0.0)
+                    ),
                     "prefill_masked": False,
                     "deviations_from_scripted_geometry": (
                         ["question_span_global"] if da_question_start is not None else []
