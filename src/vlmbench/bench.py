@@ -15,6 +15,7 @@ import httpx
 
 from .artifacts import atomic_json, atomic_jsonl, code_identity, sha256, sync_files, verified_resume
 from .config import cell_id, fingerprint
+from .derivation_labels import rows_label
 from .telemetry import GPUSampler
 from .workloads import (WorkloadError, exact_bin_pool, resolve_messages,
                         sample_digest, sample_unique, ensure_no_gold_in_request)
@@ -176,6 +177,7 @@ async def run_performance_cell(
     expected = {
         "config_sha256": fingerprint(cfg), "dataset_sha256": dataset_sha256,
         "code_sha256": code_identity(), "cell": cell,
+        "derivation": rows_label(rows),
         "execution_pass": "FIXED_OUTPUT_SERVING_256",
         "output_contract": {"max_tokens": 256, "min_tokens": 256, "ignore_eos": True},
     }

@@ -19,7 +19,7 @@ INVALID = "INVALID"  # unreadable, or PASS without the expected measured request
 NON_COMPLETE = frozenset({FAILED, STALE, INVALID})
 
 UNRECORDED = "UNRECORDED"
-IDENTITY_KEYS = ("config_sha256", "dataset_sha256", "code_sha256",
+IDENTITY_KEYS = ("config_sha256", "dataset_sha256", "code_sha256", "derivation",
                  "execution_pass", "output_contract")
 
 

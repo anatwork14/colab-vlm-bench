@@ -5,6 +5,7 @@ and deterministically generates 7-context-bin serving workloads.
 """
 from __future__ import annotations
 
+from .. import derivation_labels
 import math
 from collections import Counter
 from pathlib import Path
@@ -258,14 +259,14 @@ def build_memlens_context_bins(
                 "derived_from": source_id,
                 "messages": [{"role": "user", "content": parts}],
                 "requested_text_length_bin": target,
-                "derivation": "memlens_7bin_builder_v2",
+                "derivation": derivation_labels.MEMLENS_7BIN_BUILDER,
                 "image_count": len(selected_images),
                 "model_token_counts": {},
                 "meta": {
                     "original_question_id": source_id,
                     "requested_text_length_bin": target,
                     "actual_text_tokens": actual_tokens,
-                    "derivation_id": "memlens_7bin_builder_v2",
+                    "derivation_id": derivation_labels.MEMLENS_7BIN_BUILDER,
                     "evidence_may_be_dropped": True,
                     "official_quality_allowed": False,
                     "image_count": len(selected_images),
@@ -279,7 +280,7 @@ def build_memlens_context_bins(
     return {
         "dataset": "memlens",
         "track": "derived_serving",
-        "derivation_id": "memlens_7bin_builder_v2",
+        "derivation_id": derivation_labels.MEMLENS_7BIN_BUILDER,
         "canonical_lengths": list(canonical_targets),
         "lengths_emitted": emitted_lengths,
         "tolerance": tolerance,

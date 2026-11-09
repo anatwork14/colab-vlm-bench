@@ -18,6 +18,7 @@ from vlmbench.config import cell_id, fingerprint, load_config, planned_cells
 
 CONFIG = Path(__file__).resolve().parents[1] / "configs/a100_qwen_priority_pilot.json"
 CODE_SHA = "a" * 40
+DERIVATION = "memlens_7bin_builder_v2"
 SCOPE = {"model": "qwen35_08b", "dataset": "memlens", "mode": "base"}
 
 
@@ -31,16 +32,17 @@ def _cfg(tmp_path):
     ds = cfg["datasets"][0]
     ds["native_path"] = str(tmp_path / "native.jsonl")
     ds["derived_path"] = str(tmp_path / "annotated.jsonl")
-    Path(ds["derived_path"]).write_text('{"id":"row"}\n', encoding="utf8")
+    Path(ds["derived_path"]).write_text(json.dumps({"id": "row", "derivation": "memlens_7bin_builder_v2"}) + "\n", encoding="utf8")
     Path(ds["native_path"]).write_text("", encoding="utf8")  # presence only; loader is faked
     return cfg
 
 
-def _identity(cfg, dataset_sha, code=CODE_SHA):
+def _identity(cfg, dataset_sha, code=CODE_SHA, derivation=DERIVATION):
     return {
         "config_sha256": fingerprint(cfg),
         "dataset_sha256": dataset_sha,
         "code_sha256": code,
+        "derivation": derivation,
         "execution_pass": "FIXED_OUTPUT_SERVING_256",
         "output_contract": {"max_tokens": 256, "min_tokens": 256, "ignore_eos": True},
     }
@@ -468,3 +470,54 @@ def test_remote_benchmark_wrapper_fails_and_names_the_status(monkeypatch, tmp_pa
 
     with pytest.raises(ValueError, match="requeue_nonpass must be a boolean"):
         ap.benchmark({**job, "requeue_nonpass": "yes"})
+
+
+# ---------- F-09: one derivation route per serving pool ----------
+
+def _write_derived(cfg, labels):
+    path = Path(cfg["datasets"][0]["derived_path"])
+    rows = [{"id": f"r{i}", **({} if lab is None else {"derivation": lab})}
+            for i, lab in enumerate(labels)]
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf8")
+    return path
+
+
+def test_mixed_derivation_routes_are_refused_before_gpu(monkeypatch, tmp_path):
+    cfg = _non_pilot(_cfg(tmp_path))
+    derived = _write_derived(cfg, ["memlens_7bin_builder_v2",
+                                   "tokenizer_exact_tail_text_one_source_image_v1"])
+    before = derived.read_bytes()
+    calls: list[str] = []
+    _fake_gpu(monkeypatch, tmp_path, cfg, calls, lambda cell: "PASS")
+
+    assert cli.run_job(_args()) == 2
+    run = _status(cfg)
+    assert run["status"] == "BLOCKED_MIXED_DERIVATION"
+    assert run["labels"] == {"memlens_7bin_builder_v2": 1,
+                             "tokenizer_exact_tail_text_one_source_image_v1": 1}
+    assert calls == [] and derived.read_bytes() == before
+
+
+def test_unlabelled_serving_rows_are_refused_before_gpu(monkeypatch, tmp_path):
+    cfg = _non_pilot(_cfg(tmp_path))
+    _write_derived(cfg, ["memlens_7bin_builder_v2", None])
+    calls: list[str] = []
+    _fake_gpu(monkeypatch, tmp_path, cfg, calls, lambda cell: "PASS")
+
+    assert cli.run_job(_args()) == 2
+    assert _status(cfg)["status"] == "BLOCKED_MIXED_DERIVATION"
+    assert calls == []
+
+
+def test_single_route_run_records_its_label_in_manifest_and_receipts(monkeypatch, tmp_path):
+    cfg = _non_pilot(_cfg(tmp_path))
+    _write_derived(cfg, ["memlens_7bin_builder_v2"] * 3)
+    calls: list[str] = []
+    _fake_gpu(monkeypatch, tmp_path, cfg, calls, lambda cell: "PASS")
+
+    assert cli.run_job(_args()) == 0
+    root = _root(cfg)
+    job = json.loads(next((root / "jobs").glob("*.json")).read_text())
+    assert job["derivation"] == "memlens_7bin_builder_v2"
+    receipt = json.loads((root / "cells" / f"{cell_id(_scoped(cfg)[0])}.json").read_text())
+    assert receipt["derivation"] == "memlens_7bin_builder_v2"

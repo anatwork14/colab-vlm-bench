@@ -21,6 +21,7 @@ from .report import write_report
 from .workloads import WorkloadError, load_jsonl, sample_digest
 from .bench import eligible_pool, run_performance_cell, run_quality_predictions, select_cell_samples
 from .resume import COMPLETED, NON_COMPLETE, MISSING, classify_cell_receipt, quarantine_cell_receipts
+from .derivation_labels import read_derivation_labels, single_label
 from .methods import manifest_from_path, plan as methods_plan, native_mode_or_block, blocked_method_receipt, MethodUnqualified
 from .hallucination import read_annotations, score_evidence_annotations
 
@@ -48,10 +49,10 @@ SERVING_CONTRACT = {
 }
 
 
-def _serving_identity(config_sha256: str, dataset_sha256: str) -> dict:
+def _serving_identity(config_sha256: str, dataset_sha256: str, derivation: str) -> dict:
     """What a serving receipt must match to be skipped on resume (see resume.py)."""
     return {"config_sha256": config_sha256, "dataset_sha256": dataset_sha256,
-            "code_sha256": code_identity(), **SERVING_CONTRACT}
+            "code_sha256": code_identity(), "derivation": derivation, **SERVING_CONTRACT}
 
 
 def _expected_sample_sha(cfg: dict, cell: dict, rows: list[dict], model_id: str) -> str | None:
@@ -174,6 +175,7 @@ def run_job(args) -> int:
             raise FileNotFoundError("Serving needs derived, processor-annotated Drive JSONL")
 
         cell_states: dict = {}
+        derivation = None
         # Run CPU-only readiness and SSD/RAM checks BEFORE staging weights and
         # launching vLLM. Avoid billable GPU time for deterministic missing-data
         # errors. These checks do not claim a GPU inference pass.
@@ -201,7 +203,23 @@ def run_job(args) -> int:
             # F-05: only a COMPLETED receipt (same config, dataset, code, sample set) is skipped.
             # Failed or stale receipts stop the job before any GPU work unless the operator
             # explicitly requests a requeue, which quarantines them first.
-            identity = _serving_identity(fingerprint(cfg), derived_hash)
+            # F-09: one derivation route per serving pool. Mixed or unlabelled rows would
+            # pool different prompts under one result, so refuse before any GPU work.
+            derivation_counts = read_derivation_labels(derived_path)
+            derivation = single_label(derivation_counts)
+            if derivation is None:
+                atomic_json(root / "run_status.json", {
+                    "status": "BLOCKED_MIXED_DERIVATION", "job": job_key,
+                    "labels": {str(k): v for k, v in derivation_counts.items()},
+                    "hint": "A derived file must carry exactly one derivation label. "
+                            "Rebuild it with a single route.",
+                })
+                sync_files(root, drive_root)
+                print(json.dumps({"status": "BLOCKED_MIXED_DERIVATION",
+                                  "labels": {str(k): v for k, v in derivation_counts.items()}}),
+                      flush=True)
+                return 2
+            identity = _serving_identity(fingerprint(cfg), derived_hash, derivation)
             cell_states = _classify_serving_cells(
                 cfg, scoped_cells, root, derived_path, ds["id"],
                 "amber_serving" if ds["id"] == "amber" else "derived_serving",
@@ -336,6 +354,7 @@ def run_job(args) -> int:
                         },
                         "dataset_native_sha256": native_hash,
                         "dataset_derived_sha256": derived_hash,
+                        "derivation": derivation,
                         "config_sha256": fp, "gpu": inventory}
         atomic_json(root / "jobs" / (job_key + ".json"), job_manifest)
         sync_files(root, drive_root)

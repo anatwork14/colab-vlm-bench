@@ -24,7 +24,7 @@ def _prepare(monkeypatch, tmp_path):
     ds = cfg["datasets"][0]
     ds["native_path"] = str(tmp_path / "native.jsonl")
     ds["derived_path"] = str(tmp_path / "annotated.jsonl")
-    Path(ds["derived_path"]).write_text('{"id":"row"}\n')
+    Path(ds["derived_path"]).write_text('{"id":"row","derivation":"memlens_7bin_builder_v2"}\n')
     monkeypatch.setattr(cli, "load_config", lambda *_a, **_kw: cfg)
     monkeypatch.setattr(cli, "checkpoint_inventory", lambda *_a, **_kw: {"total_bytes": 1})
     monkeypatch.setattr(cli, "host_resources", lambda *_a, **_kw: {})
