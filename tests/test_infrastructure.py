@@ -464,3 +464,42 @@ def test_h2o_heavy_hitters_report_only_actual_score_selected_candidates():
     assert metrics["retained_tokens"] == 5
     assert metrics["heavy_hitters"] == 2
     assert int(kept.sum()) == 5
+
+
+# --- P7 engine regression tests (2026-11-09 audit, base cfccc4b) ---
+
+def test_p7_h2o_mtp_commit_rejects_more_tokens_than_proposed():
+    """Regression: commit(accepted) larger than the proposal left seq_len past scored state."""
+    tracker = H2OCacheTracker(num_layers=2, num_kv_heads=1)
+    tracker.update_attention_scores(0, np.ones((1, 1, 4), dtype=np.float32))
+    tx = H2OMTPTransaction(tracker)
+    tx.begin()
+    tracker.update_attention_scores(0, np.ones((1, 1, 4), dtype=np.float32))  # 4 proposed
+    with pytest.raises(ValueError, match="exceed"):
+        tx.commit(accepted_tokens=10)
+    # Refused commit must leave the transaction open and rollback-able.
+    assert tx.in_transaction
+    tx.rollback()
+    assert tracker.seq_len == 4
+    assert tracker.layers[0].scores.shape[1] == 4
+
+
+@pytest.mark.parametrize("window_attr", ['"-4"', '"abc"'])
+def test_p7_da_rejects_negative_or_malformed_local_window(window_attr):
+    """Regression: a negative window made every local key unreadable (even by itself),
+    and a non-numeric window crashed with an opaque numpy int() error."""
+    fsm = DAFSM()
+    _, spans = fsm.parse_text(f"<da:local window={window_attr}>x</da:local>")
+    tags = fsm.spans_to_token_tags(spans, [(0, 1)])
+    with pytest.raises(ValueError, match="window"):
+        DAMaskGenerator().generate_attention_mask(seq_len=1, tags=tags)
+    with pytest.raises(ValueError, match="window"):
+        DAMaskGenerator().generate_attention_mask(
+            seq_len=2, tags=[DATag(DATagType.LOCAL, 0, 2, window=-1)])
+
+
+def test_p7_da_zero_window_keeps_self_attention():
+    """Boundary: window=0 is legal and must still let each query read itself (no empty row)."""
+    mask = DAMaskGenerator().generate_attention_mask(
+        seq_len=3, tags=[DATag(DATagType.LOCAL, 0, 3, window=0)])
+    assert np.all(np.diag(mask))

@@ -26,6 +26,7 @@ from vlmbench.infrastructure import (
     EvidenceItem,
     ECRDConfig,
     ECRDLogitsProcessor,
+    DATagType,
 )
 
 
@@ -378,4 +379,118 @@ def test_official_hf_hooking_coverage_and_logits_parity():
     assert res.telemetry["visual_encoder_trace"]["visual_token_embeddings_count"] == 300
     assert res.attention_mask_restriction_ratio > 0.0
     assert res.physical_kv_bytes_freed == 0
+    engine.close()
+
+
+# --- P7 engine regression tests (2026-11-09 audit, base cfccc4b) ---
+
+P7_SMALL_CFG = dict(
+    model_id="Qwen/Qwen3.5-TinyTest",
+    model_type="qwen3_5",
+    architectures=("Qwen3_5ForConditionalGeneration",),
+    vocab_size=512,
+    hidden_size=64,
+    num_hidden_layers=4,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    head_dim=16,
+    intermediate_size=128,
+    max_position_embeddings=1024,
+    image_token_id=500,
+    vision_start_token_id=501,
+    vision_end_token_id=502,
+    pad_token_id=0,
+    eos_token_id=1,
+    full_attention_layers=(3,),
+    recurrent_layers=(0, 1, 2),
+    mtp_num_speculative_tokens=2,
+)
+
+
+def _p7_small_cfg():
+    return Qwen35ModelConfig(**P7_SMALL_CFG)
+
+
+def test_p7_partial_loader_does_not_count_truncated_oversized_tensor(tmp_path):
+    """Regression: an oversized q_proj was silently sliced to shape and counted as mapped."""
+    from safetensors.torch import save_file
+
+    qkey = "model.language_model.layers.3.self_attn.q_proj.weight"
+    save_file({
+        qkey: torch.randn(128, 64),  # expected (q_dim=64, hidden=64): oversized
+        "model.language_model.layers.3.self_attn.k_proj.weight": torch.randn(32, 64),
+        "model.language_model.layers.3.self_attn.v_proj.weight": torch.randn(32, 64),
+        "model.language_model.layers.3.self_attn.o_proj.weight": torch.randn(64, 64),
+    }, str(tmp_path / "model.safetensors"))
+
+    engine = RealSevenArmEngine(method_arm="base", config=_p7_small_cfg(), device="cpu",
+                                checkpoint_dir=tmp_path)
+    s = engine.pretrained_weight_summary
+    assert qkey in s["unmapped_tensor_keys"]
+    assert s["unmapped_tensors_count"] == 1
+    assert s["mapped_tensors_count"] == 3
+    assert s["parameter_coverage_ratio"] < 1.0
+    engine.close()
+
+
+def test_p7_da_mask_geometry_stable_across_decode_steps():
+    """Regression: DA sink/focus boundaries were recomputed from the growing KV length,
+    so the same prompt keys changed class between decode steps (sink 9 -> 16 for a 36-token prompt)."""
+    engine = RealSevenArmEngine(method_arm="da_base", config=_p7_small_cfg(), device="cpu")
+    recorded = []
+    real_gen = engine.da_mask_gen.generate_attention_mask
+
+    def _spy(seq_len, tags=None, active_focus_id=None):
+        recorded.append([t for t in (tags or []) if t.tag_type != DATagType.LOCAL])
+        return real_gen(seq_len=seq_len, tags=tags, active_focus_id=active_focus_id)
+
+    engine.da_mask_gen.generate_attention_mask = _spy
+    engine.execute_request("p7_da_drift", prompt_token_ids=list(range(100, 136)),
+                           max_new_tokens=30, image_present=True)
+    assert len(recorded) >= 20
+    first = recorded[0]
+    for step_tags in recorded[1:]:
+        assert step_tags == first, "DA prompt-region tags changed between decode steps"
+    engine.close()
+
+
+def test_p7_mtp_reference_path_is_token_identical_to_base():
+    """MTP never commits drafts, so its committed sequence must equal Base under the same weights."""
+    prompt = list(range(10, 50))
+    tokens = {}
+    for arm in ("base", "mtp"):
+        torch.manual_seed(1234)
+        engine = RealSevenArmEngine(method_arm=arm, config=_p7_small_cfg(), device="cpu")
+        res = engine.execute_request(f"p7_mtp_{arm}", prompt_token_ids=prompt,
+                                     max_new_tokens=12, image_present=False)
+        tokens[arm] = res.tokens_generated
+        if arm == "mtp":
+            assert res.telemetry["mtp_candidate_diagnostic"]["committed_draft_tokens"] == 0
+            assert res.mtp_acceptance_rate == 0.0
+        engine.close()
+    assert tokens["mtp"] == tokens["base"]
+
+
+def test_p7_concurrent_requests_match_sequential_non_vllm():
+    """Multi-request isolation on the CPU PyTorch reference (NOT vLLM serving evidence).
+
+    Four requests with distinct prompts run on one engine from a thread pool; each must produce exactly the tokens of its sequential run.
+    """
+    import concurrent.futures
+
+    prompts = {f"p7_req_{i}": [100 + i, 110 + i, 120 + i, 130 + i] + list(range(200 + i * 40, 240 + i * 40))
+               for i in range(4)}
+
+    torch.manual_seed(99)
+    engine = RealSevenArmEngine(method_arm="h2o_base", config=_p7_small_cfg(), device="cpu")
+    sequential = {
+        rid: engine.execute_request(rid, prompt_token_ids=p, max_new_tokens=6,
+                                    evidence_pool=None, image_present=False).tokens_generated
+        for rid, p in prompts.items()
+    }
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {rid: ex.submit(engine.execute_request, rid, p, 6, None, False)
+                   for rid, p in prompts.items()}
+        concurrent_tokens = {rid: f.result().tokens_generated for rid, f in futures.items()}
+    assert concurrent_tokens == sequential
     engine.close()

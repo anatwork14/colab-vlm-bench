@@ -96,7 +96,9 @@ def test_progressive_qualification_test_c_multimodal_execution(model_dir, canoni
     assert report["gates"]["REAL_MODEL_FORWARD_PASS"] == "PASS"
     assert report["gates"]["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS"
     assert report["gates"]["SEVEN_ARM_PRETRAINED_PASS"] == "PASS"
-    assert report["gates"]["CCU_ISOLATION_PASS"] == "PASS"
+    # A single request cannot certify concurrent isolation (see real_engine.py); the
+    # multi-request CPU check lives in tests/test_real_engine.py (non-vLLM evidence).
+    assert report["gates"]["CCU_ISOLATION_PASS"] == "GATED_MULTIREQUEST_ISOLATION_TEST_REQUIRED"
 
     engine.close()
 
