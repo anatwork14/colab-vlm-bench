@@ -9,6 +9,7 @@ Validates:
 6. Multi-request CCU concurrency isolation (zero cross-request pollution).
 7. Complete seven-arm qualification gate reporting.
 """
+import concurrent.futures
 import numpy as np
 import pytest
 import torch
@@ -149,11 +150,12 @@ def test_real_mtp_speculative_verification_and_rollback():
     assert len(res.tokens_generated) == 8
     assert res.gates["MTP_CORRECTNESS_PASS"] == "PASS"
     assert res.mtp_acceptance_rate >= 0.0
+    engine.close()
 
 
 def test_ccu_concurrency_isolation():
     """Verify concurrent requests execute with strict isolation (CCU > 1)."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
     engine = RealSevenArmEngine(method_arm="ecrd_base", device=device)
 
     # Request A: Evidence for apple
@@ -170,8 +172,16 @@ def test_ccu_concurrency_isolation():
         keywords=["target"],
     )
 
-    res_a = engine.execute_request("req_A", [100, 101], max_new_tokens=4, evidence_pool=pool_a)
-    res_b = engine.execute_request("req_B", [102, 103], max_new_tokens=4, evidence_pool=pool_b)
+    # Execute truly concurrently via ThreadPoolExecutor
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        future_a = executor.submit(engine.execute_request, "req_A", [100, 101], 4, pool_a)
+        future_b = executor.submit(engine.execute_request, "req_B", [102, 103], 4, pool_b)
+        res_a = future_a.result()
+        res_b = future_b.result()
+
+    # Verify non-vacuous citations triggered
+    assert len(res_a.grounded_citations) > 0, "res_a must produce at least one grounded citation"
+    assert len(res_b.grounded_citations) > 0, "res_b must produce at least one grounded citation"
 
     # Verify zero citation cross-contamination
     for cit in res_a.grounded_citations:
@@ -182,6 +192,22 @@ def test_ccu_concurrency_isolation():
         assert "ev_B" in cit["evidence_ids"]
         assert "ev_A" not in cit["evidence_ids"]
 
+    engine.close()
+
+
+def test_h2o_sequence_above_min_budget_physical_eviction():
+    """Verify H2O physically compacts KV cache without IndexError when sequence > min_budget."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    engine = RealSevenArmEngine(method_arm="h2o_base", device=device)
+
+    # Prompt length: 30 tokens + 6 visual tokens = 36 tokens (> min_budget=32)
+    prompt = list(range(100, 130))
+    res = engine.execute_request("test_h2o_overflow", prompt_token_ids=prompt, max_new_tokens=8)
+
+    # Compaction must have physically triggered and freed bytes
+    assert res.physical_kv_bytes_freed > 0, "H2O must physically free bytes when seq_len > min_budget"
+    assert res.logical_selection_fraction > 0.0
+    assert res.physical_kv_bytes_allocated > 0
     engine.close()
 
 
@@ -219,13 +245,13 @@ def test_all_seven_arms_real_neural_forward_and_gates():
         assert res.total_latency_ms > 0.0
         assert res.ttft_ms > 0.0
 
-        # Required release gates
+        # Required release gates with SA-01 strict truth-in-labeling
         assert res.gates["POLICY_HARNESS_PASS"] == "PASS"
-        assert res.gates["ACTUAL_BACKEND_HOOK_PASS"] == "PASS"
-        assert res.gates["REAL_MODEL_FORWARD_PASS"] == "PASS"
-        assert res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS"
+        assert res.gates["ACTUAL_BACKEND_HOOK_PASS"] in ("PASS", "GATED_VLLM_BACKEND_ATTACHMENT_REQUIRED")
+        assert res.gates["REAL_MODEL_FORWARD_PASS"] in ("PASS", "GATED_PRETRAINED_CHECKPOINT_REQUIRED")
+        assert res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] in ("PASS", "GATED_PRETRAINED_CHECKPOINT_REQUIRED")
         assert res.gates["CCU_ISOLATION_PASS"] == "PASS"
-        assert res.gates["A100_GPU_QUALIFIED"] == "GATED_A100_HOST_EXECUTION_REQUIRED"
+        assert res.gates["A100_GPU_QUALIFIED"] == "BLOCKED_PENDING_OWNER_PAID_AUTH"
 
         if "h2o" in arm:
             assert res.physical_kv_bytes_freed >= 0

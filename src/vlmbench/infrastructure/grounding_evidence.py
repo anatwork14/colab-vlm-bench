@@ -170,9 +170,19 @@ class ECRDLogitsProcessor:
         vocab_size = len(logits)
         reweighted = np.copy(logits)
 
-        # Candidate token exploration: check top-K candidate tokens
+        # Candidate token exploration: check top-K candidate tokens and evidence keywords
         top_k = min(64, vocab_size)
-        top_indices = np.argpartition(-logits, top_k - 1)[:top_k]
+        top_indices = list(np.argpartition(-logits, top_k - 1)[:top_k])
+
+        # Ensure evidence keyword tokens are included in candidate evaluation
+        if hasattr(self.tokenizer, "encode"):
+            for kw in self.evidence_pool._keyword_map.keys():
+                try:
+                    for tid in self.tokenizer.encode(kw):
+                        if 0 <= tid < vocab_size and tid not in top_indices:
+                            top_indices.append(tid)
+                except Exception:
+                    pass
 
         # Map candidate tokens to their matched evidence items
         token_to_evidence: dict[int, list[str]] = {}

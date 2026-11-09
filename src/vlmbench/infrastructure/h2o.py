@@ -94,6 +94,11 @@ class H2OCacheTracker:
 
         # Sum attention received by each key token across queries
         query_sum = weights.sum(axis=1)  # [num_heads, k_len]
+        if query_sum.shape[0] != self.num_kv_heads:
+            # Average query heads belonging to each KV head group (GQA)
+            repeat = query_sum.shape[0] // self.num_kv_heads
+            query_sum = query_sum.reshape(self.num_kv_heads, repeat, k_len).mean(axis=1)
+
         layer.scores[:, :k_len] += query_sum
 
     def compute_eviction_plan(self, layer_idx: int, current_length: int) -> tuple[np.ndarray, dict[str, Any]]:
@@ -138,6 +143,12 @@ class H2OCacheTracker:
         hh_budget = max(0, target_budget - current_retained_count)
         candidate_indices = np.where(~retained)[0]
         if len(candidate_indices) > 0 and hh_budget > 0:
+            # Defensive check: ensure layer.scores covers current_length
+            if layer.scores.shape[1] < current_length:
+                pad_len = current_length - layer.scores.shape[1]
+                layer.scores = np.pad(layer.scores, ((0, 0), (0, pad_len)), mode="constant")
+                layer.evicted_mask = np.pad(layer.evicted_mask, (0, pad_len), mode="constant", constant_values=False)
+
             # Average score across KV heads
             layer_scores = layer.scores[:, :current_length].mean(axis=0)
             candidate_scores = layer_scores[candidate_indices]
@@ -169,6 +180,26 @@ class H2OCacheTracker:
             "kv_bytes_freed": "NOT_MEASURED_LOGICAL_MASK_ONLY",
         }
         return retained, metrics
+
+    def compact_layer_state(self, layer_idx: int, retained_indices: np.ndarray) -> None:
+        """Synchronize tracker cumulative scores and mask with physical KV cache compaction.
+
+        Args:
+            layer_idx: index of full-attention layer compacted.
+            retained_indices: 1D array of retained physical indices.
+        """
+        layer = self.layers[layer_idx]
+        if layer.is_recurrent or len(retained_indices) == 0:
+            return
+
+        max_idx = int(np.max(retained_indices))
+        if layer.scores.shape[1] > max_idx:
+            layer.scores = layer.scores[:, retained_indices]
+            layer.evicted_mask = np.zeros(len(retained_indices), dtype=bool)
+
+        if len(self.visual_token_mask) > max_idx:
+            self.visual_token_mask = self.visual_token_mask[retained_indices]
+        self.seq_len = len(retained_indices)
 
 
 class H2OEvictionPolicy:
