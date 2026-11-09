@@ -117,3 +117,27 @@ def test_da_does_not_fit_target_sparsity():
         )
     finally:
         engine.close()
+
+
+def test_p7_synthetic_adapter_cannot_emit_mtp_acceptance():
+    """Guard (round 2): the synthetic harness must not fabricate MTP acceptance.
+
+    It used to force `accepted = 1 if step % 2 == 0 else 0` and call it verification.
+    It must also be absent from the package's public exports.
+    """
+    import vlmbench.infrastructure as pkg
+    from vlmbench.infrastructure.adapters import InfrastructureRunner
+
+    adapters_src = (Path(__file__).resolve().parents[1]
+                    / "src/vlmbench/infrastructure/adapters.py").read_text()
+    assert "step % 2" not in adapters_src
+    assert "accepted_count = 1" not in adapters_src
+    assert "SevenArmEngine" not in pkg.__all__
+    assert "InfrastructureRunner" not in pkg.__all__
+
+    res = InfrastructureRunner(target_backend="pytorch").run_method_verification(
+        "mtp", max_tokens=6)
+    assert res.execution_classification == "SYNTHETIC_REFERENCE_POLICY_TEST_HARNESS"
+    for step in res.verification_trace["steps"]:
+        assert step.get("mtp_accepted_count") is None, step
+        assert not str(step.get("mtp_action", "")).startswith("commit"), step
