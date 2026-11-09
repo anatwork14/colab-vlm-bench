@@ -8,6 +8,8 @@ score is produced (status BLOCKED_NO_JUDGE).
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from vlmbench.datasets import mmlong_official_scorer as ms
@@ -83,6 +85,10 @@ def test_extracted_answers_must_record_extractor_and_prompt_hash():
 # ITER2 N-3 (REVIEW_ITER2B §3): the official stage-3 label requires the official extraction.
 # A caller-supplied extraction with any model name and any hash must not be labelled official.
 
+# A qualification path that never verifies. Passing it lets the extraction checks run (they come before
+# verification), so each refusal test below exercises its own branch instead of the NO_QUALIFICATION branch.
+UNVERIFIED = Path("never-verified-qualification.json")
+
 RECORD = {"question_id": "q1", "answer": "10", "answer_format": "Int", "evidence_pages": "[3]",
           "evidence_sources": "['Pure-text (Plain-text)']", "doc_type": "Research report / Introduction", }
 
@@ -93,25 +99,30 @@ def test_official_extractor_model_is_the_upstream_default():
 
 
 def test_the_auditor_reproducer_is_not_labelled_official():
-    out = ms.score_records([RECORD], {"q1": ms.ExtractedAnswer("q1", "10", "x", "0" * 64)})
+    out = ms.score_records([RECORD], {"q1": ms.ExtractedAnswer("q1", "10", "x", "0" * 64)}, qualification=UNVERIFIED)
     assert out["status"] == "BLOCKED_NO_JUDGE"
+    assert out["reason"].startswith("extraction is not from the official")
     assert out["official_acc"] is None and out["official_f1"] is None
     assert "overall_acc" not in out
 
 
 def test_right_model_with_a_wrong_prompt_hash_is_not_official():
-    out = ms.score_records([RECORD], {"q1": ms.ExtractedAnswer("q1", "10", "gpt-4o", "0" * 64)})
+    out = ms.score_records([RECORD], {"q1": ms.ExtractedAnswer("q1", "10", "gpt-4o", "0" * 64)}, qualification=UNVERIFIED)
     assert out["status"] == "BLOCKED_NO_JUDGE"
+    assert out["reason"].startswith("extraction is not from the official")
 
 
 def test_right_prompt_hash_with_another_model_is_not_official():
-    out = ms.score_records([RECORD], {"q1": ms.ExtractedAnswer("q1", "10", "gpt-3.5", ms.EXTRACTION_PROMPT_SHA256)})
+    out = ms.score_records([RECORD], {"q1": ms.ExtractedAnswer("q1", "10", "gpt-3.5", ms.EXTRACTION_PROMPT_SHA256)},
+                           qualification=UNVERIFIED)
     assert out["status"] == "BLOCKED_NO_JUDGE"
+    assert out["reason"].startswith("extraction is not from the official")
 
 
 def test_a_question_without_an_extraction_blocks_rather_than_raising_or_scoring():
-    out = ms.score_records([RECORD], {})
+    out = ms.score_records([RECORD], {}, qualification=UNVERIFIED)
     assert out["status"] == "BLOCKED_NO_JUDGE" and out["official_acc"] is None
+    assert out["missing_question_ids"] == ["q1"]
 
 
 def test_the_official_extractor_and_prompt_alone_do_not_produce_the_official_label():
