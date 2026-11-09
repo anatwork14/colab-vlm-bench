@@ -100,9 +100,9 @@ def render_markdown(summary: dict) -> str:
             f"{metric('peak_total_gpu_used_mib')} |"
         )
     lines += [
-        "", "## Matched Base versus MTP", "",
-        "| Dataset | Model | Bin | CCU | Repetitions | Median speedup | 95% bootstrap CI (descriptive) |",
-        "|---|---|---:|---:|---:|---:|---|",
+        "", "## Matched Base versus MTP (throughput; E2E is not used)", "",
+        "| Dataset | Model | Bin | CCU | Repetitions | Mixed-E2E-definition pairs | Median speedup | 95% bootstrap CI (descriptive) |",
+        "|---|---|---:|---:|---:|---:|---:|---|",
     ]
     for x in summary["paired_comparisons"]:
         speed = x["throughput_speedup_median"]
@@ -111,6 +111,7 @@ def render_markdown(summary: dict) -> str:
         ci_label = f"[{ci[0]:.3f}, {ci[1]:.3f}]" if ci else "NOT_ESTIMATED"
         lines.append(f"| {x['dataset']} | {x['model']} | {x['input_length']} | "
                      f"{x['concurrency']} | {x['paired_repetitions']} | "
+                     f"{x['mixed_e2e_definition_pairs']} | "
                      f"{label} | {ci_label} |")
     lines += [
         "", "## Native quality (external official scorer pending)", "",
@@ -134,8 +135,9 @@ def render_markdown(summary: dict) -> str:
     if summary.get("e2e_comparability") == "MIXED_NOT_COMPARABLE":
         lines[-1:-1] = [
             "- E2E: this campaign mixes receipts with and without the client queue wait "
-            "field. Legacy E2E values are withheld (NOT_COMPARABLE). Paired speedups do not "
-            "pool a pair whose two receipts differ.",
+            "field. Legacy E2E values are withheld (NOT_COMPARABLE). Paired throughput "
+            "speedups do not use E2E, so pairs with different E2E definitions are included; "
+            "they are counted in the Mixed-E2E-definition column.",
         ]
     return "\n".join(lines)
 
