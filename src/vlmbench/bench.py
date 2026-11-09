@@ -29,8 +29,26 @@ def quantile(values: list[float], q: float) -> float | None:
     return arr[a] + (arr[b] - arr[a]) * (pos - a)
 
 
+async def admitted_stream(client: httpx.AsyncClient, url: str, request: dict, request_id: str,
+                          semaphore: asyncio.Semaphore, submitted_at: float) -> dict:
+    """Wait for a CCU slot, then stream. E2E counts from submission, not from the slot.
+
+    A user who submitted at ``submitted_at`` experiences the client-side slot wait, so
+    it is added to e2e. TTFT stays HTTP-send based (docs/METRICS.md). Before this fix
+    the slot wait was invisible: a CCU=1 second request reported only its service time.
+    """
+    async with semaphore:
+        acquired_at = perf_counter()
+        result = await stream_completion(client, url, request, request_id)
+    queue_ms = max(0.0, (acquired_at - submitted_at) * 1000)
+    result["client_queue_wait_ms"] = queue_ms
+    if isinstance(result.get("e2e_ms"), (int, float)):
+        result["e2e_ms"] = result["e2e_ms"] + queue_ms
+    return result
+
+
 async def stream_completion(client: httpx.AsyncClient, url: str, request: dict, request_id: str) -> dict:
-    start = perf_counter()
+    start = perf_counter()  # HTTP send: service-side timing origin
     first_token_at = None
     emitted_chunks = 0
     output_text = []
@@ -170,18 +188,20 @@ async def run_performance_cell(
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             async def one(sample, phase):
+                submitted_at = perf_counter()
                 try:
-                    async with semaphore:
-                        payload = request_payload(sample, model_id=model_id,
-                                                  max_tokens=cell["output_tokens"],
-                                                  streaming=True, fixed_output=True)
-                        result = await stream_completion(client, url, payload, str(sample["id"]))
+                    payload = request_payload(sample, model_id=model_id,
+                                              max_tokens=cell["output_tokens"],
+                                              streaming=True, fixed_output=True)
+                    result = await admitted_stream(client, url, payload, str(sample["id"]),
+                                                   semaphore, submitted_at)
                 except asyncio.CancelledError:
                     request_evidence.append({"id": str(sample["id"]), "phase": phase,
                                              "status": "CANCELLED", "output_tokens": None})
                     raise
                 except (WorkloadError, OSError, ValueError, httpx.HTTPError) as exc:
                     result = {"id": str(sample["id"]), "status": "ERROR", "output_tokens": None,
+                              "client_queue_wait_ms": None,
                               "error": f"{type(exc).__name__}: {exc}"}
                 request_evidence.append({**result, "phase": phase})
                 return result
@@ -228,6 +248,11 @@ async def run_performance_cell(
         "e2e_p50_ms": quantile([x["e2e_ms"] for x in valid], 0.50),
         "e2e_p95_ms": quantile([x["e2e_ms"] for x in valid], 0.95),
         "e2e_p99_ms": quantile([x["e2e_ms"] for x in valid], 0.99),
+        # Client-side wait for a CCU slot before the HTTP send (included in e2e).
+        "client_queue_wait_p50_ms": quantile(
+            [x["client_queue_wait_ms"] for x in valid if x.get("client_queue_wait_ms") is not None], 0.50),
+        "client_queue_wait_p95_ms": quantile(
+            [x["client_queue_wait_ms"] for x in valid if x.get("client_queue_wait_ms") is not None], 0.95),
         "actual_effective_prompt_tokens_p50": quantile(
             [x["input_tokens_reported"] for x in valid
              if isinstance(x["input_tokens_reported"], int)], 0.50),
@@ -257,7 +282,7 @@ async def run_performance_cell(
         "metrics": metric,
         "notes": [
             "Fixed length request count checked against per-request streaming usage.completion_tokens",
-            "TTFT based on first streamed content chunk; TPOT derived from stream interval/output token count",
+            "TTFT from HTTP send to first streamed content chunk; E2E from submission (includes client CCU-slot queue wait); TPOT from stream interval/output token count",
             "nvidia-smi total MiB is not KV resident memory",
         ],
     }

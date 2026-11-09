@@ -13,15 +13,16 @@ Metrics are divided into quality, evidence-grounded hallucination, end-to-end se
 | False refusal rate / answer coverage | abstention on answerable items; fraction of requests actually answered | independent answerability + abstention labels | native |
 | Judge coverage, unverifiable count | annotated / expected; unknowns kept separate | frozen manifest and judge revision | native |
 | Proxy EM / token F1 | normalized exact match and overlap, failures count zero | references held evaluator-only | auxiliary only |
-| TTFT | HTTP arrival to first nonempty streamed content chunk | streaming server + client clock | serving |
+| TTFT | HTTP send to first nonempty streamed content chunk (service-side; excludes client CCU-slot wait) | streaming server + client clock | serving |
 | TPOT | (response finish - first content)/ (actual generated tokens-1) | completion usage metadata | serving |
 | ITL | inter-token emission intervals, not SSE message intervals | engine token-level instrumentation | NOT_MEASURED currently |
-| E2E p50/p95/p99 | request admission to completed streamed response | client clock | serving |
+| E2E p50/p95/p99 | submission (before waiting for a CCU slot) to completed streamed response; **includes client-side slot wait** (`client_queue_wait_ms`) | client clock | serving |
+| Client queue wait p50/p95 | submission to CCU-slot acquisition, before the HTTP send; reported separately so E2E can be decomposed | client clock | serving |
 | Throughput | committed *successful user-facing* output tokens / wall clock | verified completion_tokens | serving |
 | Requests/s | successful requests / complete measured-cell wall clock | per request PASS | serving |
 | Offered CCU | max simultaneous in-flight client requests | client concurrency semaphore | serving |
 | Active GPU sequences | actual running sequences, queued requests | vLLM scheduler metrics | NOT_MEASURED currently |
-| Peak VRAM | max sampled nvidia-smi total used device MiB | nvidia-smi interval | serving |
+| Peak VRAM | max sampled nvidia-smi total used MiB, summed over visible devices (0.5 s sampling; transient peaks between samples can be missed; includes CUDA context/cache, not allocated bytes). `parse_failures` / `query_failures` are reported; a non-zero count means the peak is not trustworthy | nvidia-smi interval | serving |
 | Physical KV read/resident bytes | kernel/cache allocator measured bytes | internal backend instrumentation | NOT_MEASURED currently |
 | MTP acceptance rate | accepted drafts / proposed drafts | engine trace + correct accounting | NOT_MEASURED currently |
 
