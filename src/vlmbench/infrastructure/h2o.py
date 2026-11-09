@@ -7,7 +7,8 @@ Implements:
 2. Dynamic budget split: Heavy Hitters (K_hh) + Recent Local Window (W_r).
 3. Protection of special tokens and visual token blocks.
 4. Immunity for linear recurrent / DeltaNet layers (only full-attention layers are evicted).
-5. MTP transactional state machine: begin -> propose -> verify -> commit / rollback.
+5. MTP transactional state machine (begin -> propose -> verify -> commit / rollback). Used ONLY by
+   the synthetic policy harness (adapters.py). NOT used by the real engine, which keeps no H2O MTP transaction.
 6. Exact memory attribution: distinguishing virtual mask savings from physical block reclamation.
 """
 from __future__ import annotations

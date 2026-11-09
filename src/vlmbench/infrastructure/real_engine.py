@@ -1,32 +1,34 @@
 """Real PyTorch Neural Model & Official Transformers Hooking Engine for Seven-Arm Benchmarking.
 
-Closes the gap between synthetic policy harnesses and production neural execution:
-1. Official Pretrained Architecture & Hooking (P0-01):
-   - Hooks official Hugging Face `Qwen3_5ForConditionalGeneration` (473 base VL tensors,
-     852,985,920 parameters) and `Qwen35MTPModule` (15 MTP tensors, 20,452,864 parameters)
-     achieving 100% tensor coverage (488/488 tensors) and 100% parameter coverage.
-   - Verifies one-step logits parity (max_abs_logits_diff == 0.0) against unhooked official HF model.
-   - Retains lightweight reference scaffold strictly labeled as `PARTIALLY_WEIGHTED_PYTORCH_REFERENCE`
-     or `PYTORCH_ARCHITECTURAL_SCAFFOLD_UNWEIGHTED` when unhooked.
-2. Genuine Multimodal Inference Per Arm (P0-02):
-   - Processes real image bytes (`000000039769.png`) through official `AutoProcessor`
-     (`pixel_values`, `image_grid_thw`, `mm_token_type_ids`) and ViT vision encoder
-     for every arm (`base`, `h2o_base`, `da_base`, `ecrd_base`, `mtp`, `h2o_mtp`, `da_mtp`).
+What this module does, and what it does NOT establish (see docs/engine/P7_ENGINE_AUDIT_20261109.md):
+1. Official checkpoint loading (P0-01):
+   - Loads the official HF `Qwen3_5ForConditionalGeneration` and the `Qwen35MTPModule` head.
+   - Tensor and parameter coverage are computed at load time and reported in
+     `pretrained_weight_summary`. A full-coverage load is required for `is_official_hf_hooked`.
+   - Partial coverage keeps the scaffold labels (`PARTIALLY_WEIGHTED_PYTORCH_REFERENCE`) and
+     never reports the real-forward gate as PASS.
+2. Multimodal inputs per arm (P0-02):
+   - Processes real image bytes through the official `AutoProcessor` and the ViT encoder for
+     the arms that take an image.
    - Records `visual_encoder_trace` (`pixel_values_shape`, `visual_token_embeddings_count`).
-3. Physical KV Cache Reclamation (H2O):
-   - Computes real softmax attention weights from model forward passes.
-   - Executes physical tensor slicing/compaction on CUDA/CPU KV caches (`DynamicLayer`).
-   - Exempts DeltaNet recurrent states (`LinearAttentionLayer`) and protects visual tokens.
-4. Declarative Attention Cost Accounting (P1-03):
+3. H2O KV eviction (physical compaction on full-attention layers):
+   - Computes attention weights from forward passes and compacts `DynamicCache` tensors.
+   - DeltaNet recurrent layers are exempt. Protected (sink and visual) tokens sit outside the budget.
+   - Reports retained and evicted slots. No physical VRAM saving is measured.
+4. Declarative attention (DA) cost accounting:
    - Injects 2D boolean read masks into attention logits before softmax.
-   - Labels sparsity metric strictly as `attention_mask_restriction_ratio` (logical mask restriction
-     estimate), never claiming physical KV-read saving or HBM traffic reduction
-     (`physical_kv_bytes_freed = 0`, `100%` KV residency preserved).
-5. Production ECRD Logits Processing & MTP Speculative Rollback:
-   - Full-vocabulary [B, 248320] ECRD logits processor (`is_argmax_invariant() -> False`).
-   - Authentic 15-tensor MTP drafting, verification, and bit-exact `DynamicCache` rollback.
-6. Multi-Request Concurrency Isolation (CCU > 1):
-   - Independent request slots and thread-local hook contexts ensuring zero state pollution.
+   - Reports `attention_mask_restriction_ratio` as a logical estimate. No KV-read saving or HBM
+     traffic reduction is claimed.
+5. MTP (multi-token prediction) in this module:
+   - The serving-style `mtp` arm proposes drafts for diagnostics only and commits none. It does not
+     verify them. Its candidate-vs-target agreement is not an acceptance rate.
+   - Verifier-derived greedy k=1 acceptance and KV/DeltaNet-state rollback exist only in
+     `RealSevenArmEngine._speculative_mtp_greedy_k1`. It is labelled
+     `cpu_greedy_k1_reference_not_vllm_mtp`. `execute_request` does not call it.
+   - Native vLLM MTP is not verified here.
+6. ECRD logits processing: a full-vocabulary logits processor (`is_argmax_invariant() -> False`).
+7. Concurrency: a CPU test covers one H2O arm against sequential runs. Hook context is thread-local
+   and the official forward is serialised on a lock. Broader isolation is NOT proven.
 """
 from __future__ import annotations
 
@@ -1618,7 +1620,9 @@ class RealSevenArmEngine:
         # verifier-derived CPU reference lives in _speculative_mtp_greedy_k1 and is
         # labelled cpu_greedy_k1_reference_not_vllm_mtp.
         mtp_acc_rate: float | None = None
-        mtp_proposal_match_rate = (
+        # Candidate-vs-committed-target agreement. NOT an acceptance rate: no draft is committed
+        # or verified by a speculative step in this serving arm (R4-2).
+        mtp_proposal_target_agreement = (
             mtp_matched_total / mtp_proposed_total if mtp_proposed_total else None
         )
         if "da" in self.method_arm:
@@ -1717,10 +1721,17 @@ class RealSevenArmEngine:
                     "classification": "REFERENCE_DRAFT_NO_PERSISTENT_MTP_KV_NO_SPECULATIVE_SERVING",
                     "position_ids_are_absolute": self.is_official_hf_hooked,
                     "persistent_mtp_kv_history": False,
-                    "proposal_match_rate_publishable": False,
+                    "proposal_target_agreement_publishable": False,
+                    "proposal_target_agreement_is_acceptance": False,
                     "proposals_verified": mtp_proposed_total,
                     "proposals_matching_target": mtp_matched_total,
-                    "proposal_match_rate": mtp_proposal_match_rate,
+                    "proposal_target_agreement_diagnostic": mtp_proposal_target_agreement,
+                    "cpu_greedy_k1_reference": {
+                        "label": self.CPU_GREEDY_K1_LABEL,
+                        "run_in_this_request": False,
+                        "entry_point": "RealSevenArmEngine._speculative_mtp_greedy_k1",
+                        "note": "Verifier-derived acceptance exists only in that helper; this serving arm does not call it.",
+                    },
                     "committed_draft_tokens": 0,
                     "native_target_verifier_executed": False,
                     "speculative_speedup_claimed": False,
