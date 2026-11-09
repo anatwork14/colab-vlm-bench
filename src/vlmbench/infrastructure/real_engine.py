@@ -858,18 +858,31 @@ class Qwen35NeuralModel(nn.Module):
         }
 
 
-def _da_scripted_tags(anchor_len: int, phys_len: int, n_visual: int, image_present: bool) -> list[DATag]:
+DA_DECODE_ONLY_LABEL = "decode_only_scripted_da_diagnostic"
+
+
+def _da_scripted_tags(
+    anchor_len: int, phys_len: int, n_visual: int, image_present: bool,
+    question_start: int | None = None,
+) -> list[DATag]:
     """SCRIPTED DA diagnostic geometry, fixed from the prompt anchor.
 
     Sink, focus and visual-segment bounds are computed ONCE from the prefill length, so
     the prompt region keeps the same tag class at every decode step. Only the trailing
     LOCAL window moves with the generated suffix (phys_len). Deriving the bounds from the
     growing KV length instead reclassified prompt keys between steps.
+
+    DOCUMENTED DEVIATION: when question_start is given (image prompts: the span after the
+    last vision_end token), that question/instruction span is GLOBAL, so every query can
+    read it. Without this the LOCAL window hid question tokens from the newest query.
+    Text-only prompts have no question split, so no deviation is applied to them.
     """
     sink_end = min(16, max(1, anchor_len // 4))
     if not n_visual and image_present:
         n_visual = min(4, max(0, anchor_len - sink_end - 1))
     tags = [DATag(DATagType.GLOBAL, start_idx=0, end_idx=sink_end)]
+    if question_start is not None and question_start < anchor_len:
+        tags.append(DATag(DATagType.GLOBAL, start_idx=question_start, end_idx=anchor_len))
     if anchor_len > sink_end + 1:
         focus_end = min(anchor_len - 1, sink_end + max(1, n_visual))
         tags.append(DATag(
@@ -1257,6 +1270,9 @@ class RealSevenArmEngine:
         recurrent_s: list[Any] | None = None
         da_anchor_len = len(full_prompt)  # DA geometry is anchored to the prefill, not the growing KV
         da_n_visual = int(vis_trace.get("visual_token_embeddings_count", 0))
+        da_question_start: int | None = None
+        if image_present and self.config.vision_end_token_id in full_prompt:
+            da_question_start = len(full_prompt) - 1 - full_prompt[::-1].index(self.config.vision_end_token_id) + 1
 
         tokens_generated: list[int] = []
         step_latencies: list[float] = []
@@ -1346,6 +1362,7 @@ class RealSevenArmEngine:
                 da_tags = _da_scripted_tags(
                     anchor_len=da_anchor_len, phys_len=phys_kv_len,
                     n_visual=da_n_visual, image_present=image_present,
+                    question_start=da_question_start,
                 )
 
                 raw_mask = self.da_mask_gen.generate_attention_mask(
@@ -1554,6 +1571,12 @@ class RealSevenArmEngine:
                     "full_causal_mask_area_restriction_ratio": round(final_da_causal_area_ratio, 4),
                     "focus_visual_evidence_kept": bool(image_present),
                     "da_scope_provenance": "SCRIPTED_SEGMENT_DIAGNOSTIC_NOT_MODEL_DECLARED",
+                    "result_label": DA_DECODE_ONLY_LABEL,
+                    "nontrivial_masking_exercised": bool(final_da_restriction_ratio > 0.0),
+                    "prefill_masked": False,
+                    "deviations_from_scripted_geometry": (
+                        ["question_span_global"] if da_question_start is not None else []
+                    ),
                     "original_paper_protocol_qualified": False,
                     "physical_kv_bytes_freed": 0 if "da" in self.method_arm else total_physical_freed,
                     "kv_residency_preserved_ratio": 1.0 if "da" in self.method_arm else round(1.0 - final_logical_fraction, 4),

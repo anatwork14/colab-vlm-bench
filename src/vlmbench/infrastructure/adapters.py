@@ -427,6 +427,7 @@ class SevenArmEngine:
 
         if self.da_mask_gen is not None and "da_read_ratio" in prep_meta:
             verification_trace["final_da_read_ratio"] = prep_meta["da_read_ratio"]
+            verification_trace["final_da_label"] = "SYNTHETIC_PROMPT_MASK_STATS_NOT_DECODE_ONLY_DIAGNOSTIC"
 
         output_text = f"Decoded {len(tokens_generated)} tokens via {self.method_arm}"
 
