@@ -60,7 +60,8 @@ def test_all_passing_tests_give_measured_labels():
     assert gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS"
     assert gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS"
     assert gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS"
-    assert gates["CCU_REQUEST_ISOLATION_TEST_PASS"] == "PASS"
+    assert gates["PYTORCH_THREAD_CITATION_LEAK_CHECK"] == "PASS"
+    assert "CCU_REQUEST_ISOLATION_TEST_PASS" not in gates
     # engine-reported gates are carried through only when every arm agrees
     assert gates["ACTUAL_BACKEND_HOOK_PASS"] == ENGINE_GATES["ACTUAL_BACKEND_HOOK_PASS"]
     assert gates["MTP_CORRECTNESS_PASS"] == ENGINE_GATES["MTP_CORRECTNESS_PASS"]
@@ -242,3 +243,54 @@ def test_an_mtp_arm_reporting_not_applicable_leaves_the_mtp_gate_not_tested():
     tests["test_d_seven_arms"]["arms"]["h2o_mtp"]["gates"]["MTP_CORRECTNESS_PASS"] = "NOT_APPLICABLE"
     gates = qual.compute_release_gates(tests, device_name=GPU)
     assert gates["MTP_CORRECTNESS_PASS"] == "NOT_TESTED"
+
+
+# ITER2 G-2 (REVIEW_ITER2 §4): Test G checks PyTorch-thread citation leakage and token equality with
+# solo runs. It is not multi-request serving isolation; CCU_ISOLATION_PASS stays GATED per engine result.
+
+def test_token_check_passes_when_every_concurrent_output_equals_its_solo_output():
+    solo = {"r0": [1, 2, 3], "r1": [4, 5]}
+    conc = {"r0": [1, 2, 3], "r1": [4, 5]}
+    assert qual.token_isolation_check(solo, conc) == {"pass": True, "compared": 2, "mismatches": []}
+
+
+def test_token_check_names_the_request_whose_tokens_differ():
+    solo = {"r0": [1, 2, 3], "r1": [4, 5]}
+    conc = {"r0": [1, 2, 3], "r1": [4, 6]}
+    result = qual.token_isolation_check(solo, conc)
+    assert result["pass"] is False
+    assert result["mismatches"] == ["r1: tokens differ"]
+
+
+def test_token_check_fails_on_a_missing_or_extra_request():
+    solo = {"r0": [1], "r1": [2]}
+    assert qual.token_isolation_check(solo, {"r0": [1]})["mismatches"] == ["r1: missing concurrent output"]
+    assert qual.token_isolation_check(solo, {"r0": [1], "r1": [2], "r9": [3]})["pass"] is False
+
+
+def test_token_check_is_not_vacuous():
+    assert qual.token_isolation_check({}, {})["pass"] is False
+    assert qual.token_isolation_check({"r0": []}, {"r0": []})["pass"] is False
+
+
+def test_citation_leak_check_accepts_citations_only_to_the_request_own_evidence():
+    expected = {"req_0": {"ev_0"}, "req_1": {"ev_1"}}
+    cits = {"req_0": [{"evidence_ids": ["ev_0"]}], "req_1": [{"evidence_ids": ["ev_1"]}]}
+    assert qual.citation_leak_violations(cits, expected) == []
+
+
+def test_citation_leak_check_reports_a_cross_request_citation():
+    expected = {"req_0": {"ev_0"}, "req_1": {"ev_1"}}
+    cits = {"req_0": [{"evidence_ids": ["ev_0", "ev_1"]}], "req_1": [{"evidence_ids": ["ev_1"]}]}
+    assert qual.citation_leak_violations(cits, expected) == ["req_0 cited ev_1"]
+
+
+def test_citation_leak_check_requires_each_request_to_cite_something():
+    expected = {"req_0": {"ev_0"}}
+    assert qual.citation_leak_violations({"req_0": []}, expected) == ["req_0: no grounded citations"]
+
+
+def test_old_ccu_gate_name_is_gone_from_the_script():
+    source = SCRIPT.read_text(encoding="utf8")
+    assert "CCU_REQUEST_ISOLATION_TEST_PASS" not in source
+    assert "PYTORCH_THREAD_CITATION_LEAK_CHECK" in source
