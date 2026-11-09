@@ -233,6 +233,11 @@ class H2OCacheTracker:
         }
         return retained, metrics
 
+    def unprotected_count(self, layer_idx: int, length: int) -> int:
+        """Number of UNPROTECTED (text-side) positions among the first `length` physical slots."""
+        layer = self.layers[layer_idx]
+        return int(length - np.sum(self._protected_mask(layer, length)))
+
     def compact_layer_state(self, layer_idx: int, retained_indices: np.ndarray) -> None:
         """Synchronize tracker cumulative scores and mask with physical KV cache compaction.
 

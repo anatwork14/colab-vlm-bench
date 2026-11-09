@@ -1485,6 +1485,8 @@ class RealSevenArmEngine:
         h2o_cumulative_evicted_slots: int | None = None  # None until a decode step runs
         h2o_slots_at_prefill: int | None = None
         h2o_last_step_retained_slots: int | None = None
+        h2o_unprotected_prefill_slots: int | None = None
+        h2o_last_step_unprotected_retained: int | None = None
         final_da_restriction_ratio: float | None = None  # None until a decode step builds a mask
         final_da_causal_area_ratio: float | None = None
         da_measured_masked_entries: int | None = None    # None = no hooked decode measurement
@@ -1530,6 +1532,10 @@ class RealSevenArmEngine:
             for l_idx in self.config.full_attention_layers:
                 tracker.initialize_budget(l_idx, len(full_prompt))
             h2o_slots_at_prefill = len(self.config.full_attention_layers) * len(full_prompt)
+            h2o_unprotected_prefill_slots = sum(
+                tracker.unprotected_count(l_idx, len(full_prompt))
+                for l_idx in self.config.full_attention_layers
+            )
 
         # Feed prefill attention scores into H2O tracker
         if tracker is not None:
@@ -1593,6 +1599,7 @@ class RealSevenArmEngine:
                 step_evicted = 0
                 step_total = 0
                 step_retained = 0
+                step_unprotected_retained = 0
                 for l_idx in self.config.full_attention_layers:
                     if self.model.hf_forward_active and past_kv is not None:
                         k_phys_len = past_kv.layers[l_idx].keys.shape[2] + 1
@@ -1606,10 +1613,12 @@ class RealSevenArmEngine:
                     step_evicted += metrics["evicted_tokens"]
                     step_total += metrics["total_tokens"]
                     step_retained += metrics["retained_tokens"]
+                    step_unprotected_retained += metrics["unprotected_retained"]
                 # Per-step rate over full-attention layers (last step only), plus cumulative
                 # evicted slots over all steps. Layers may have different compacted lengths.
                 h2o_cumulative_evicted_slots = (h2o_cumulative_evicted_slots or 0) + step_evicted
                 h2o_last_step_retained_slots = step_retained
+                h2o_last_step_unprotected_retained = step_unprotected_retained
                 h2o_per_step_rate = step_evicted / step_total if step_total else 0.0
 
             # Compute 3D RoPE position_ids for decode step when using official HF model
@@ -1718,6 +1727,11 @@ class RealSevenArmEngine:
             if h2o_last_step_retained_slots is not None and h2o_slots_at_prefill
             else None
         )
+        h2o_text_side_retained_fraction = (
+            h2o_last_step_unprotected_retained / h2o_unprotected_prefill_slots
+            if h2o_last_step_unprotected_retained is not None and h2o_unprotected_prefill_slots
+            else None
+        )
         decoded_str = ""
         if self.tokenizer is not None and hasattr(self.tokenizer, "decode"):
             try:
@@ -1774,6 +1788,15 @@ class RealSevenArmEngine:
                     "cumulative_evicted_slots": h2o_cumulative_evicted_slots,  # all decode steps, full-attention layers
                     "cumulative_total_slots_at_prefill": h2o_slots_at_prefill,  # full-attention layers x prompt length
                     "final_retained_fraction": h2o_final_retained_fraction,  # retained after last step / prefill slots
+                    "unprotected_prefill_slots": h2o_unprotected_prefill_slots,  # text-side population at prefill
+                    "unprotected_retained_slots_last_step": h2o_last_step_unprotected_retained,
+                    "text_side_retained_fraction": h2o_text_side_retained_fraction,
+                    "total_retention_near_1_expected_on_vlm_prompts": True,
+                    "total_retention_interpretation": (
+                        "EXPECTED on VLM prompts: the protected visual block is kept whole, so the total "
+                        "final_retained_fraction is near 1.0 by construction. Use text_side_retained_fraction "
+                        "for any text-side retention statement. Not a KV-compression result."
+                    ),
                     "physical_vram_saving_claimed": False,
                     "protected_vision_tokens_in_prompt": int(
                         sum(1 for t in full_prompt if t in (
