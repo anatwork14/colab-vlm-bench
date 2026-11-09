@@ -72,18 +72,22 @@ def get_qualification_tokenizer(model_dir: Path | str | None = None) -> Any:
     return DeterministicSimpleTokenizer()
 
 
-def snapshot_directory_state(path: Path) -> dict[str, tuple[int, int]]:
-    """Capture relative path -> (size, mtime_ns) for all files in a directory."""
+def snapshot_directory_state(path: Path, subdirs: list[Path] | None = None) -> dict[str, tuple[int, int]]:
+    """Capture relative path -> (size, mtime_ns) for files under path or specific subdirs."""
     snapshot: dict[str, tuple[int, int]] = {}
     if not path.is_dir():
         return snapshot
-    for p in path.rglob("*"):
-        try:
-            st = p.stat()
-            rel = str(p.relative_to(path))
-            snapshot[rel] = (st.st_size, st.st_mtime_ns)
-        except OSError:
-            pass
+    targets = [path / s for s in subdirs] if subdirs else [path]
+    for target in targets:
+        if not target.is_dir():
+            continue
+        for p in target.rglob("*"):
+            try:
+                st = p.stat()
+                rel = str(p.relative_to(path))
+                snapshot[rel] = (st.st_size, st.st_mtime_ns)
+            except OSError:
+                pass
     return snapshot
 
 
@@ -645,8 +649,11 @@ def qualify_all_drive_assets(
     if tolerance <= 0.0 or tolerance > 0.05:
         raise ValueError(f"tolerance must be strictly in (0.0, 0.05], got {tolerance}")
 
+    asset_subdirs = [LEGACY_DATASET_REL, LEGACY_MODEL_REL]
+    subdirs_to_check = [s for s in asset_subdirs if (root / s).is_dir()] or None
+
     # Capture read-only snapshot before qualification
-    snapshot_before = snapshot_directory_state(root)
+    snapshot_before = snapshot_directory_state(root, subdirs=subdirs_to_check)
 
     models_res = qualify_qwen_models(
         root, compute_shards_sha=compute_shards_sha
@@ -659,7 +666,7 @@ def qualify_all_drive_assets(
     )
 
     # Verify read-only guarantee
-    snapshot_after = snapshot_directory_state(root)
+    snapshot_after = snapshot_directory_state(root, subdirs=subdirs_to_check)
     if snapshot_before != snapshot_after:
         added = set(snapshot_after.keys()) - set(snapshot_before.keys())
         removed = set(snapshot_before.keys()) - set(snapshot_after.keys())

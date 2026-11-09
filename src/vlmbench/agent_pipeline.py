@@ -364,7 +364,8 @@ def execute(job: dict) -> dict:
         # A read-only, CPU-only dataset/model qualification action.
         drive_root = Path(job.get("drive_root", "/content/drive/MyDrive"))
         tolerance = float(job.get("tolerance", 0.05))
-        return qualify_all_drive_assets(drive_root, tolerance=tolerance)
+        compute_shards = bool(job.get("compute_shards_sha", False))
+        return qualify_all_drive_assets(drive_root, tolerance=tolerance, compute_shards_sha=compute_shards)
     if action == "prepare":
         return prepare(job)
     if action == "annotate":
