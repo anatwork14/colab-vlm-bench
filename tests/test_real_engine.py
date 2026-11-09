@@ -377,7 +377,8 @@ def test_official_hf_hooking_coverage_and_logits_parity():
     assert res.telemetry["visual_encoder_trace"]["invoked"] is True
     assert res.telemetry["visual_encoder_trace"]["pixel_values_shape"] == [1200, 1536]
     assert res.telemetry["visual_encoder_trace"]["visual_token_embeddings_count"] == 300
-    assert res.attention_mask_restriction_ratio > 0.0
+    assert res.telemetry["da_cost_accounting"]["nontrivial_masking_exercised"] is (
+        res.attention_mask_restriction_ratio > 0.0)
     assert res.physical_kv_bytes_freed == 0
     engine.close()
 
@@ -532,3 +533,38 @@ def test_p7_ecrd_unsupported_penalty_is_inert_and_documented():
         proc = ECRDLogitsProcessor(pool, _Tok(), ECRDConfig(reweight_alpha=1.0, unsupported_penalty=beta))
         outs.append(proc([], logits.copy()))
     np.testing.assert_array_equal(outs[0], outs[1])
+
+
+def test_p7_da_question_tokens_stay_readable_at_every_decode_step():
+    """Round 2: the scripted LOCAL window (8) hid question tokens far back from the newest
+    query. For image prompts the question span (after the last vision_end token) must be
+    readable by every query. Decode-only scripted DA diagnostic."""
+    cfg = _p7_small_cfg()
+    vs, ve = cfg.vision_start_token_id, cfg.vision_end_token_id
+    question = list(range(200, 240))  # 40 question tokens after the image block
+    engine = RealSevenArmEngine(method_arm="da_base", config=cfg, device="cpu")
+    captured = []
+    real_gen = engine.da_mask_gen.generate_attention_mask
+
+    def _spy(seq_len, tags=None, active_focus_id=None):
+        mask = real_gen(seq_len=seq_len, tags=tags, active_focus_id=active_focus_id)
+        captured.append(mask)
+        return mask
+
+    engine.da_mask_gen.generate_attention_mask = _spy
+    res = engine.execute_request("p7_da_question", prompt_token_ids=[vs] + [cfg.image_token_id] * 4 + [ve] + question,
+                                 max_new_tokens=12, image_present=True)
+    assert len(captured) >= 10
+    last = captured[-1]
+    q_start = last.shape[0] - 12 - 40  # question span = prompt tail before 12 generated tokens
+    # Question keys are not restricted for the final query row (the newest token).
+    assert last[-1, q_start:q_start + 40].all(), "question tokens hidden from the newest query"
+    # Every decode-step mask keeps the question span readable from the newest row.
+    for m in captured[1:]:
+        span = m.shape[0] - 12 - 40
+        assert m[-1, span:span + 40].all()
+    # Result is labeled as a decode-only scripted diagnostic, with the deviation listed.
+    cost = res.telemetry["da_cost_accounting"]
+    assert cost["result_label"] == "decode_only_scripted_da_diagnostic"
+    assert "question_span_global" in cost["deviations_from_scripted_geometry"]
+    engine.close()

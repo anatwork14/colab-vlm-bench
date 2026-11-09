@@ -619,3 +619,10 @@ def test_p7_ecrd_does_not_boost_substring_token_in_logits():
     assert out[5] == pytest.approx(1.0), "substring token was boosted by evidence keyword"
     assert out[6] == pytest.approx(3.0), "whole-word token must still be boosted by alpha"
     assert int(np.argmax(out)) == 6
+
+
+def test_p7_adapter_da_numbers_carry_scope_label():
+    """DA numbers from the synthetic harness must not read as decode-only scripted results."""
+    res = InfrastructureRunner(target_backend="pytorch").run_method_verification("da_base", max_tokens=4)
+    assert "final_da_read_ratio" in res.verification_trace
+    assert res.verification_trace["final_da_label"] == "SYNTHETIC_PROMPT_MASK_STATS_NOT_DECODE_ONLY_DIAGNOSTIC"
