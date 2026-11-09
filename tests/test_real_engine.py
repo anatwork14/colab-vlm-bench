@@ -1179,3 +1179,16 @@ def test_r5_non_mtp_arm_reports_no_speculation_without_mtp_label():
         engine.close()
     assert res.telemetry["speculation_executed"] is False
     assert res.telemetry["arm_label"] == "non_speculative_arm"
+
+
+# --- R5-6 (auditor R4 §5.6): stale names in docs ---
+
+def test_r5_docs_do_not_use_stale_proposal_match_rate_name():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "docs"
+    for name in ("MTP_DA_UPSTREAM_CONTRACT_AUDIT.md", "NUMERIC_INTEGRITY_AUDIT_20261109.md"):
+        text = (root / name).read_text(encoding="utf8")
+        assert "proposal_match_rate" not in text, f"{name} still uses the retired name"
+        assert "mtp_acceptance_rate=0" not in text, f"{name} still states acceptance 0 (now None)"
+    mtp_doc = (root / "MTP_DA_UPSTREAM_CONTRACT_AUDIT.md").read_text(encoding="utf8")
+    assert "proposal_target_agreement_diagnostic" in mtp_doc
