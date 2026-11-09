@@ -1,0 +1,29 @@
+# Outputs captured 2026-11-09 (numpy-only; interpreter: wt/OPUSV2/.venv/bin/python, read-only use)
+## h2o_compound_sim.py (no visual protection, repo tracker budget_ratio=0.5)
+step   1: cache_len_before_eviction= 301 retained_after= 150 ratio_vs_prev=0.498
+step   2: cache_len_before_eviction= 151 retained_after=  75 ratio_vs_prev=0.497
+step   3: cache_len_before_eviction=  76 retained_after=  38 ratio_vs_prev=0.500
+step   5: cache_len_before_eviction=  33 retained_after=  32 ratio_vs_prev=0.970
+step  10: cache_len_before_eviction=  33 retained_after=  32 ratio_vs_prev=0.970
+step  20: cache_len_before_eviction=  33 retained_after=  32 ratio_vs_prev=0.970
+step  50: cache_len_before_eviction=  33 retained_after=  32 ratio_vs_prev=0.970
+step 100: cache_len_before_eviction=  33 retained_after=  32 ratio_vs_prev=0.970
+step 200: cache_len_before_eviction=  33 retained_after=  32 ratio_vs_prev=0.970
+final cached length: 32  start: 300
+## h2o_compound_sim_visual.py (200 protected visual tokens)
+step   1: cache_len_before_eviction= 301 retained_after= 234 ratio_vs_prev=0.777
+step   2: cache_len_before_eviction= 235 retained_after= 227 ratio_vs_prev=0.966
+step   3: cache_len_before_eviction= 228 retained_after= 226 ratio_vs_prev=0.991
+step   5: cache_len_before_eviction= 227 retained_after= 226 ratio_vs_prev=0.996
+step  10: cache_len_before_eviction= 227 retained_after= 226 ratio_vs_prev=0.996
+step  20: cache_len_before_eviction= 227 retained_after= 226 ratio_vs_prev=0.996
+step  50: cache_len_before_eviction= 227 retained_after= 226 ratio_vs_prev=0.996
+step 100: cache_len_before_eviction= 227 retained_after= 226 ratio_vs_prev=0.996
+step 200: cache_len_before_eviction= 227 retained_after= 226 ratio_vs_prev=0.996
+final cached length: 226  start: 300
+## da_scripted_sim.py (text-only scripted tags, mirrors real_engine.py:1302-1320)
+text-only L=100: last-row readable keys=25 -> indices 0..99 ; question-region keys (16..L-9) readable: 0
+text-only L=400: last-row readable keys=25 -> indices 0..399 ; question-region keys (16..L-9) readable: 0
+## ecrd_substring_sim.py (keyword 'red'; token 'reduce'; raw argmax 'green')
+alpha=1.5: argmax='reduce' (raw argmax green); citations=[{'step': 0, 'token_id': 0, 'token_str': 'reduce', 'evidence_ids': ['e1']}]
+alpha=20.0: argmax='reduce' (raw argmax green); citations=[{'step': 0, 'token_id': 0, 'token_str': 'reduce', 'evidence_ids': ['e1']}]
