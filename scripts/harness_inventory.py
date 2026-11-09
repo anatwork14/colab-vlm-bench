@@ -261,6 +261,10 @@ def probe_weights(model_dir: Path, manifest_path: Path | None, *, hash_files: bo
     config = model_dir / "config.json"
     if not (model_dir.is_dir() and config.is_file()):
         return result
+    # C-1 (R1): a config alone is not weights. A shard counts only when it is a non-empty safetensors file.
+    weight_files = {p.name for p in model_dir.glob("*.safetensors") if p.is_file() and p.stat().st_size > 0}
+    if not weight_files:
+        return result
     result["present"] = True
     try:
         cfg = json.loads(config.read_text(encoding="utf8"))
@@ -274,8 +278,11 @@ def probe_weights(model_dir: Path, manifest_path: Path | None, *, hash_files: bo
     manifest_bytes = manifest_path.read_bytes()
     result["manifest_pinned"] = bool(pinned_manifest_sha256) and sha256_hex(manifest_bytes) == pinned_manifest_sha256
     files = json.loads(manifest_bytes.decode("utf8"))["files"]
-    weight_files = {p.name for p in model_dir.glob("*.safetensors")}
-    covered = bool(files) and weight_files <= set(files)
+    # C-1 (R1): the manifest must list every shard on disk, at least one shard, and each listed shard non-empty.
+    # A manifest that lists only the config (vacuously "covering" no shards) does not verify anything.
+    listed_weights = {rel for rel in files if rel.endswith(".safetensors")}
+    covered = (bool(weight_files) and weight_files <= listed_weights
+               and all(isinstance(files[rel], dict) and files[rel].get("size", 0) > 0 for rel in listed_weights))
     sizes_ok, hashes_ok = True, True
     for rel, rec in files.items():
         path = model_dir / rel
