@@ -5,6 +5,7 @@ this helper. Never score these shortened/derived contexts as official dataset QA
 """
 from __future__ import annotations
 
+from . import derivation_labels
 import hashlib
 import json
 from collections import Counter
@@ -159,7 +160,7 @@ def build_serving_candidates(
                 "requested_text_length_bin": length,
                 "image_count": 1,
                 "model_token_counts": {},
-                "derivation": "tokenizer_exact_tail_text_one_source_image_v1",
+                "derivation": derivation_labels.SERVING_TAIL_TEXT_ONE_IMAGE,
                 "meta": {"native_context_complete": False,
                          "official_quality_allowed": False,
                          "text_tokens_tokenizer_candidate": best[0],

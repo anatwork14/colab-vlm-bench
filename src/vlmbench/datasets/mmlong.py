@@ -69,9 +69,11 @@ def normalize_mmlong(
             with fitz.open(pdf) as doc:
                 page_count = len(doc)
                 for index in range(page_count):
+                    # DPI is part of the cache key: a reused 72-dpi page must never
+                    # silently satisfy a 96-dpi run (different visual evidence).
                     dst = (
                         images_out
-                        / hashlib.sha256(doc_name.encode()).hexdigest()[:16]
+                        / f"{hashlib.sha256(doc_name.encode()).hexdigest()[:16]}_dpi{dpi}"
                         / f"p{index+1:04d}.jpg"
                     )
                     dst.parent.mkdir(parents=True, exist_ok=True)

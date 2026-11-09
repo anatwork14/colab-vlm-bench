@@ -5,6 +5,7 @@ not replaced by random tokens, but evidence may be omitted by the derivation.
 """
 from __future__ import annotations
 
+from . import derivation_labels
 import json
 from pathlib import Path
 
@@ -57,7 +58,7 @@ def generate_candidates(native_path: Path, output: Path, dataset: str,
                 "derived_from": str(row["id"]),
                 "messages": [{"role": "user", "content": parts}],
                 "requested_text_length_bin": target,
-                "derivation": "last_text_words_plus_last_k_images_v1",
+                "derivation": derivation_labels.LAST_WORDS_LAST_K_IMAGES,
                 "image_count": len(selected_images),
                 "model_token_counts": {},
                 "meta": {"original_native_id": str(row["id"]),

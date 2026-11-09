@@ -46,26 +46,59 @@ def token_f1(prediction: str, reference: str) -> float:
 
 
 def score_proxy(predictions: list[dict], examples: list[dict]) -> dict:
-    gt = {str(x["id"]): x.get("reference") for x in examples}
-    points = []
+    """Proxy EM/F1 over the frozen example set.
+
+    Denominator = every example that has a reference. An example with no prediction row
+    (crash, circuit breaker, lost resume row) scores EM=0 and F1=0; it is never dropped.
+    Duplicate prediction IDs and prediction IDs outside the frozen set are errors.
+    """
+    references: dict[str, str] = {}
+    known: set[str] = set()
+    unscored_without_reference = 0
+    for example in examples:
+        sid = str(example["id"])
+        if sid in known:
+            raise ValueError(f"Duplicate example id: {sid}")
+        known.add(sid)
+        if example.get("reference") is None:
+            unscored_without_reference += 1
+            continue
+        references[sid] = str(example["reference"])
+
+    by_id: dict[str, dict] = {}
     for pred in predictions:
         sid = str(pred.get("id"))
-        if sid not in gt or gt[sid] is None:
-            continue
-        ok = pred.get("status") == "SUCCESS"
-        answer = str(pred.get("prediction") or "") if ok else ""
+        if sid in by_id:
+            raise ValueError(f"Duplicate prediction id: {sid}")
+        if sid not in known:
+            raise ValueError(f"Unknown prediction id not in frozen examples: {sid}")
+        by_id[sid] = pred
+
+    points = []
+    missing_predictions = 0
+    for sid, reference in references.items():
+        pred = by_id.get(sid)
+        if pred is None:
+            missing_predictions += 1
+            ok, answer = False, ""
+        else:
+            ok = pred.get("status") == "SUCCESS"
+            answer = str(pred.get("prediction") or "") if ok else ""
         points.append({
             "id": sid, "valid_prediction": ok,
-            "exact_match": exact_match(answer, str(gt[sid])),
-            "token_f1": token_f1(answer, str(gt[sid])),
+            "exact_match": exact_match(answer, reference),
+            "token_f1": token_f1(answer, reference),
         })
     if not points:
-        return {"status": "PROXY_UNAVAILABLE", "count": 0}
+        return {"status": "PROXY_UNAVAILABLE", "count": 0,
+                "unscored_without_reference": unscored_without_reference}
     return {
         "status": "QUALITY_PROXY_ONLY", "count": len(points),
         "exact_match": sum(x["exact_match"] for x in points) / len(points),
         "token_f1": sum(x["token_f1"] for x in points) / len(points),
         "failures_counted_zero": sum(not x["valid_prediction"] for x in points),
+        "missing_predictions": missing_predictions,
+        "unscored_without_reference": unscored_without_reference,
         "not_official": True, "per_sample": points,
     }
 

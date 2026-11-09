@@ -363,13 +363,22 @@ def benchmark(job: dict) -> dict:
     from types import SimpleNamespace
 
     from .cli import run_job
+    requeue = job.get("requeue_nonpass", False)
+    if type(requeue) is not bool:
+        raise ValueError("requeue_nonpass must be a boolean")
     status = run_job(SimpleNamespace(
         config=config_path, model=job["model"], mode=job["mode"],
         dataset=job["dataset"], max_cells=max_cells,
         quality=bool(job.get("quality", False)), owner_approved_compute=True,
+        requeue_nonpass=requeue,
     ))
     if status:
-        raise RuntimeError(f"Bench refused, code {status}. Check Drive receipts.")
+        # Non-zero exit is a failure for the remote wrapper (ACTION_FAILED). Name the cause.
+        run_status = Path(cfg["storage"]["local_scratch_dir"]) / cfg["campaign_id"] / "run_status.json"
+        name = (json.loads(run_status.read_text(encoding="utf8")).get("status", "UNKNOWN")
+                if run_status.is_file() else "NO_RUN_STATUS")
+        raise RuntimeError(f"Bench finished with status {name} (exit {status}). "
+                           "Check run_status.json and the cell receipts before retrying.")
     return {"status": "GPU_JOB_FINISHED_CHECK_OBSERVED_RECEIPTS",
             "campaign_id": cfg["campaign_id"], "model": job["model"],
             "mode": job["mode"], "dataset": job["dataset"]}
