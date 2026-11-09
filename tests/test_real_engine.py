@@ -5,7 +5,7 @@ Validates:
 2. True physical KV cache byte compaction under H2O.
 3. Genuine kernel attention restrictions under Declarative Attention.
 4. ECRD logits processing on full 248,320 vocabulary with winning-token citation alignment.
-5. MTP speculative decoding verification and physical KV rollback.
+5. MTP source-head proposal diagnostics; native speculative verifier remains gated.
 6. Multi-request CCU concurrency isolation (zero cross-request pollution).
 7. Complete seven-arm qualification gate reporting.
 """
@@ -139,7 +139,7 @@ def test_real_ecrd_on_full_vocabulary():
 
 
 def test_real_mtp_speculative_verification_and_rollback():
-    """Verify MTP speculative verification and physical KV rollback."""
+    """Verify MTP proposal matches are measured without speculative commits."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     engine = RealSevenArmEngine(method_arm="mtp", device=device)
 
@@ -148,8 +148,10 @@ def test_real_mtp_speculative_verification_and_rollback():
 
     assert res.method_arm == "mtp"
     assert len(res.tokens_generated) == 8
-    assert res.gates["MTP_CORRECTNESS_PASS"] == "PASS"
-    assert res.mtp_acceptance_rate >= 0.0
+    assert res.gates["MTP_CORRECTNESS_PASS"] == "GATED_NATIVE_MTP_VERIFIER_REQUIRED"
+    assert res.gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS"
+    assert res.mtp_acceptance_rate == 0.0
+    assert res.telemetry["mtp_candidate_diagnostic"]["committed_draft_tokens"] == 0
     engine.close()
 
 
@@ -265,7 +267,8 @@ def test_all_seven_arms_real_neural_forward_and_gates():
             assert res.telemetry["da_cost_accounting"]["physical_kv_read_saving_claimed"] is False
             assert res.telemetry["da_cost_accounting"]["hbm_traffic_reduction_claimed"] is False
         if "mtp" in arm:
-            assert res.gates["MTP_CORRECTNESS_PASS"] == "PASS"
+            assert res.gates["MTP_CORRECTNESS_PASS"] == "GATED_NATIVE_MTP_VERIFIER_REQUIRED"
+            assert res.gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS"
 
         engine.close()
 

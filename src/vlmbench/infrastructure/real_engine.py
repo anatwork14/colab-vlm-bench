@@ -1165,7 +1165,8 @@ class RealSevenArmEngine:
             "REAL_MODEL_FORWARD_PASS": "PASS" if self.is_pretrained else "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
             "REAL_MULTIMODAL_INFERENCE_PASS": mm_gate,
             "SEVEN_ARM_PRETRAINED_PASS": seven_arm_gate,
-            "MTP_CORRECTNESS_PASS": "PASS" if "mtp" in self.method_arm else "NOT_APPLICABLE",
+            "MTP_CORRECTNESS_PASS": "GATED_NATIVE_MTP_VERIFIER_REQUIRED" if "mtp" in self.method_arm else "NOT_APPLICABLE",
+            "MTP_PROPOSAL_DIAGNOSTIC_PASS": "PENDING" if "mtp" in self.method_arm else "NOT_APPLICABLE",
             "CCU_ISOLATION_PASS": "PASS",
             "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH",
         }
@@ -1201,6 +1202,8 @@ class RealSevenArmEngine:
         final_da_restriction_ratio = 0.0
         mtp_accepted_total = 0
         mtp_proposed_total = 0
+        mtp_matched_total = 0
+        pending_mtp_candidate: int | None = None
 
         # Prefill forward pass
         with torch.no_grad():
@@ -1214,6 +1217,13 @@ class RealSevenArmEngine:
             logits = prefill_out["logits"]
             ttft_ms = (time.perf_counter() - t0) * 1000.0
             final_allocated_bytes = sum(t.get("kv_bytes_allocated", 0) for t in prefill_out["layer_telemetries"])
+
+        # The official MTP head consumes the hidden state at position t together
+        # with the TARGET-selected embedding for t+1 and proposes token t+2.
+        # The next ordinary target forward at t+1 can validate that proposal.
+        # This reference path NEVER commits drafts or asserts serving speedup.
+        if "mtp" in self.method_arm:
+            pending_mtp_candidate = int(torch.argmax(prefill_out["mtp_logits"][0, 0]).item())
 
         # Feed prefill attention scores into H2O tracker
         if tracker is not None:
@@ -1246,28 +1256,27 @@ class RealSevenArmEngine:
             # 1. Declarative Attention mask for full-attention layers (P1-03 compliant)
             da_masks: dict[int, torch.Tensor] = {}
             if self.da_mask_gen is not None:
-                if phys_kv_len > 32:
-                    # Scale FOCUS border scope so logical mask restriction ratio is 18.95% while keeping core image tokens GLOBAL
-                    total_causal = phys_kv_len * (phys_kv_len + 1) // 2
-                    target_masked = max(1, round(0.1895 * total_causal) - 28)
-                    b_coef = phys_kv_len - 5
-                    disc = max(0.0, float(b_coef * b_coef - 4 * target_masked))
-                    l_focus = max(2, int(round((b_coef - math.sqrt(disc)) / 2.0)))
-                    da_tags = [
-                        DATag(DATagType.GLOBAL, start_idx=0, end_idx=5),
-                        DATag(DATagType.FOCUS, start_idx=5, end_idx=5 + l_focus, focus_id="vis_border"),
-                        DATag(DATagType.GLOBAL, start_idx=5 + l_focus, end_idx=max(5 + l_focus, phys_kv_len - 16)),
-                        DATag(DATagType.LOCAL, start_idx=max(5 + l_focus, phys_kv_len - 16), end_idx=phys_kv_len, window=8),
-                    ]
-                else:
-                    da_tags = [
-                        DATag(DATagType.GLOBAL, start_idx=0, end_idx=min(4, phys_kv_len)),
-                    ]
-                    if image_present and phys_kv_len > 6:
-                        da_tags.append(DATag(DATagType.FOCUS, start_idx=0, end_idx=6, focus_id="vis1"))
-                        da_tags.append(DATag(DATagType.LOCAL, start_idx=6, end_idx=phys_kv_len, window=8))
-                    elif phys_kv_len > 4:
-                        da_tags.append(DATag(DATagType.LOCAL, start_idx=4, end_idx=phys_kv_len, window=8))
+                # SCRIPTED DIAGNOSTIC ONLY: this is NOT original DA's model-emitted
+                # <focus magic_chunks="..."> protocol. No target sparsity is fitted.
+                # Bounds derive from the current prompt/vision geometry, and the
+                # observed mask density is calculated after actual construction.
+                sink_end = min(16, max(1, phys_kv_len // 4))
+                n_visual = int(vis_trace.get("visual_token_embeddings_count", 0))
+                if not n_visual and image_present:
+                    n_visual = min(4, max(0, phys_kv_len - sink_end - 1))
+                da_tags = [DATag(DATagType.GLOBAL, start_idx=0, end_idx=sink_end)]
+                if phys_kv_len > sink_end + 1:
+                    focus_end = min(
+                        phys_kv_len - 1, sink_end + max(1, n_visual)
+                    )
+                    da_tags.append(DATag(
+                        DATagType.FOCUS, start_idx=sink_end,
+                        end_idx=focus_end, focus_id="scripted_visual_segment"
+                    ))
+                    da_tags.append(DATag(
+                        DATagType.LOCAL, start_idx=focus_end,
+                        end_idx=phys_kv_len, window=8
+                    ))
 
                 raw_mask = self.da_mask_gen.generate_attention_mask(seq_len=phys_kv_len, tags=da_tags)
                 da_tensor = torch.from_numpy(raw_mask).to(self.device)
@@ -1332,69 +1341,16 @@ class RealSevenArmEngine:
             else:
                 current_token = int(torch.argmax(step_logits).item())
 
-            # 5. MTP Speculative proposal and rollback
+            # 5. P0 source-correct MTP PROPOSAL DIAGNOSTIC, not speculative serving.
+            # Qwen3.5's single trained MTP layer proposes t+2 from h(t) and
+            # the embedding of target-selected t+1. Verify that proposal only
+            # against the TARGET logit computed at t+1 by the regular decode.
+            # Critically, drafts never enter the output or KV/recurrent states.
             if "mtp" in self.method_arm:
-                num_spec = 1 if self.is_official_hf_hooked else self.config.mtp_num_speculative_tokens
-                mtp_proposed_total += num_spec
-                draft_token = int(torch.argmax(out["mtp_logits"][0, 0]).item())
-
-                if self.is_official_hf_hooked:
-                    cache_snapshot = _snapshot_dynamic_cache(past_kv)
-                    past_kv_snapshot = None
-                    recurrent_s_snapshot = None
-                else:
-                    cache_snapshot = None
-                    past_kv_snapshot = [
-                        (pk.clone(), pv.clone()) if (pk is not None and pv is not None) else None
-                        for pk, pv in [(p[0], p[1]) if p is not None else (None, None) for p in past_kv]
-                    ] if past_kv is not None else None
-                    recurrent_s_snapshot = (
-                        [s.clone() if s is not None else None for s in recurrent_s]
-                        if recurrent_s is not None
-                        else None
-                    )
-
-                mtp_tx = H2OMTPTransaction(tracker) if tracker is not None else None
-                if mtp_tx is not None:
-                    mtp_tx.begin()
-
-                spec_input = torch.tensor([[draft_token]], device=self.device, dtype=torch.long)
-                spec_pos_ids: torch.Tensor | None = None
-                if self.is_official_hf_hooked:
-                    spec_pos_ids = torch.full((3, 1, 1), curr_len, device=self.device, dtype=torch.long)
-                    if rope_deltas is not None:
-                        spec_pos_ids = spec_pos_ids + rope_deltas.view(1, 1, 1)
-
-                with torch.no_grad():
-                    spec_out = self.model(
-                        spec_input,
-                        past_key_values=past_kv,
-                        recurrent_states=recurrent_s,
-                        position_ids=spec_pos_ids,
-                    )
-                    spec_target_token = int(torch.argmax(spec_out["logits"][0]).item())
-
-                is_accepted = (step % 2 == 0) or (draft_token == spec_target_token)
-                if is_accepted:
-                    past_kv = spec_out["past_key_values"]
-                    recurrent_s = spec_out["recurrent_states"]
-                    if mtp_tx is not None:
-                        mtp_tx.commit(accepted_tokens=1)
-                    tokens_generated.append(draft_token)
-                    mtp_accepted_total += 1
-                    curr_len += 1
-                    current_token = spec_target_token
-                    if len(tokens_generated) >= max_new_tokens:
-                        step_latencies.append((time.perf_counter() - step_t0) * 1000.0)
-                        break
-                else:
-                    if self.is_official_hf_hooked and cache_snapshot is not None:
-                        _restore_dynamic_cache(past_kv, cache_snapshot)
-                    else:
-                        past_kv = past_kv_snapshot
-                        recurrent_s = recurrent_s_snapshot
-                    if mtp_tx is not None:
-                        mtp_tx.rollback()
+                if pending_mtp_candidate is not None:
+                    mtp_proposed_total += 1
+                    mtp_matched_total += int(pending_mtp_candidate == current_token)
+                pending_mtp_candidate = int(torch.argmax(out["mtp_logits"][0, 0]).item())
 
             tokens_generated.append(current_token)
             curr_len += 1
@@ -1406,7 +1362,16 @@ class RealSevenArmEngine:
         tpot_ms = float(np.mean(step_latencies)) if step_latencies else total_latency_ms
 
         citations = ecrd_proc.citations if ecrd_proc is not None else []
-        mtp_acc_rate = (mtp_accepted_total / max(1, mtp_proposed_total)) if "mtp" in self.method_arm else 1.0
+        # There were zero accepted DRAFT tokens: the target alone committed every
+        # output token. Candidate match rate is a diagnostic, NOT acceptance rate.
+        mtp_acc_rate = 0.0
+        mtp_proposal_match_rate = (
+            mtp_matched_total / mtp_proposed_total if mtp_proposed_total else None
+        )
+        if "mtp" in self.method_arm:
+            gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] = (
+                "PASS" if mtp_proposed_total > 0 else "INSUFFICIENT_TOKENS"
+            )
 
         # Decode semantic text when official tokenizer is attached
         decoded_str = ""
@@ -1447,9 +1412,20 @@ class RealSevenArmEngine:
                 "is_official_hf_hooked": self.is_official_hf_hooked,
                 "vllm_backend_status": "MOCKED_PYTORCH_FALLBACK" if not self.has_vllm_backend else "ATTACHED_VLLM_0_29_0",
                 "pretrained_weights": self.pretrained_weight_summary,
+                "mtp_candidate_diagnostic": {
+                    "classification": "TARGET_GREEDY_MATCH_ONLY_NO_SPECULATIVE_SERVING",
+                    "proposals_verified": mtp_proposed_total,
+                    "proposals_matching_target": mtp_matched_total,
+                    "proposal_match_rate": mtp_proposal_match_rate,
+                    "committed_draft_tokens": 0,
+                    "native_target_verifier_executed": False,
+                    "speculative_speedup_claimed": False,
+                },
                 "visual_encoder_trace": vis_trace,
                 "da_cost_accounting": {
                     "attention_mask_restriction_ratio": round(final_da_restriction_ratio, 4),
+                    "da_scope_provenance": "SCRIPTED_SEGMENT_DIAGNOSTIC_NOT_MODEL_DECLARED",
+                    "original_paper_protocol_qualified": False,
                     "physical_kv_bytes_freed": 0 if "da" in self.method_arm else total_physical_freed,
                     "kv_residency_preserved_ratio": 1.0 if "da" in self.method_arm else round(1.0 - final_logical_fraction, 4),
                     "kv_residency_preserved_pct": 100.0 if "da" in self.method_arm else round((1.0 - final_logical_fraction) * 100.0, 2),

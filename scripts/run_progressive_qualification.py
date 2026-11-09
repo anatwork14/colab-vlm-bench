@@ -326,7 +326,8 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
         if "ecrd" in arm:
             assert len(res.grounded_citations) > 0, f"{arm} must produce grounded citations"
         if "mtp" in arm:
-            assert res.gates["MTP_CORRECTNESS_PASS"] == "PASS"
+            assert res.gates["MTP_CORRECTNESS_PASS"] == "GATED_NATIVE_MTP_VERIFIER_REQUIRED"
+            assert res.gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS"
 
         arm_info = {
             "tokens_generated": res.tokens_generated,
@@ -419,8 +420,8 @@ def run_test_d_seven_arms(model_dir: Path, fixture_path: Path, device: str = "cp
 
 
 def run_test_e_speculative_correctness(model_dir: Path, fixture_path: Path, device: str = "cpu") -> dict[str, Any]:
-    """Test E: Speculative Correctness (15-Tensor MTP Drafting, Verifier Matching, DynamicCache Rollback)."""
-    print(f"=== [Test E] Speculative Correctness & DynamicCache Rollback on {device} ===")
+    """Test E: source-aligned MTP proposal diagnostic and greedy target equivalence (not speculative serving)."""
+    print(f"=== [Test E] MTP Proposal Diagnostic + Greedy Target Equivalence on {device} ===")
     t0 = time.perf_counter()
 
     engine = RealSevenArmEngine(method_arm="h2o_mtp", device=device, checkpoint_dir=model_dir)
@@ -438,22 +439,41 @@ def run_test_e_speculative_correctness(model_dir: Path, fixture_path: Path, devi
     assert res.gates["REAL_MODEL_FORWARD_PASS"] == "PASS"
     assert res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS"
     assert res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS"
-    assert res.gates["MTP_CORRECTNESS_PASS"] == "PASS"
+    assert res.gates["MTP_CORRECTNESS_PASS"] == "GATED_NATIVE_MTP_VERIFIER_REQUIRED"
+    assert res.gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS"
+    assert res.mtp_acceptance_rate == 0.0
     assert res.physical_kv_bytes_freed > 0, "H2O MTP transaction must physically free bytes"
     assert 0.0 <= res.mtp_acceptance_rate <= 1.0
 
     engine.close()
+    # Paired greedy-equivalence: the MTP diagnostic must NEVER change target
+    # output tokens, even when MTP proposals do not match the target.
+    baseline = RealSevenArmEngine(method_arm="h2o_base", device=device, checkpoint_dir=model_dir)
+    baseline_res = baseline.execute_request(
+        request_id="test_e_target_reference",
+        max_new_tokens=16, image_present=True, image_path=fixture_path,
+        question="Are there cats lying on the couch in the living room?",
+    )
+    baseline.close()
+    assert res.tokens_generated == baseline_res.tokens_generated, (
+        "MTP diagnostic changed the H2O target's greedy output tokens"
+    )
+    mtp_diag = res.telemetry["mtp_candidate_diagnostic"]
+    assert mtp_diag["committed_draft_tokens"] == 0
+    assert mtp_diag["proposals_verified"] > 0
     dt = time.perf_counter() - t0
     result = {
-        "status": "PASS",
+        "status": "PASS_DIAGNOSTIC_ONLY",
         "duration_s": round(dt, 3),
-        "mtp_acceptance_rate": round(res.mtp_acceptance_rate, 4),
+        "mtp_acceptance_rate": 0.0,
+        "proposal_match_rate": mtp_diag["proposal_match_rate"],
+        "greedy_target_equivalence": True,
         "physical_kv_freed_bytes": res.physical_kv_bytes_freed,
         "output_text": res.output_text,
         "architectural_status": res.telemetry["architectural_status"],
         "gates": res.gates,
     }
-    print(f"Test E PASSED in {dt:.2f}s (Acceptance Rate: {res.mtp_acceptance_rate:.2%}, Freed: {res.physical_kv_bytes_freed}B, Rollback Verified)")
+    print(f"Test E DIAGNOSTIC PASSED in {dt:.2f}s (Proposal Match: {mtp_diag['proposal_match_rate']}, target-equivalent, no speculative token committed)")
     return result
 
 
@@ -590,7 +610,7 @@ def main() -> None:
         receipt["tests"]["test_g_ccu_concurrency"] = run_test_g_ccu_concurrency(args.model_dir, device=args.device)
 
         total_duration = time.perf_counter() - overall_t0
-        receipt["qualification_verdict"] = "ALL_TESTS_QUALIFIED"
+        receipt["qualification_verdict"] = "PRETRAINED_FORWARD_AND_MTP_PROPOSAL_DIAGNOSTIC_ONLY"
         receipt["total_duration_s"] = round(total_duration, 3)
 
         receipt["release_gates"] = {
@@ -599,7 +619,8 @@ def main() -> None:
             "REAL_MODEL_FORWARD_PASS": "PASS (100% parameter coverage: 488/488 safetensors tensors [473 base VL + 15 MTP], 873,438,784 total parameters, verified one-step logits parity max_abs_diff=0.0)",
             "REAL_MULTIMODAL_INFERENCE_PASS": "PASS (Real 000000039769.png bytes processed via AutoProcessor [1200x1536 pixel_values] and ViT encoder [300x1024 visual token embeddings] across all 7 arms and 4 canonical tasks)",
             "SEVEN_ARM_PRETRAINED_PASS": "PASS (100% official Qwen3.5-0.8B model hooking, logits parity, and per-arm ViT execution verified across all 7 method arms)",
-            "MTP_CORRECTNESS_PASS": "PASS (15-tensor Qwen35MTPModule speculative proposals & bit-exact DynamicCache rollback verified in Tests D & E)",
+            "MTP_CORRECTNESS_PASS": "GATED_NATIVE_MTP_VERIFIER_REQUIRED (source MTP head is real; PyTorch path only measures target-aligned proposal matches)",
+            "MTP_PROPOSAL_DIAGNOSTIC_PASS": "PASS (no unverified drafts committed; target-greedy output parity in Test E)",
             "CCU_ISOLATION_PASS": "PASS (Pretrained CCU 1, 2, 4 strict isolation with non-empty citations verified in Test G)",
             "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH (SA-01 Truth in Labeling)",
         }
