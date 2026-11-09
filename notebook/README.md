@@ -40,6 +40,14 @@ If rerunning an existing Colab session, execute the setup cell to fast-forward t
 
 For a full code-cell-by-code-cell review and RAM/SSD thresholds, see [COLAB_STEPWISE_AUDIT.md](../docs/COLAB_STEPWISE_AUDIT.md). This checklist distinguishes CPU test PASS from still-unverified A100 capacity.
 
+## Recovered A100 startup — first-image smoke blocked by corrupt Drive JSONL
+
+If vLLM starts normally and reports `GET /v1/models 200 OK` but the first smoke request fails with `JSONDecodeError: Unterminated string` in `load_jsonl(CANDIDATES[first_ds], ...)`, the problem is **invalid candidate JSONL on Drive**, not CUDA or vLLM. Old Step 6 checked only `Path.exists()` and silently reused damaged files.
+
+The new Step 6 uses `prepare_serving_candidates` and `validate_serving_candidates`: it streams **every JSONL line on CPU**, checks unique sample IDs, text bins and image/text content structure. If the candidate is invalid and no annotation/state exists, it rebuilds from the existing normalized dataset **on local SSD first**, validates, copies the original damaged file to a SHA-tagged `.corrupt-<sha>.jsonl` backup on Drive, verifies the new Drive copy's SHA, and prints a receipt. If annotation/state already exists, it **refuses** automatic regeneration to preserve scientific provenance. The paid Step 8 repeats this validation **before** calling `start_server`.
+
+To use this repair in an existing Colab runtime, first run Step 3 so `/content/colab-vlm-bench` checks out the latest fix-branch SHA, then rerun Step 6. Do not rerun costly model-weight staging or normalization if their outputs are intact. Confirm `REBUILT_CORRUPT_CANDIDATES` or `REUSED_VALIDATED_CANDIDATES` for each active dataset, followed by `PRE_GPU_CANDIDATE_PASS` at Step 8. The next failure, if any, will be a real VLM image-request/server issue. Actual A100 image-request success remains unproven until that run.
+
 ## Qwen3.5-0.8B bounded A100 Base pilot (branch fix)
 
 The Qwen3.5-0.8B branch notebook is now configured for a **paid first Base pilot when Run All is invoked on an allocated A100**. Step 1 explicitly prints `RUN_GPU_ANNOTATION=True`, `RUN_BASE=True`, `ANNOTATION_CALL_BUDGET=24`, and `MAX_CELLS_PER_JOB=1`. This is at most 24 **new** one-token annotation requests per active dataset, plus one smoke prompt, then at most one ready Base serving cell per dataset. MTP/full quality/external methods stay disabled. Switch both `RUN_GPU_ANNOTATION` and `RUN_BASE` to `False` for preprocessing-only runs. GPU compute units can also be billed during CPU-heavy preparation if the A100 is already allocated.
