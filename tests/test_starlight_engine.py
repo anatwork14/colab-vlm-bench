@@ -340,3 +340,22 @@ def test_s1_candidate_set_is_ablation_independent_and_only_the_veto_differs():
     no_ground = plans_by_arm["starlight_s1_no_grounding"]
     assert no_ground.evicted == full.evicted
     assert no_ground.retained == full.retained
+
+
+# --- ITER2 D4 S-4 (auditor): the H-6 cache-length check must be testable -------------------
+
+def test_s4_cache_length_check_detects_an_injected_mismatch():
+    engine = _engine("starlight_s1")
+    prompt = list(range(100, 140))
+    clean = engine.execute_request("s4_clean", prompt_token_ids=prompt, image_present=False,
+                                   max_new_tokens=6).telemetry["starlight"]
+    assert clean["cache_length_mismatch_steps"] == 0
+
+    # Inject an off-by-one physical length into every decode step. The H-6 check must count it.
+    engine._test_cache_len_offset = 1
+    try:
+        broken = engine.execute_request("s4_injected", prompt_token_ids=prompt, image_present=False,
+                                        max_new_tokens=6).telemetry["starlight"]
+    finally:
+        engine._test_cache_len_offset = 0
+    assert broken["cache_length_mismatch_steps"] > 0, "mutating the H-6 check must fail this test"
