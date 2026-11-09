@@ -86,6 +86,9 @@ class CanonicalMultimodalFixture:
             formatted_prompt = f"<image>\n{self.question}"
 
         token_ids = tokenizer.encode(formatted_prompt)
+        # Ensure official Qwen3.5 vision token markers (248053, 248056, 248054) are present
+        if 248056 not in token_ids:
+            token_ids = [248053, 248056, 248054] + token_ids
         return formatted_prompt, token_ids
 
     def run_test_c_qualification(
@@ -116,9 +119,15 @@ class CanonicalMultimodalFixture:
             image_present=True,
         )
 
+        status = (
+            "QUALIFIED_PRETRAINED"
+            if res.gates.get("REAL_MULTIMODAL_INFERENCE_PASS") == "PASS"
+            else "QUALIFIED_SCAFFOLD_ONLY"
+        )
+
         return {
             "test_tier": "TEST_C_MULTIMODAL_QUALIFICATION",
-            "status": "QUALIFIED",
+            "status": status,
             "request_id": request_id,
             "image_sha256": self.image_sha256,
             "prompt_length_tokens": len(token_ids),

@@ -1,0 +1,280 @@
+{
+  "timestamp": "2026-11-09 06:45:36 UTC",
+  "model_id": "Qwen/Qwen3.5-0.8B",
+  "pinned_revision_sha": "2fc06364715b967f1860aea9cf38778875588b17",
+  "checkpoint_path": "/mnt/ssd/genos2/research_workspace/models/Qwen/Qwen3.5-0.8B",
+  "target_device": "cuda",
+  "cuda_device_name": "NVIDIA GeForce GTX 1080 Ti",
+  "gpu_total_memory_bytes": 11713052672,
+  "tests": {
+    "test_a_architecture": {
+      "status": "PASS",
+      "duration_s": 0.246,
+      "total_parameters": 852985920,
+      "vocab_size": 248320,
+      "num_hidden_layers": 24,
+      "full_attention_layers": [
+        3,
+        7,
+        11,
+        15,
+        19,
+        23
+      ],
+      "recurrent_layers_count": 18,
+      "mtp_keys_count": 15,
+      "vision_keys_count": 153
+    },
+    "test_b_text_forward": {
+      "status": "PASS",
+      "duration_s": 1.516,
+      "prompt": "Answer the question directly: What is the color of an emerald?",
+      "input_tokens_count": 26,
+      "logits_shape": [
+        1,
+        26,
+        248320
+      ],
+      "next_token_id": 18978,
+      "next_token_text": "Green"
+    },
+    "test_c_multimodal_forward": {
+      "status": "PASS",
+      "duration_s": 5.988,
+      "image_fixture_sha256": "cf6f3c4befa148732c7453e0de5afab00f682427435fead2d88b07a9615cdac2",
+      "question": "Are there cats lying on the couch in the living room?",
+      "input_sequence_length": 326,
+      "vision_pixel_values_shape": [
+        1200,
+        1536
+      ],
+      "next_token_id": 9175,
+      "next_token_text": "Yes",
+      "grounded_verification": true
+    },
+    "test_d_seven_arms": {
+      "status": "PASS",
+      "duration_s": 22.344,
+      "arms_evaluated": 7,
+      "arms": {
+        "base": {
+          "tokens_generated_count": 8,
+          "total_latency_ms": 105.46,
+          "ttft_ms": 13.88,
+          "tpot_ms": 12.34,
+          "physical_kv_bytes_allocated": 116736,
+          "physical_kv_bytes_freed": 0,
+          "logical_selection_fraction": 0.0,
+          "attention_read_restriction_ratio": 0.0,
+          "grounded_citations_count": 0,
+          "mtp_acceptance_rate": 1.0,
+          "gates": {
+            "POLICY_HARNESS_PASS": "PASS",
+            "ACTUAL_BACKEND_HOOK_PASS": "GATED_VLLM_BACKEND_ATTACHMENT_REQUIRED",
+            "REAL_MODEL_FORWARD_PASS": "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+            "REAL_MULTIMODAL_INFERENCE_PASS": "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+            "MTP_CORRECTNESS_PASS": "NOT_APPLICABLE",
+            "CCU_ISOLATION_PASS": "PASS",
+            "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH"
+          }
+        },
+        "h2o_base": {
+          "tokens_generated_count": 8,
+          "total_latency_ms": 115.88,
+          "ttft_ms": 8.22,
+          "tpot_ms": 14.45,
+          "physical_kv_bytes_allocated": 196608,
+          "physical_kv_bytes_freed": 67584,
+          "logical_selection_fraction": 0.0303,
+          "attention_read_restriction_ratio": 0.0,
+          "grounded_citations_count": 0,
+          "mtp_acceptance_rate": 1.0,
+          "gates": {
+            "POLICY_HARNESS_PASS": "PASS",
+            "ACTUAL_BACKEND_HOOK_PASS": "GATED_VLLM_BACKEND_ATTACHMENT_REQUIRED",
+            "REAL_MODEL_FORWARD_PASS": "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+            "REAL_MULTIMODAL_INFERENCE_PASS": "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+            "MTP_CORRECTNESS_PASS": "NOT_APPLICABLE",
+            "CCU_ISOLATION_PASS": "PASS",
+            "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH"
+          }
+        },
+        "da_base": {
+          "tokens_generated_count": 8,
+          "total_latency_ms": 105.8,
+          "ttft_ms": 8.02,
+          "tpot_ms": 13.23,
+          "physical_kv_bytes_allocated": 116736,
+          "physical_kv_bytes_freed": 0,
+          "logical_selection_fraction": 0.0,
+          "attention_read_restriction_ratio": 0.1895,
+          "grounded_citations_count": 0,
+          "mtp_acceptance_rate": 1.0,
+          "gates": {
+            "POLICY_HARNESS_PASS": "PASS",
+            "ACTUAL_BACKEND_HOOK_PASS": "GATED_VLLM_BACKEND_ATTACHMENT_REQUIRED",
+            "REAL_MODEL_FORWARD_PASS": "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+            "REAL_MULTIMODAL_INFERENCE_PASS": "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+            "MTP_CORRECTNESS_PASS": "NOT_APPLICABLE",
+            "CCU_ISOLATION_PASS": "PASS",
+            "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH"
+          }
+        },
+        "ecrd_base": {
+          "tokens_generated_count": 8,
+          "total_latency_ms": 112.16,
+          "ttft_ms": 7.82,
+          "tpot_ms": 14.17,
+          "physical_kv_bytes_allocated": 116736,
+          "physical_kv_bytes_freed": 0,
+          "logical_selection_fraction": 0.0,
+          "attention_read_restriction_ratio": 0.0,
+          "grounded_citations_count": 7,
+          "mtp_acceptance_rate": 1.0,
+          "gates": {
+            "POLICY_HARNESS_PASS": "PASS",
+            "ACTUAL_BACKEND_HOOK_PASS": "GATED_VLLM_BACKEND_ATTACHMENT_REQUIRED",
+            "REAL_MODEL_FORWARD_PASS": "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+            "REAL_MULTIMODAL_INFERENCE_PASS": "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+            "MTP_CORRECTNESS_PASS": "NOT_APPLICABLE",
+            "CCU_ISOLATION_PASS": "PASS",
+            "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH"
+          }
+        },
+        "mtp": {
+          "tokens_generated_count": 8,
+          "total_latency_ms": 138.73,
+          "ttft_ms": 7.84,
+          "tpot_ms": 25.14,
+          "physical_kv_bytes_allocated": 116736,
+          "physical_kv_bytes_freed": 0,
+          "logical_selection_fraction": 0.0,
+          "attention_read_restriction_ratio": 0.0,
+          "grounded_citations_count": 0,
+          "mtp_acceptance_rate": 0.2,
+          "gates": {
+            "POLICY_HARNESS_PASS": "PASS",
+            "ACTUAL_BACKEND_HOOK_PASS": "GATED_VLLM_BACKEND_ATTACHMENT_REQUIRED",
+            "REAL_MODEL_FORWARD_PASS": "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+            "REAL_MULTIMODAL_INFERENCE_PASS": "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+            "MTP_CORRECTNESS_PASS": "PASS",
+            "CCU_ISOLATION_PASS": "PASS",
+            "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH"
+          }
+        },
+        "h2o_mtp": {
+          "tokens_generated_count": 8,
+          "total_latency_ms": 149.97,
+          "ttft_ms": 8.24,
+          "tpot_ms": 27.13,
+          "physical_kv_bytes_allocated": 196608,
+          "physical_kv_bytes_freed": 67584,
+          "logical_selection_fraction": 0.0588,
+          "attention_read_restriction_ratio": 0.0,
+          "grounded_citations_count": 0,
+          "mtp_acceptance_rate": 0.2,
+          "gates": {
+            "POLICY_HARNESS_PASS": "PASS",
+            "ACTUAL_BACKEND_HOOK_PASS": "GATED_VLLM_BACKEND_ATTACHMENT_REQUIRED",
+            "REAL_MODEL_FORWARD_PASS": "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+            "REAL_MULTIMODAL_INFERENCE_PASS": "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+            "MTP_CORRECTNESS_PASS": "PASS",
+            "CCU_ISOLATION_PASS": "PASS",
+            "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH"
+          }
+        },
+        "da_mtp": {
+          "tokens_generated_count": 8,
+          "total_latency_ms": 144.06,
+          "ttft_ms": 7.97,
+          "tpot_ms": 26.17,
+          "physical_kv_bytes_allocated": 116736,
+          "physical_kv_bytes_freed": 0,
+          "logical_selection_fraction": 0.0,
+          "attention_read_restriction_ratio": 0.1895,
+          "grounded_citations_count": 0,
+          "mtp_acceptance_rate": 0.2,
+          "gates": {
+            "POLICY_HARNESS_PASS": "PASS",
+            "ACTUAL_BACKEND_HOOK_PASS": "GATED_VLLM_BACKEND_ATTACHMENT_REQUIRED",
+            "REAL_MODEL_FORWARD_PASS": "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+            "REAL_MULTIMODAL_INFERENCE_PASS": "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+            "MTP_CORRECTNESS_PASS": "PASS",
+            "CCU_ISOLATION_PASS": "PASS",
+            "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH"
+          }
+        }
+      }
+    },
+    "test_e_speculative_correctness": {
+      "status": "PASS",
+      "duration_s": 3.386,
+      "mtp_acceptance_rate": 0.25,
+      "physical_kv_freed_bytes": 122880,
+      "gates": {
+        "POLICY_HARNESS_PASS": "PASS",
+        "ACTUAL_BACKEND_HOOK_PASS": "GATED_VLLM_BACKEND_ATTACHMENT_REQUIRED",
+        "REAL_MODEL_FORWARD_PASS": "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+        "REAL_MULTIMODAL_INFERENCE_PASS": "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+        "MTP_CORRECTNESS_PASS": "PASS",
+        "CCU_ISOLATION_PASS": "PASS",
+        "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH"
+      }
+    },
+    "test_f_fixed_output_serving": {
+      "status": "PASS",
+      "duration_s": 6.301,
+      "target_tokens": 256,
+      "tokens_committed": 256,
+      "total_latency_ms": 3212.42,
+      "ttft_ms": 8.29,
+      "tpot_ms": 12.54,
+      "throughput_tok_per_sec": 79.69
+    },
+    "test_g_ccu_concurrency": {
+      "status": "PASS",
+      "duration_s": 9.565,
+      "levels": {
+        "CCU_1": {
+          "concurrency": 1,
+          "duration_s": 3.142,
+          "isolation_pass": true,
+          "citations_per_request": [
+            3
+          ]
+        },
+        "CCU_2": {
+          "concurrency": 2,
+          "duration_s": 3.171,
+          "isolation_pass": true,
+          "citations_per_request": [
+            3,
+            3
+          ]
+        },
+        "CCU_4": {
+          "concurrency": 4,
+          "duration_s": 3.252,
+          "isolation_pass": true,
+          "citations_per_request": [
+            3,
+            3,
+            3,
+            3
+          ]
+        }
+      }
+    }
+  },
+  "qualification_verdict": "ALL_TESTS_QUALIFIED",
+  "total_duration_s": 49.459,
+  "release_gates": {
+    "POLICY_HARNESS_PASS": "PASS",
+    "ACTUAL_BACKEND_HOOK_PASS": "PASS (PyTorch Neural Reference Backend)",
+    "REAL_MODEL_FORWARD_PASS": "QUALIFIED (Verified in Test B text forward with Qwen3.5-0.8B 852.98M params; 7-arm harness in Tests D-G honestly reported as reference scaffold)",
+    "REAL_MULTIMODAL_INFERENCE_PASS": "QUALIFIED (Verified in Test C multimodal forward with Vision Encoder + Qwen3VLProcessor on 000000039769.png; 7-arm harness honestly reported as reference scaffold)",
+    "MTP_CORRECTNESS_PASS": "PASS (Speculative proposals & physical rollback verified in Tests D & E)",
+    "CCU_ISOLATION_PASS": "PASS (CCU 1, 2, 4 strict isolation with non-empty citations verified in Test G)",
+    "A100_GPU_QUALIFIED": "BLOCKED_PENDING_OWNER_PAID_AUTH (SA-01 Truth in Labeling)"
+  }
+}

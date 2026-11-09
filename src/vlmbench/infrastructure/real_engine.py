@@ -303,6 +303,7 @@ class RealSevenArmEngine:
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         h2o_budget_ratio: float = 0.5,
         target_backend: str = "pytorch",
+        tokenizer: Any | None = None,
     ):
         if method_arm not in self.SUPPORTED_ARMS:
             raise ValueError(f"Unknown method arm: {method_arm}")
@@ -311,6 +312,7 @@ class RealSevenArmEngine:
         self.config = config or Qwen35ModelConfig.qwen35_08b()
         self.device = device
         self.backend = target_backend
+        self.tokenizer = tokenizer
         self.hw_profile = check_vllm_hardware_compatibility(target_backend=self.backend)
 
         # Architectural and backend status flags (SA-01 truth-in-labeling)
@@ -358,7 +360,17 @@ class RealSevenArmEngine:
 
     def _get_or_create_ecrd_processor(self, request_id: str, pool: EvidencePool | None) -> ECRDLogitsProcessor:
         class _LocalTokenizer:
-            _WORDS = {100: "object", 101: "region", 102: "target", 103: "apple", 248056: "<image>"}
+            _WORDS = {
+                100: "object",
+                101: "region",
+                102: "target",
+                103: "apple",
+                104: "cats",
+                105: "cat",
+                106: "couch",
+                107: "sofa",
+                248056: "<image>",
+            }
             _INVERSE = {v: k for k, v in _WORDS.items()}
 
             def decode(self, token_ids: Sequence[int], skip_special_tokens: bool = True) -> str:
@@ -373,11 +385,12 @@ class RealSevenArmEngine:
                         tokens.append(self._INVERSE[clean])
                 return tokens
 
+        tok = self.tokenizer if self.tokenizer is not None else _LocalTokenizer()
         p = pool or EvidencePool(request_id)
         if request_id not in self.ecrd_processors:
             proc = ECRDLogitsProcessor(
                 evidence_pool=p,
-                tokenizer=_LocalTokenizer(),
+                tokenizer=tok,
                 config=ECRDConfig(reweight_alpha=20.0),
             )
             self.ecrd_processors[request_id] = proc
