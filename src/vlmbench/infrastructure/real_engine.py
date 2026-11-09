@@ -763,8 +763,15 @@ class Qwen35NeuralModel(nn.Module):
         mm_encoder_outputs: dict[str, Any] | None = None,
         compute_mtp: bool = False,
         mtp_position_ids: torch.Tensor | None = None,
+        logits_to_keep: int = 1,
     ) -> dict[str, Any]:
-        """Full forward pass routing through hooked official HF model when attached, or scaffold layers."""
+        """Full forward pass routing through hooked official HF model when attached, or scaffold layers.
+
+        `logits_to_keep` = number of trailing positions whose logits are returned. `logits`,
+        `full_logits[:, -1]` and the MTP draft all refer to the LAST kept position.
+        """
+        if type(logits_to_keep) is not int or logits_to_keep < 1:
+            raise ValueError("logits_to_keep must be a positive integer")
         if self.hf_model is not None and self.hook_ctx is not None:
             from transformers.models.qwen3_5 import modeling_qwen3_5
 
@@ -786,7 +793,7 @@ class Qwen35NeuralModel(nn.Module):
                     position_ids=position_ids,
                     past_key_values=past_key_values,
                     mm_encoder_outputs=mm_encoder_outputs,
-                    logits_to_keep=1,
+                    logits_to_keep=logits_to_keep,
                     use_cache=True,
                     output_hidden_states=True,
                 )
@@ -822,7 +829,9 @@ class Qwen35NeuralModel(nn.Module):
                     "layer_telemetries": layer_telemetries,
                 }
 
-        # Reference PyTorch scaffold path
+        # Reference PyTorch scaffold path (last position only; multi-position verify is official-path only)
+        if logits_to_keep != 1:
+            raise ValueError("scaffold forward supports logits_to_keep=1 only")
         b, seq_len = input_ids.shape
         hidden = self.embed_tokens(input_ids)
         vis_mask = input_ids == self.config.image_token_id
@@ -929,7 +938,7 @@ class RealExecutionResult:
     logical_selection_fraction: float
     attention_read_restriction_ratio: float
     grounded_citations: list[dict[str, Any]]
-    mtp_acceptance_rate: float
+    mtp_acceptance_rate: float | None  # None = not verified (serving arm); see _speculative_mtp_greedy_k1
     attention_mask_restriction_ratio: float = 0.0
     gates: dict[str, str] = field(default_factory=dict)
     telemetry: dict[str, Any] = field(default_factory=dict)
@@ -1204,6 +1213,106 @@ class RealSevenArmEngine:
             "image_placeholder_tokens_in_prompt": int((input_ids == self.config.image_token_id).sum().item()),
         }
         return input_ids, pos_ids, rope_deltas, {"image": vis_out}, vis_trace
+
+    CPU_GREEDY_K1_LABEL = "cpu_greedy_k1_reference_not_vllm_mtp"
+
+    def _speculative_mtp_greedy_k1(
+        self,
+        prompt_ids: Sequence[int],
+        max_new_tokens: int,
+        draft_override: Any = None,
+    ) -> dict[str, Any]:
+        """CPU greedy k=1 speculative decoding with the official MTP head (reference, NOT vLLM MTP).
+
+        Invariant: the committed stream is always the target's greedy stream. Each step, the MTP
+        head proposes one draft d for the token after the pending token. One target forward over
+        [pending, d] from a state snapshot verifies it: accept iff d == target argmax after pending.
+        On reject, the snapshot (KV and Gated-DeltaNet conv/recurrent states) is restored and the
+        pending token is re-fed alone, so the next committed token comes from a single-token target
+        forward.
+
+        `draft_override(draft, proposal_index, n_emitted) -> int` is a test hook that replaces the
+        proposal. `n_emitted` = tokens already committed; an oracle hook can use it to propose the
+        target's known next token (forced accept) or a corrupted one (forced reject).
+        No speed is claimed. Acceptance is verifier-derived: accepted / proposed.
+        """
+        if not self.is_official_hf_hooked or getattr(self.model, "mtp_module", None) is None:
+            raise RuntimeError(
+                "cpu_greedy_k1 reference requires the official hooked checkpoint with its MTP head"
+            )
+        if type(max_new_tokens) is not int or max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be a positive integer")
+        ids = [int(t) for t in prompt_ids]
+        if not ids:
+            raise ValueError("prompt_ids must be non-empty")
+        vocab = self.config.vocab_size
+        from transformers.models.qwen3_5 import modeling_qwen3_5
+
+        cache = modeling_qwen3_5.DynamicCache(config=self.model.hf_model.config)
+
+        def _pos(start: int, n: int) -> torch.Tensor:
+            return (
+                torch.arange(start, start + n, device=self.device, dtype=torch.long)
+                .view(1, 1, n).expand(3, 1, n).clone()
+            )
+
+        def _feed(tokens: list[int], start: int, keep: int) -> dict[str, Any]:
+            # MTP position = absolute position of the next target token (after the fed chunk).
+            return self.model(
+                torch.tensor([tokens], device=self.device, dtype=torch.long),
+                past_key_values=cache,
+                position_ids=_pos(start, len(tokens)),
+                compute_mtp=True,
+                mtp_position_ids=_pos(start + len(tokens), 1),
+                logits_to_keep=keep,
+            )
+
+        with torch.no_grad():
+            out = _feed(ids, 0, 1)
+            cache_len = len(ids)  # tokens currently in the cache; `pending` is not yet fed
+            pending = int(torch.argmax(out["logits"][0]).item())
+            draft = int(torch.argmax(out["mtp_logits"][0, 0]).item())
+
+            emitted: list[int] = []
+            proposed = accepted = rejected = 0
+            while len(emitted) < max_new_tokens:
+                emitted.append(pending)
+                if len(emitted) >= max_new_tokens:
+                    break
+                proposal = draft
+                if draft_override is not None:
+                    proposal = int(draft_override(draft, proposed, len(emitted)))
+                if not 0 <= proposal < vocab:
+                    raise ValueError("draft proposal outside the vocabulary")
+                proposed += 1
+                snap = _snapshot_dynamic_cache(cache)
+                v = _feed([pending, proposal], cache_len, 2)
+                target_after_pending = int(torch.argmax(v["full_logits"][0, 0]).item())
+                if proposal == target_after_pending:
+                    accepted += 1
+                    emitted.append(proposal)
+                    cache_len += 2
+                    if len(emitted) >= max_new_tokens:
+                        break
+                    pending = int(torch.argmax(v["logits"][0]).item())
+                    draft = int(torch.argmax(v["mtp_logits"][0, 0]).item())
+                else:
+                    rejected += 1
+                    _restore_dynamic_cache(cache, snap)
+                    v1 = _feed([pending], cache_len, 1)
+                    cache_len += 1
+                    pending = int(torch.argmax(v1["logits"][0]).item())
+                    draft = int(torch.argmax(v1["mtp_logits"][0, 0]).item())
+
+        return {
+            "label": self.CPU_GREEDY_K1_LABEL,
+            "tokens": emitted[:max_new_tokens],
+            "proposed": proposed,
+            "accepted": accepted,
+            "rejected": rejected,
+            "acceptance_rate": (accepted / proposed) if proposed else None,
+            "speed_claim": None,
+        }
 
     def execute_request(
         self,
@@ -1500,9 +1609,11 @@ class RealSevenArmEngine:
         tpot_ms = float(np.mean(step_latencies)) if step_latencies else total_latency_ms
 
         citations = ecrd_proc.citations if ecrd_proc is not None else []
-        # There were zero accepted DRAFT tokens: the target alone committed every
-        # output token. Candidate match rate is a diagnostic, NOT acceptance rate.
-        mtp_acc_rate = 0.0
+        # This serving-style arm runs NO verifier and commits only target tokens, so no
+        # acceptance rate was measured. None = unverified (never a literal 0.0). The
+        # verifier-derived CPU reference lives in _speculative_mtp_greedy_k1 and is
+        # labelled cpu_greedy_k1_reference_not_vllm_mtp.
+        mtp_acc_rate: float | None = None
         mtp_proposal_match_rate = (
             mtp_matched_total / mtp_proposed_total if mtp_proposed_total else None
         )
