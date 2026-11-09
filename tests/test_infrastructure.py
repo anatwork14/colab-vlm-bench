@@ -9,6 +9,8 @@ Validates:
 6. End-to-end execution of all 7 method arms with telemetry verification under synthetic test harness labeling.
 """
 from unittest.mock import patch
+
+from vlmbench.infrastructure.adapters import InfrastructureRunner  # SYNTHETIC harness, not exported
 import numpy as np
 import pytest
 
@@ -28,8 +30,6 @@ from vlmbench.infrastructure import (
     EvidencePool,
     ECRDLogitsProcessor,
     HardwareGateError,
-    SevenArmEngine,
-    InfrastructureRunner,
     check_vllm_hardware_compatibility,
 )
 
