@@ -1669,7 +1669,12 @@ class RealSevenArmEngine:
                 "arm_status": arm_status,
                 "grounding_declaration_missing": starlight,
                 "kv_memory_accounting": {
-                    "scope": "per decode step, prefill cache unbounded",
+                    "scope": "MIXED_PER_FIELD_SEE_memory_field_scopes",
+                        "scope_note": (
+                            "This block mixes per-step sums and a final-state snapshot "
+                            "(final_retained_kv_payload_bytes). No single scope applies to the block; "
+                            "each field's coverage is in memory_field_scopes."
+                        ),
                     "classification": "PHYSICAL_KV_ALLOCATED_NOT_FREED_NOT_MEASURED_IN_POLICY_DRIVER",
                     "final_retained_kv_payload_bytes": spec["kv_bytes_allocated"],
                 },
@@ -1760,7 +1765,12 @@ class RealSevenArmEngine:
                 "is_official_hf_hooked": self.is_official_hf_hooked,
                 "measurement_label": "cpu_pytorch_reference_not_vllm",
                 "kv_memory_accounting": {
-                    "scope": "per decode step, prefill cache unbounded",
+                    "scope": "MIXED_PER_FIELD_SEE_memory_field_scopes",
+                        "scope_note": (
+                            "This block mixes per-step sums and a final-state snapshot "
+                            "(final_retained_kv_payload_bytes). No single scope applies to the block; "
+                            "each field's coverage is in memory_field_scopes."
+                        ),
                     "classification": "NO_EVICTION_PHYSICAL_LENGTH_ONLY",
                     "final_retained_kv_payload_bytes": spec["kv_bytes_allocated"],
                 },
@@ -2819,7 +2829,12 @@ class RealSevenArmEngine:
                 "pretrained_weights": self.pretrained_weight_summary,
                 "kv_memory_accounting": {
                     # S-8 (lead ruling): every memory field states its coverage.
-                    "scope": "per decode step, prefill cache unbounded",
+                    "scope": "MIXED_PER_FIELD_SEE_memory_field_scopes",
+                        "scope_note": (
+                            "This block mixes per-step sums and a final-state snapshot "
+                            "(final_retained_kv_payload_bytes). No single scope applies to the block; "
+                            "each field's coverage is in memory_field_scopes."
+                        ),
                     "legacy_field": "physical_kv_bytes_freed",
                     "classification": "SUM_OF_KV_TENSOR_FOOTPRINT_DELTAS_NOT_GPU_VRAM_SAVING",
                     "compaction_tensor_byte_deltas_sum": total_physical_freed,
