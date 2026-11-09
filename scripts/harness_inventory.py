@@ -31,6 +31,7 @@ from vlmbench.methods import NATIVE_AVAILABLE, manifest_from_path, plan  # noqa:
 
 DEFAULT_MODELS_ROOT = Path("/mnt/ssd/genos2/research_workspace/models")
 DEFAULT_AUTHORIZATION = REPO / "docs/harness/OWNER_AUTHORIZATION.json"
+DEFAULT_FEASIBILITY = REPO / "docs/harness/DATASET_FEASIBILITY.json"  # read-only metadata, not approval
 LOCAL_WEIGHTS_MANIFEST = "starlight_local_manifest.json"
 REQUIRED_CAPABILITY = 8.0       # BF16 native support (Ampere, sm_80 and newer). Assumption, stated in report.
 REQUIRED_VRAM_MIB = 39000       # matches vlmbench.config.validate (A100 40GB contract)
@@ -299,7 +300,8 @@ def git_head() -> str:
 
 def build_report(pilot_config: Path, matrix_manifest: Path, *, models_root: Path,
                  authorization: Path, receipts_dir: Path | None, min_free_gib: float,
-                 hash_weights: bool, probe_gpu_fn=probe_gpu) -> dict:
+                 hash_weights: bool, probe_gpu_fn=probe_gpu,
+                 feasibility_path: Path | None = DEFAULT_FEASIBILITY) -> dict:
     config = load_config(pilot_config)
     manifest = manifest_from_path(matrix_manifest)
     pilot_cells = enumerate_pilot_cells(pilot_config)
@@ -371,8 +373,16 @@ def build_report(pilot_config: Path, matrix_manifest: Path, *, models_root: Path
             "full": {"campaign_id": manifest["campaign_id"], **full_summary,
                      "source": "vlmbench.methods.plan + manifest grid (" + str(matrix_manifest.name) + ")"},
         },
+        "dataset_feasibility": _load_feasibility(feasibility_path),
         "cells": cells,
     }
+
+
+def _load_feasibility(path: Path | None) -> dict | None:
+    """Resolved revisions and sizes from read-only metadata. Never an approval, never a status input."""
+    if path is None or not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf8"))
 
 
 def render_markdown(report: dict) -> str:
@@ -425,6 +435,19 @@ def render_markdown(report: dict) -> str:
               "- Nothing here starts a GPU job, loads a model or contacts the network.", "",
               "## 5. Regenerate", "",
               "```", f"{sys.executable} scripts/harness_inventory.py", "```", ""]
+    feas = report.get("dataset_feasibility")
+    if feas:
+        mem, mmlong = feas["memlens"], feas["mmlongbench_doc"]
+        lines += ["## 6. Dataset feasibility (read-only metadata, not owner-approved)", "",
+                  f"Resolved {feas['resolved_on']}; `owner_approved` = {feas['owner_approved']}. "
+                  "These revisions do not unpin the config, and no status above depends on them.", "",
+                  f"- MemLens `{mem['hf_dataset']}` @ `{mem['hf_revision_sha']}`, 789 items per context config, "
+                  f"{mem['total_repo_bytes']:,} bytes total, licence {mem['hf_license_card']}.",
+                  f"- MMLongBench-Doc `{mmlong['hf_dataset']}` @ `{mmlong['hf_revision_sha']}`, "
+                  f"{mmlong['qa_counts']['answerable'] + mmlong['qa_counts']['unanswerable_answer_Not_answerable']} QA rows, "
+                  f"{mmlong['documents']['count']} documents, licence card: {mmlong['hf_license_card']}.",
+                  "- Official scoring needs an LLM answer-extraction step; it is BLOCKED_NO_JUDGE. Details are in "
+                  "`docs/harness/DATASET_FEASIBILITY.json`.", ""]
     return "\n".join(lines)
 
 

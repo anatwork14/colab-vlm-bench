@@ -290,3 +290,23 @@ def test_markdown_states_limits_and_regeneration_and_matches_the_json_counts(tmp
     assert "## 5. Regenerate" in text and "scripts/harness_inventory.py" in text
     assert f"| pilot ({report['matrices']['pilot']['campaign_id']}) | 48 |" in text
     assert f"| full ({report['matrices']['full']['campaign_id']}) | 3528 |" in text
+
+
+# ITER2 D5-1: resolved dataset metadata is attached as metadata. It never changes a cell status.
+
+def _report(tmp_path, feasibility_path):
+    return inv.build_report(PILOT, MATRIX, models_root=tmp_path / "none", authorization=tmp_path / "no-auth.json",
+                            receipts_dir=None, min_free_gib=3.0, hash_weights=False,
+                            probe_gpu_fn=lambda: None, feasibility_path=feasibility_path)
+
+
+def test_feasibility_metadata_is_attached_marked_unapproved_and_changes_no_status(tmp_path):
+    with_meta = _report(tmp_path, inv.DEFAULT_FEASIBILITY)
+    without = _report(tmp_path, None)
+    feas = with_meta["dataset_feasibility"]
+    assert feas["owner_approved"] is False
+    assert feas["memlens"]["hf_revision_sha"] == "afa101a1907cc37db40b50d649547964387b96b7"
+    assert feas["mmlongbench_doc"]["hf_revision_sha"] == "2ff6aa9237fc777b6627dc57a486e9225ac5fb86"
+    assert without["dataset_feasibility"] is None
+    assert [c["status"] for c in with_meta["cells"]] == [c["status"] for c in without["cells"]]
+    assert all(c["status"] != "READY" for c in with_meta["cells"])
