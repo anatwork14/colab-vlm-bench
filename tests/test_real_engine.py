@@ -262,3 +262,63 @@ def test_all_seven_arms_real_neural_forward_and_gates():
             assert res.gates["MTP_CORRECTNESS_PASS"] == "PASS"
 
         engine.close()
+
+
+def test_real_engine_pretrained_checkpoint_loading(tmp_path):
+    """Verify RealSevenArmEngine loads safetensors weights and sets is_pretrained=True."""
+    from safetensors.torch import save_file
+
+    small_cfg = Qwen35ModelConfig(
+        model_id="Qwen/Qwen3.5-TinyTest",
+        model_type="qwen3_5",
+        architectures=("Qwen3_5ForConditionalGeneration",),
+        vocab_size=512,
+        hidden_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        intermediate_size=128,
+        max_position_embeddings=1024,
+        image_token_id=500,
+        vision_start_token_id=501,
+        vision_end_token_id=502,
+        pad_token_id=0,
+        eos_token_id=1,
+        full_attention_layers=(3,),
+        recurrent_layers=(0, 1, 2),
+        mtp_num_speculative_tokens=2,
+    )
+
+    tensors = {
+        "model.language_model.embed_tokens.weight": torch.randn(512, 64),
+        "model.language_model.norm.weight": torch.ones(64),
+        "mtp.fc.weight": torch.randn(64, 128),
+        "model.visual.merger.linear_fc2.weight": torch.randn(64, 64),
+        "model.visual.merger.linear_fc2.bias": torch.zeros(64),
+        "model.language_model.layers.0.input_layernorm.weight": torch.ones(64),
+        "model.language_model.layers.0.linear_attn.in_proj_qkv.weight": torch.randn(192, 64),
+        "model.language_model.layers.0.linear_attn.out_proj.weight": torch.randn(64, 64),
+        "model.language_model.layers.3.input_layernorm.weight": torch.ones(64),
+        "model.language_model.layers.3.self_attn.q_proj.weight": torch.randn(64, 64),
+        "model.language_model.layers.3.self_attn.k_proj.weight": torch.randn(32, 64),
+        "model.language_model.layers.3.self_attn.v_proj.weight": torch.randn(32, 64),
+        "model.language_model.layers.3.self_attn.o_proj.weight": torch.randn(64, 64),
+    }
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+
+    engine = RealSevenArmEngine(
+        method_arm="h2o_mtp",
+        config=small_cfg,
+        device="cpu",
+        checkpoint_dir=tmp_path,
+    )
+    assert engine.is_pretrained is True
+    assert engine.has_vision_encoder is True
+
+    res = engine.execute_request("req_pretrained_tiny", prompt_token_ids=[10, 11, 12], max_new_tokens=4)
+    assert res.gates["REAL_MODEL_FORWARD_PASS"] == "PASS"
+    assert res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS"
+    assert res.telemetry["architectural_status"] == "PRETRAINED_WEIGHTED_MODEL"
+    assert res.telemetry["pretrained_weights"]["loaded_tensors_count"] > 0
+    engine.close()

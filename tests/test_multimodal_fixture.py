@@ -64,9 +64,11 @@ def test_progressive_qualification_test_b_tokenizer(model_dir, canonical_fixture
 
 
 def test_progressive_qualification_test_c_multimodal_execution(model_dir, canonical_fixture):
-    """Progressive Qualification Test C: Multimodal Execution on Real Neural Engine."""
+    """Progressive Qualification Test C: Multimodal Execution on Real Pretrained Neural Engine."""
     tok = get_qualification_tokenizer(model_dir, require_real=True)
-    engine = RealSevenArmEngine(method_arm="base", device="cpu")
+    engine = RealSevenArmEngine(method_arm="base", device="cpu", checkpoint_dir=model_dir)
+    assert engine.is_pretrained is True
+    assert engine.has_vision_encoder is True
 
     report = canonical_fixture.run_test_c_qualification(
         engine=engine,
@@ -76,12 +78,14 @@ def test_progressive_qualification_test_c_multimodal_execution(model_dir, canoni
     )
 
     assert report["test_tier"] == "TEST_C_MULTIMODAL_QUALIFICATION"
-    assert report["status"] in ("QUALIFIED", "QUALIFIED_PRETRAINED", "QUALIFIED_SCAFFOLD_ONLY")
+    assert report["status"] == "QUALIFIED_PRETRAINED"
     assert report["image_sha256"] == CANONICAL_IMAGE_SHA256
     assert len(report["tokens_generated"]) == 4
     assert report["total_latency_ms"] > 0.0
     assert report["ttft_ms"] > 0.0
     assert report["gates"]["POLICY_HARNESS_PASS"] == "PASS"
+    assert report["gates"]["REAL_MODEL_FORWARD_PASS"] == "PASS"
+    assert report["gates"]["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS"
     assert report["gates"]["CCU_ISOLATION_PASS"] == "PASS"
 
     engine.close()

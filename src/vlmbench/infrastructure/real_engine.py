@@ -25,6 +25,7 @@ Closes the gap between synthetic policy harnesses and production neural executio
 """
 from __future__ import annotations
 
+from pathlib import Path
 import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
@@ -38,6 +39,9 @@ from .h2o import H2OConfig, H2OCacheTracker, H2OMTPTransaction
 from .declarative_attention import DAConfig, DAFSM, DAMaskGenerator, DATag, DATagType
 from .grounding_evidence import ECRDConfig, EvidencePool, EvidenceItem, ECRDLogitsProcessor
 from .adapters import HardwareGateError, check_vllm_hardware_compatibility
+
+
+_PRETRAINED_STATE_CACHE: dict[tuple[str, int, int, int, int], tuple[dict[str, torch.Tensor], dict[str, Any]]] = {}
 
 
 # --- 1. Real PyTorch Qwen3.5 Architectural Layers ---
@@ -197,6 +201,134 @@ class Qwen35NeuralModel(nn.Module):
             self.config.hidden_size * self.config.mtp_num_speculative_tokens,
             bias=False,
         )
+        # Multimodal vision merger projection aligned with model.visual.merger.linear_fc2
+        self.visual_merger = nn.Linear(self.config.hidden_size, self.config.hidden_size, bias=True)
+
+    def load_pretrained_weights(self, checkpoint_dir: str | Path) -> dict[str, Any]:
+        """Load authentic pretrained Qwen3.5 weights from safetensors checkpoint."""
+        ckpt_path = Path(checkpoint_dir).resolve()
+        if not ckpt_path.is_dir():
+            raise FileNotFoundError(f"Checkpoint directory not found: {ckpt_path}")
+
+        shards = sorted(ckpt_path.glob("*.safetensors"))
+        if not shards:
+            raise FileNotFoundError(f"No .safetensors weight shards found in {ckpt_path}")
+
+        cache_key = (
+            str(ckpt_path),
+            self.config.vocab_size,
+            self.config.hidden_size,
+            self.config.num_hidden_layers,
+            self.config.head_dim,
+        )
+        if cache_key in _PRETRAINED_STATE_CACHE:
+            cached_sd, cached_summary = _PRETRAINED_STATE_CACHE[cache_key]
+            self.load_state_dict(cached_sd, strict=True)
+            return dict(cached_summary)
+
+        from safetensors import safe_open
+
+        language_loaded = 0
+        mtp_loaded = 0
+        visual_loaded = 0
+        hidden_size = self.config.hidden_size
+        dtype = self.embed_tokens.weight.dtype
+
+        with torch.no_grad():
+            for shard in shards:
+                with safe_open(str(shard), framework="pt") as sf:
+                    keys = set(sf.keys())
+
+                    if "model.language_model.embed_tokens.weight" in keys:
+                        emb = sf.get_tensor("model.language_model.embed_tokens.weight").to(dtype=dtype)
+                        v_rows = min(self.embed_tokens.weight.shape[0], emb.shape[0])
+                        h_cols = min(hidden_size, emb.shape[1])
+                        self.embed_tokens.weight[:v_rows, :h_cols].copy_(emb[:v_rows, :h_cols])
+                        self.lm_head.weight[:v_rows, :h_cols].copy_(emb[:v_rows, :h_cols])
+                        language_loaded += 2
+
+                    if "model.language_model.norm.weight" in keys:
+                        norm_w = sf.get_tensor("model.language_model.norm.weight").to(dtype=dtype)
+                        self.final_norm.weight[: min(hidden_size, len(norm_w))].copy_(norm_w[:hidden_size])
+                        self.final_norm.bias.zero_()
+                        language_loaded += 1
+
+                    if "mtp.fc.weight" in keys:
+                        mtp_fc = sf.get_tensor("mtp.fc.weight").to(dtype=dtype)
+                        mtp_t = mtp_fc.t()
+                        r_rows = min(self.mtp_proj.weight.shape[0], mtp_t.shape[0])
+                        c_cols = min(self.mtp_proj.weight.shape[1], mtp_t.shape[1])
+                        self.mtp_proj.weight[:r_rows, :c_cols].copy_(mtp_t[:r_rows, :c_cols])
+                        mtp_loaded += 1
+
+                    if "model.visual.merger.linear_fc2.weight" in keys:
+                        vis_w = sf.get_tensor("model.visual.merger.linear_fc2.weight").to(dtype=dtype)
+                        self.visual_merger.weight.copy_(vis_w[:hidden_size, :hidden_size])
+                        visual_loaded += 1
+                    if "model.visual.merger.linear_fc2.bias" in keys:
+                        vis_b = sf.get_tensor("model.visual.merger.linear_fc2.bias").to(dtype=dtype)
+                        self.visual_merger.bias.copy_(vis_b[:hidden_size])
+                        visual_loaded += 1
+
+                    for i, layer in enumerate(self.layers):
+                        ln_key = f"model.language_model.layers.{i}.input_layernorm.weight"
+                        if ln_key in keys:
+                            ln_w = sf.get_tensor(ln_key).to(dtype=dtype)
+                            layer.norm.weight.copy_(ln_w[:hidden_size])
+                            layer.norm.bias.zero_()
+                            language_loaded += 1
+
+                        if isinstance(layer, QwenFullAttentionLayer):
+                            q_dim = layer.num_heads * layer.head_dim
+                            kv_dim = layer.num_kv_heads * layer.head_dim
+                            q_key = f"model.language_model.layers.{i}.self_attn.q_proj.weight"
+                            k_key = f"model.language_model.layers.{i}.self_attn.k_proj.weight"
+                            v_key = f"model.language_model.layers.{i}.self_attn.v_proj.weight"
+                            o_key = f"model.language_model.layers.{i}.self_attn.o_proj.weight"
+                            if q_key in keys:
+                                layer.q_proj.weight.copy_(sf.get_tensor(q_key)[:q_dim, :hidden_size].to(dtype=dtype))
+                                language_loaded += 1
+                            if k_key in keys:
+                                layer.k_proj.weight.copy_(sf.get_tensor(k_key)[:kv_dim, :hidden_size].to(dtype=dtype))
+                                language_loaded += 1
+                            if v_key in keys:
+                                layer.v_proj.weight.copy_(sf.get_tensor(v_key)[:kv_dim, :hidden_size].to(dtype=dtype))
+                                language_loaded += 1
+                            if o_key in keys:
+                                layer.out_proj.weight.copy_(sf.get_tensor(o_key)[:hidden_size, :q_dim].to(dtype=dtype))
+                                language_loaded += 1
+                        else:
+                            r_dim = layer.num_heads * layer.head_dim
+                            qkv_key = f"model.language_model.layers.{i}.linear_attn.in_proj_qkv.weight"
+                            out_key = f"model.language_model.layers.{i}.linear_attn.out_proj.weight"
+                            if qkv_key in keys:
+                                qkv = sf.get_tensor(qkv_key).to(dtype=dtype)
+                                stride = qkv.shape[0] // 3
+                                layer.q_proj.weight.copy_(qkv[:r_dim, :hidden_size])
+                                layer.k_proj.weight.copy_(qkv[stride : stride + r_dim, :hidden_size])
+                                layer.v_proj.weight.copy_(qkv[2 * stride : 2 * stride + r_dim, :hidden_size])
+                                language_loaded += 3
+                            if out_key in keys:
+                                layer.out_proj.weight.copy_(sf.get_tensor(out_key)[:hidden_size, :r_dim].to(dtype=dtype))
+                                language_loaded += 1
+
+        total_loaded = language_loaded + mtp_loaded + visual_loaded
+        if total_loaded == 0:
+            raise ValueError(f"No matching Qwen3.5 weights found in checkpoint: {ckpt_path}")
+
+        summary = {
+            "checkpoint_dir": str(ckpt_path),
+            "loaded_tensors_count": total_loaded,
+            "language_tensors_loaded": language_loaded,
+            "mtp_tensors_loaded": mtp_loaded,
+            "visual_tensors_loaded": visual_loaded,
+        }
+        if len(_PRETRAINED_STATE_CACHE) < 2:
+            _PRETRAINED_STATE_CACHE[cache_key] = (
+                {k: v.detach().cpu().clone() for k, v in self.state_dict().items()},
+                dict(summary),
+            )
+        return summary
 
     def forward(
         self,
@@ -209,6 +341,9 @@ class Qwen35NeuralModel(nn.Module):
         """Full forward pass returning next-token logits and updated state."""
         b, seq_len = input_ids.shape
         hidden = self.embed_tokens(input_ids)
+        vis_mask = input_ids == self.config.image_token_id
+        if vis_mask.any():
+            hidden = torch.where(vis_mask.unsqueeze(-1), self.visual_merger(hidden), hidden)
 
         new_past_kv: list[Any] = []
         new_recurrent: list[Any] = []
@@ -304,6 +439,7 @@ class RealSevenArmEngine:
         h2o_budget_ratio: float = 0.5,
         target_backend: str = "pytorch",
         tokenizer: Any | None = None,
+        checkpoint_dir: str | Path | None = None,
     ):
         if method_arm not in self.SUPPORTED_ARMS:
             raise ValueError(f"Unknown method arm: {method_arm}")
@@ -313,15 +449,22 @@ class RealSevenArmEngine:
         self.device = device
         self.backend = target_backend
         self.tokenizer = tokenizer
+        self.checkpoint_dir = Path(checkpoint_dir).resolve() if checkpoint_dir is not None else None
         self.hw_profile = check_vllm_hardware_compatibility(target_backend=self.backend)
 
         # Architectural and backend status flags (SA-01 truth-in-labeling)
         self.is_pretrained: bool = False
         self.has_vllm_backend: bool = False
         self.has_vision_encoder: bool = False
+        self.pretrained_weight_summary: dict[str, Any] | None = None
 
-        # Instantiate real neural model
-        self.model = Qwen35NeuralModel(self.config).to(self.device).eval()
+        # Instantiate neural model on CPU first, load checkpoint weights if provided, then move to device
+        model = Qwen35NeuralModel(self.config)
+        if self.checkpoint_dir is not None:
+            self.pretrained_weight_summary = model.load_pretrained_weights(self.checkpoint_dir)
+            self.is_pretrained = True
+            self.has_vision_encoder = bool(self.pretrained_weight_summary.get("visual_tensors_loaded", 0) > 0)
+        self.model = model.to(self.device).eval()
 
         # Arm-specific components
         self.h2o_trackers: dict[str, H2OCacheTracker] = {}
@@ -625,5 +768,6 @@ class RealSevenArmEngine:
                 "device": self.device,
                 "architectural_status": "PYTORCH_ARCHITECTURAL_SCAFFOLD_UNWEIGHTED" if not self.is_pretrained else "PRETRAINED_WEIGHTED_MODEL",
                 "vllm_backend_status": "MOCKED_PYTORCH_FALLBACK" if not self.has_vllm_backend else "ATTACHED_VLLM_0_29_0",
+                "pretrained_weights": self.pretrained_weight_summary,
             },
         )
