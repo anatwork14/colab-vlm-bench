@@ -89,3 +89,11 @@ def test_compare_refuses_incomplete_mismatched_or_unrelated_receipts(bad):
                    **({"status": bad["status"]} if "status" in bad else {}))
     with pytest.raises(ValueError):
         smoke.compare_receipts(_receipt(), cpu)
+
+
+def test_request_is_complete_at_eos_or_at_the_token_cap_and_not_otherwise():
+    # The engine never emits EOS (<|im_end|>), so an EOS stop is a short, complete output.
+    assert smoke.request_complete({"stop_reason": "eos", "tokens_generated_count": 3}) is True
+    assert smoke.request_complete({"stop_reason": "max_new_tokens", "tokens_generated_count": smoke.MAX_NEW_TOKENS}) is True
+    assert smoke.request_complete({"stop_reason": "max_new_tokens", "tokens_generated_count": 3}) is False
+    assert smoke.request_complete({"stop_reason": None, "tokens_generated_count": smoke.MAX_NEW_TOKENS}) is False

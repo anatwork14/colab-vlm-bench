@@ -126,13 +126,23 @@ def _guard(deadline: float, device: str) -> None:
         check_free_memory(gpu_snapshot()["free_mib"])
 
 
+def request_complete(record: dict[str, Any]) -> bool:
+    """A request is complete if it stopped at EOS (EOS is never emitted) or reached the token cap."""
+    reason = record.get("stop_reason")
+    if reason == "eos":
+        return True
+    return reason == "max_new_tokens" and record.get("tokens_generated_count") == MAX_NEW_TOKENS
+
+
 def _record(name: str, prompt: str, res: Any) -> dict[str, Any]:
     tokens = [int(t) for t in res.tokens_generated]
+    generation = (res.telemetry or {}).get("generation", {})
     return {
         "input": name,
         "prompt": prompt,
         "tokens": tokens,
         "tokens_generated_count": len(tokens),
+        "stop_reason": generation.get("stop_reason"),
         "output_text": res.output_text,
     }
 
@@ -215,9 +225,7 @@ def build_receipt(device: str) -> dict[str, Any]:
                 receipt["free_memory_checks"].append({"before_arm": arm, "free_mib": snap["free_mib"]})
                 check_free_memory(snap["free_mib"])
             receipt["results"][arm] = run_arm(device, arm, deadline)
-        complete = all(
-            r["tokens_generated_count"] == MAX_NEW_TOKENS for arm in ARMS for r in receipt["results"][arm]
-        )
+        complete = all(request_complete(r) for arm in ARMS for r in receipt["results"][arm])
         receipt["status"] = "RUN_COMPLETED" if complete else "RUN_INCOMPLETE"
     except SmokeAbort as exc:
         receipt["status"] = f"ABORTED: {exc}"
