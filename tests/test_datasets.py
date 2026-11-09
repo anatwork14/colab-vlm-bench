@@ -54,6 +54,65 @@ def test_missing_image_is_not_dropped(tmp_path):
         normalize_memlens(source, tmp_path, tmp_path / "out.jsonl")
 
 
+def test_memlens_multi_turn_multiple_images_and_date_headers(tmp_path):
+    # Verify multi-turn sessions with multiple images, 0 images, date headers, and image existence
+    needle_dir = tmp_path / "assets" / "release_images" / "needle_images"
+    haystack_dir = tmp_path / "assets" / "release_images" / "haystack_images"
+    needle_dir.mkdir(parents=True)
+    haystack_dir.mkdir(parents=True)
+
+    (needle_dir / "img1.jpg").write_bytes(b"img1")
+    (needle_dir / "img2.jpg").write_bytes(b"img2")
+    (haystack_dir / "img3.jpg").write_bytes(b"img3")
+
+    source = tmp_path / "multiturn.json"
+    source.write_text(json.dumps([{
+        "question_id": "q_multi",
+        "question_type": "information_extraction",
+        "question": "What items were seen across sessions?",
+        "answer": "Item 1, 2, 3",
+        "haystack_dates": ["2024-01-15", "2024-01-16"],
+        "haystack_session_ids": ["s1", "s2"],
+        "haystack_sessions": [
+            # Session 1: Turn 1 has 2 images, Turn 2 has 0 images
+            [
+                {"role": "user", "content": "Session 1 start", "images": [
+                    {"file": "needle_images/img1.jpg"},
+                    {"file": "needle_images/img2.jpg"},
+                ]},
+                {"role": "assistant", "content": "I see both images.", "images": []},
+            ],
+            # Session 2: Turn 1 has 1 image
+            [
+                {"role": "user", "content": "Session 2 follows", "images": [
+                    {"file": "haystack_images/img3.jpg"},
+                ]},
+            ],
+        ],
+        "answer_session_ids": ["s1", "s2"],
+    }]))
+
+    output = tmp_path / "multiturn_out.jsonl"
+    result = normalize_memlens(source, tmp_path / "assets", output)
+    assert result["count"] == 1
+    assert result["image_references"] == 3
+
+    records = load_jsonl(output, dataset="memlens", track="native_quality")
+    content = records[0]["messages"][0]["content"]
+
+    # Verify date headers
+    assert any("[Session s1 — 2024-01-15]" in p.get("text", "") for p in content)
+    assert any("[Session s2 — 2024-01-16]" in p.get("text", "") for p in content)
+
+    # Verify images
+    image_parts = [p for p in content if p.get("type") == "image_path"]
+    assert len(image_parts) == 3
+    assert image_parts[0]["path"].endswith("img1.jpg")
+    assert image_parts[1]["path"].endswith("img2.jpg")
+    assert image_parts[2]["path"].endswith("img3.jpg")
+    assert records[0]["meta"]["image_count"] == 3
+
+
 def test_bin_requires_real_model_token_counts():
     rows = [{
         "id": "q1", "model_token_counts": {"qwen35_08b": {

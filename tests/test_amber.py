@@ -460,3 +460,91 @@ def test_score_amber_generative_missing_does_not_count_as_hallucination():
     assert scores["hallucination_rate"] == 0.0
 
 
+def test_score_amber_discriminative_mathematical_edge_cases():
+    # Mathematical edge cases audit:
+    # 1. Zero TP (Positives exist, predicted No)
+    gt_zero_tp = [{"id": "1", "label": "Yes", "type": "existence"}]
+    preds_zero_tp = [{"id": "1", "prediction": "No"}]
+    res_zero_tp = score_amber_discriminative(preds_zero_tp, gt_zero_tp)
+    assert res_zero_tp["overall"]["tp"] == 0
+    assert res_zero_tp["overall"]["fn"] == 1
+    assert res_zero_tp["overall"]["precision"] is None  # No positive predictions made
+    assert res_zero_tp["overall"]["recall"] == 0.0
+    assert res_zero_tp["overall"]["f1"] == 0.0  # Positives existed but none found
+    assert res_zero_tp["overall"]["accuracy"] == 0.0
+
+    # 2. Zero FP (Positives answered Yes, negatives answered No)
+    gt_zero_fp = [
+        {"id": "1", "label": "Yes", "type": "existence"},
+        {"id": "2", "label": "No", "type": "existence"},
+    ]
+    preds_zero_fp = [
+        {"id": "1", "prediction": "Yes"},
+        {"id": "2", "prediction": "No"},
+    ]
+    res_zero_fp = score_amber_discriminative(preds_zero_fp, gt_zero_fp)
+    assert res_zero_fp["overall"]["fp"] == 0
+    assert res_zero_fp["overall"]["precision"] == 1.0
+    assert res_zero_fp["overall"]["recall"] == 1.0
+    assert res_zero_fp["overall"]["f1"] == 1.0
+    assert res_zero_fp["overall"]["hallucination_rate"] == 0.0
+    assert res_zero_fp["overall"]["accuracy"] == 1.0
+
+    # 3. Zero TN (Negatives exist, but all predicted Yes -> all hallucinated)
+    gt_zero_tn = [{"id": "1", "label": "No", "type": "existence"}]
+    preds_zero_tn = [{"id": "1", "prediction": "Yes"}]
+    res_zero_tn = score_amber_discriminative(preds_zero_tn, gt_zero_tn)
+    assert res_zero_tn["overall"]["tn"] == 0
+    assert res_zero_tn["overall"]["fp"] == 1
+    assert res_zero_tn["overall"]["hallucination_rate"] == 1.0
+    assert res_zero_tn["overall"]["accuracy"] == 0.0
+
+    # 4. Zero FN (Positives exist, all predicted Yes)
+    gt_zero_fn = [{"id": "1", "label": "Yes", "type": "existence"}]
+    preds_zero_fn = [{"id": "1", "prediction": "Yes"}]
+    res_zero_fn = score_amber_discriminative(preds_zero_fn, gt_zero_fn)
+    assert res_zero_fn["overall"]["fn"] == 0
+    assert res_zero_fn["overall"]["recall"] == 1.0
+    assert res_zero_fn["overall"]["f1"] == 1.0
+
+    # 5. All Missing (1 Yes, 1 No, zero predictions provided)
+    gt_all_missing = [
+        {"id": "1", "label": "Yes", "type": "existence"},
+        {"id": "2", "label": "No", "type": "existence"},
+    ]
+    res_all_missing = score_amber_discriminative([], gt_all_missing)
+    assert res_all_missing["overall"]["count"] == 2
+    assert res_all_missing["overall"]["missing_count"] == 2
+    assert res_all_missing["overall"]["accuracy"] == 0.0
+    assert res_all_missing["overall"]["fn"] == 1  # Missing positive counts as FN
+    assert res_all_missing["overall"]["recall"] == 0.0
+    assert res_all_missing["overall"]["f1"] == 0.0
+
+    # 6. All Unparseable (1 Yes, 1 No, non-binary text answers)
+    preds_all_unparseable = [
+        {"id": "1", "prediction": "Gibberish"},
+        {"id": "2", "prediction": "Also gibberish"},
+    ]
+    res_all_unparseable = score_amber_discriminative(preds_all_unparseable, gt_all_missing)
+    assert res_all_unparseable["overall"]["count"] == 2
+    assert res_all_unparseable["overall"]["unparseable_count"] == 2
+    assert res_all_unparseable["overall"]["accuracy"] == 0.0
+    assert res_all_unparseable["overall"]["fn"] == 1  # Unparseable positive counts as FN
+    assert res_all_unparseable["overall"]["recall"] == 0.0
+    assert res_all_unparseable["overall"]["f1"] == 0.0
+
+
+def test_score_amber_generative_all_hallucinated_edge_case():
+    # Model mentions 2 objects, but both are hallucinations
+    ann = [{"id": "1", "objects": ["dog"]}]
+    preds = [{"id": "1", "prediction": "A red car and a bicycle."}]
+    scores = score_amber_generative(preds, ann)
+    assert scores["count"] == 1
+    assert scores["chair_i"] == 1.0  # 2/2 objects hallucinated
+    assert scores["chair_s"] == 1.0
+    assert scores["precision"] == 0.0  # 0/2 correct
+    assert scores["recall"] == 0.0  # 0/1 gt objects covered
+    assert scores["f1"] == 0.0  # Must be 0.0, strictly not None!
+
+
+

@@ -471,7 +471,8 @@ def score_amber_discriminative(
         tot = counts["total"]
         if tot == 0:
             return {
-                "count": 0, "accuracy": None, "precision": None,
+                "count": 0, "tp": 0, "fp": 0, "tn": 0, "fn": 0,
+                "accuracy": None, "precision": None,
                 "recall": None, "f1": None, "hallucination_rate": None,
                 "yes_ratio": None, "unparseable_count": 0, "missing_count": 0,
             }
@@ -484,7 +485,11 @@ def score_amber_discriminative(
         # Precision & Recall on positive class
         prec = tp / (tp + fp) if (tp + fp) > 0 else (0.0 if tp == 0 and fp > 0 else None)
         rec = tp / (tp + fn) if (tp + fn) > 0 else (0.0 if tp == 0 and fn > 0 else None)
-        f1 = (2 * prec * rec / (prec + rec)) if (prec is not None and rec is not None and (prec + rec) > 0) else None
+        f1 = (
+            (2 * prec * rec / (prec + rec))
+            if (prec is not None and rec is not None and (prec + rec) > 0)
+            else (0.0 if (prec == 0.0 or rec == 0.0) else None)
+        )
 
         valid_predictions = tp + fp + tn + fn
         yes_ratio = (tp + fp) / valid_predictions if valid_predictions > 0 else None
@@ -495,6 +500,10 @@ def score_amber_discriminative(
 
         return {
             "count": tot,
+            "tp": tp,
+            "fp": fp,
+            "tn": tn,
+            "fn": fn,
             "accuracy": acc,
             "precision": prec,
             "recall": rec,
@@ -654,7 +663,7 @@ def score_amber_generative(
     f1 = (
         (2 * precision * recall / (precision + recall))
         if (precision is not None and recall is not None and (precision + recall) > 0)
-        else None
+        else (0.0 if (precision == 0.0 or recall == 0.0) else None)
     )
 
     return {
