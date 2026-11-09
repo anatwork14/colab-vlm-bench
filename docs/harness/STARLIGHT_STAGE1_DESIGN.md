@@ -17,8 +17,9 @@ external eviction   = H2O-proposed candidates only
 - When protected count > budget, the plan is `INFEASIBLE_PROTECTED_EXCEEDS_BUDGET`. Protected
   entries stay, unprotected candidates are evicted, and the overflow is reported. It is never
   silently dropped.
-- A candidate set that would leave more than `budget` entries retained is rejected with
-  `ValueError`. The policy does not accept an inconsistent caller.
+- A candidate set that would leave more than `budget` entries retained is reported as
+  `INFEASIBLE_UNMET_AFTER_ELIGIBLE`, never silently. Caller errors (candidates supplied when nothing
+  needs eviction) raise `ValueError`.
 
 ## 2. Components
 
@@ -208,7 +209,7 @@ Decision records are opt-in (`starlight_record_decisions=True`).
 | I-5 budget when feasible | covered | pure random consistent plans; engine `max_retained_per_layer_step` |
 | I-6 GDN exempt and labelled | partial | exempt and labelled (`test_HC12_*`). The byte-identity hash of GDN state is NOT tested. |
 | I-7 position preservation | partial | survivors keep original ids (`test_I7_*`). RoPE tensor values are NOT compared. |
-| I-8 vision_start/end never evicted | NOT satisfied (open A-4) | measured as `structural_tokens_evicted` and marked `NOT_RATIFIED_A4_POLICY_DEPENDENT`. Not protected. |
+| I-8 vision_start/end never evicted | protected through the structural source (lead decision Q2, `PROTECTED_LEAD_DECISION_Q2`); owner ratification of A-4 open | measured as `structural_tokens_evicted` and marked `NOT_RATIFIED_A4_POLICY_DEPENDENT`. |
 | I-9 determinism | covered | `test_I9_HC15_*` |
 | I-10 complete decision records | covered | `test_I10_*`; records are keyed by original position |
 | A-DA | covered | `test_A_DA_*` on the conflict fixture |
@@ -229,19 +230,19 @@ Decision records are opt-in (`starlight_record_decisions=True`).
 | HC-8 malformed declaration | covered for spans and sha | `test_HC8_*` raises. No score declarations exist, so NaN scores are not applicable. |
 | HC-9 multi-request isolation | partial | sequential isolation test. Interleaved batches are not possible: `execute_request` is synchronous. |
 | HC-10 multi-turn / evicted never returns | partial | `test_HC10_*` covers evicted-not-returning within a request. The engine carries no KV across calls, so cross-turn KV is not applicable. |
-| HC-11 no eligible candidates | covered | `test_HC11_*`. Unmet budget with no candidates raises ValueError (open A-2). |
+| HC-11 no eligible candidates | covered | `test_HC11_*`. Unmet budget after all eligible candidates returns `INFEASIBLE_UNMET_AFTER_ELIGIBLE` (open A-2 ruling). |
 | HC-12 GDN exemption | partial | label and exemption covered. Hash identity NOT tested. |
-| HC-13 vision span integrity | partial, open A-4 | structural tokens measured; not protected |
+| HC-13 vision span integrity | partial, open A-4 | structural tokens protected (Q2) and measured; A-4 ratification open |
 | HC-14 cache consistency | partial | length counter checked every step (`test_HC14_*`). Logit recomputation NOT done. |
 | HC-15 determinism | covered | `test_I9_HC15_*` |
 
 Auditor ambiguities (A-1..A-6) and the choices made:
 
 - A-1 budget granularity: per (request, FA layer), applied to both KV heads (oracle default).
-- A-2 budget unmet with no eligible candidates: NOT a status. The policy raises ValueError. Open.
+- A-2 budget unmet with no eligible candidates: a status, `STATUS_INFEASIBLE` with `INFEASIBLE_UNMET_AFTER_ELIGIBLE` (code behaviour, 133d5c5). Owner ruling still open.
 - A-3 per-head protection: a protected position is protected in all KV heads of the layer
   (conservative oracle default). Positions are shared across heads.
-- A-4 structural tokens: not ratified. Measured, not protected. Open.
+- A-4 structural tokens: protected through the structural source (lead decision Q2) and measured. Owner ratification still open.
 - A-5 missing declarations: explicit status, no protection. Not fail-closed. Open.
 - A-6 eviction timing: decode only. Prefill is never evicted. Each record states `phase: "decode"`.
 
