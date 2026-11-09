@@ -41,6 +41,7 @@ class H2OLayerState:
     # evicted_mask[i] == True if token i is physically evicted from KV cache
     visual_token_mask: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=bool))
     # Per-layer physical-token coordinates; MUST NOT be shared between layers.
+    budget: int | None = None  # Fixed total KV budget, set once from prefill length
 
     def __post_init__(self) -> None:
         if self.scores.shape[0] != self.num_kv_heads:
@@ -105,28 +106,58 @@ class H2OCacheTracker:
 
         layer.scores[:, :k_len] += query_sum
 
+    def _budget_for_length(self, length: int) -> int:
+        return max(self.config.min_budget, int(length * self.config.budget_ratio))
+
+    def initialize_budget(self, layer_idx: int, prefill_length: int) -> int:
+        """Fix this layer's total KV budget from the PREFILL length (upstream H2O semantics).
+
+        The budget is computed once and never re-derived from the compacted cache length.
+        Re-deriving it each step made retention decay geometrically (300 -> 150 -> 75 -> 38 -> 32).
+        """
+        layer = self.layers[layer_idx]
+        if prefill_length < 0:
+            raise ValueError("prefill_length must be non-negative")
+        layer.budget = self._budget_for_length(prefill_length)
+        return layer.budget
+
     def compute_eviction_plan(self, layer_idx: int, current_length: int) -> tuple[np.ndarray, dict[str, Any]]:
-        """Calculate which tokens to retain vs evict based on H2O policy.
+        """Plan retained positions for a layer with a FIXED total budget.
+
+        Semantics (documented deviation from unbounded protected sets):
+        - Budget B = max(min_budget, int(prefill_length * budget_ratio)), fixed per layer.
+        - Protected tokens (sinks and visual tokens) are INSIDE B. If they alone reach B,
+          the plan keeps all protected tokens plus the newest token and sets
+          metrics["protected_saturated"]=True. No heavy hitters are kept in that case.
+        - Evict only when current_length > B. Otherwise nothing is evicted.
+        - Otherwise keep: protected + recent window (sized from B - protected) + the
+          highest-scoring remaining tokens to fill exactly B.
 
         Returns:
             (retained_mask, metrics_dict) where retained_mask is bool array of length current_length.
         """
         layer = self.layers[layer_idx]
-        if layer.is_recurrent or current_length <= self.config.min_budget:
-            # All tokens retained
+        if layer.is_recurrent:
             return np.ones(current_length, dtype=bool), {
                 "total_tokens": current_length,
                 "retained_tokens": current_length,
                 "evicted_tokens": 0,
                 "heavy_hitters": 0,
                 "recent_tokens": current_length,
+                "protected_tokens": 0,
+                "budget": None,
+                "protected_saturated": False,
                 "logical_selection_fraction": 0.0,
                 "kv_bytes_freed": "NOT_MEASURED_LOGICAL_MASK_ONLY",
             }
 
-        # Per-layer cache shapes diverge after KV compaction. Keep visual-token
-        # coordinates separate for each full-attention layer; append false for
-        # newly generated text tokens. NEVER mutate the original global mask.
+        if layer.budget is None:
+            # Fallback only when the engine did not call initialize_budget(); the
+            # engine always does so after prefill.
+            layer.budget = self._budget_for_length(current_length)
+        budget = layer.budget
+
+        # Per-layer mask bookkeeping (positions move after compaction; never mutate the global mask).
         if len(layer.visual_token_mask) < current_length:
             layer.visual_token_mask = np.pad(
                 layer.visual_token_mask,
@@ -146,71 +177,69 @@ class H2OCacheTracker:
                 constant_values=0.0,
             )
 
-        target_budget = max(self.config.min_budget, int(current_length * self.config.budget_ratio))
-        recent_size = max(1, int(target_budget * self.config.recent_ratio))
+        if current_length <= budget:
+            # Zero eviction while the cache fits the fixed budget.
+            layer.evicted_mask[:current_length] = False
+            return np.ones(current_length, dtype=bool), {
+                "total_tokens": current_length,
+                "retained_tokens": current_length,
+                "evicted_tokens": 0,
+                "heavy_hitters": 0,
+                "recent_tokens": current_length,
+                "protected_tokens": 0,
+                "budget": budget,
+                "protected_saturated": False,
+                "logical_selection_fraction": 0.0,
+                "kv_bytes_freed": "NOT_MEASURED_LOGICAL_MASK_ONLY",
+            }
 
         retained = np.zeros(current_length, dtype=bool)
 
-        # 1. Permanently protect initial system tokens
-        sys_protected = min(self.config.protect_system_tokens, current_length)
-        retained[:sys_protected] = True
+        # 1. Permanently protect initial system tokens.
+        retained[:min(self.config.protect_system_tokens, current_length)] = True
 
-        # 2. Protect visual tokens if configured (before computing recent window budget)
+        # 2. Protect visual tokens (per-layer physical coordinates).
         if self.config.protect_visual_tokens and len(layer.visual_token_mask) > 0:
             active_len = min(current_length, len(layer.visual_token_mask))
             retained[:active_len] |= layer.visual_token_mask[:active_len]
 
         protected_count = int(np.sum(retained))
-        unprotected_count = current_length - protected_count
-        if protected_count + recent_size >= current_length and unprotected_count > 2:
-            # When protected visual/system tokens dominate the sequence, budget the non-protected text tail
-            text_budget = max(2, int(unprotected_count * self.config.budget_ratio))
-            recent_size = max(1, int(text_budget * self.config.recent_ratio))
-            target_budget = protected_count + text_budget
+        protected_saturated = protected_count >= budget
 
-        # 3. Retain most recent local window
-        recent_start = max(0, current_length - recent_size)
-        retained[recent_start:] = True
+        # 3. Recent window sized from the budget left after protection (always >= 1: newest token).
+        free_budget = max(0, budget - protected_count)
+        recent_size = max(1, int(free_budget * self.config.recent_ratio))
+        retained[max(0, current_length - recent_size):] = True
 
-        # 4. Fill remaining budget with top-scoring heavy hitters from eviction candidates
+        # 4. Fill to exactly the fixed budget with score-selected heavy hitters.
         current_retained_count = int(np.sum(retained))
-        hh_budget = max(0, target_budget - current_retained_count)
+        hh_budget = max(0, budget - current_retained_count)
         candidate_indices = np.where(~retained)[0]
-        selected_count = 0  # Only newly selected scored candidates are heavy hitters.
+        selected_count = 0
         if len(candidate_indices) > 0 and hh_budget > 0:
-            # Defensive check: ensure layer.scores covers current_length
-            if layer.scores.shape[1] < current_length:
-                pad_len = current_length - layer.scores.shape[1]
-                layer.scores = np.pad(layer.scores, ((0, 0), (0, pad_len)), mode="constant")
-                layer.evicted_mask = np.pad(layer.evicted_mask, (0, pad_len), mode="constant", constant_values=False)
-
-            # Average score across KV heads
             layer_scores = layer.scores[:, :current_length].mean(axis=0)
             candidate_scores = layer_scores[candidate_indices]
-
-            # Deterministic sorting: sort by score descending, tie-break by index
+            # Deterministic: score descending, ties broken toward later (more recent) positions.
             if self.config.tie_breaking == "recent":
-                # Primary key: score, secondary key: index
                 order = np.lexsort((candidate_indices, candidate_scores))[::-1]
             else:
                 order = np.argsort(-candidate_scores)
-
             selected_count = min(len(order), hh_budget)
-            chosen_hh = candidate_indices[order[:selected_count]]
-            retained[chosen_hh] = True
+            retained[candidate_indices[order[:selected_count]]] = True
 
         evicted_count = int(np.sum(~retained))
         retained_count = int(np.sum(retained))
-        hh_count = selected_count  # Protected visual tokens are NOT heavy hitters.
-
         layer.evicted_mask[:current_length] = ~retained
 
         metrics = {
             "total_tokens": current_length,
             "retained_tokens": retained_count,
             "evicted_tokens": evicted_count,
-            "heavy_hitters": hh_count,
+            "heavy_hitters": selected_count,  # Protected visual tokens are NOT heavy hitters.
             "recent_tokens": recent_size,
+            "protected_tokens": protected_count,
+            "budget": budget,
+            "protected_saturated": bool(protected_saturated),
             "logical_selection_fraction": float(evicted_count / max(1, current_length)),
             "kv_bytes_freed": "NOT_MEASURED_LOGICAL_MASK_ONLY",
         }
@@ -297,6 +326,12 @@ class H2OMTPTransaction:
             raise RuntimeError("No active MTP transaction to commit")
         if accepted_tokens < 0:
             raise ValueError(f"accepted_tokens cannot be negative: {accepted_tokens}")
+        proposed = max(0, self.tracker.seq_len - self._snapshot["seq_len"])
+        if accepted_tokens > proposed:
+            raise ValueError(
+                f"accepted_tokens {accepted_tokens} exceed {proposed} proposed tokens; "
+                "refusing to commit positions that were never scored"
+            )
 
         if accepted_tokens == 0:
             self.rollback()

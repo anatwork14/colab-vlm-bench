@@ -159,11 +159,24 @@ def _install_seven_arm_attention_hooks(hf_model: Any, hook_ctx: _HookStepContext
 
                 kv_bytes_before = (key_states.nelement() + value_states.nelement()) * key_states.element_size()
                 physical_bytes_freed = 0
+                pre_compaction_len = key_states.shape[2]
+                mask_len_received = None if attention_mask is None else int(attention_mask.shape[-1])
+
+                # Attention mask invariant: HF builds the decode mask from the PRE-compaction
+                # cache, so its width must equal the pre-compaction KV length exactly.
+                if attention_mask is not None and mask_len_received != pre_compaction_len:
+                    raise ValueError(
+                        f"Layer {l_idx}: attention mask width {mask_len_received} does not match "
+                        f"KV length {pre_compaction_len}; refusing a silent slice"
+                    )
 
                 # 1. H2O Physical KV Eviction & Tensor Compaction on official DynamicLayer cache
                 h2o_plans = getattr(hook_ctx, "h2o_eviction_plans", None)
                 h2o_retained = h2o_plans.get(l_idx) if h2o_plans else None
                 if h2o_retained is not None and len(h2o_retained) < key_states.shape[2]:
+                    if attention_mask is not None:
+                        # Select mask columns by the SAME retained positions as the KV cache.
+                        attention_mask = torch.index_select(attention_mask, dim=-1, index=h2o_retained)
                     key_states = torch.index_select(key_states, dim=2, index=h2o_retained).contiguous()
                     value_states = torch.index_select(value_states, dim=2, index=h2o_retained).contiguous()
                     if past_key_values is not None and l_idx < len(past_key_values.layers):
@@ -180,7 +193,12 @@ def _install_seven_arm_attention_hooks(hf_model: Any, hook_ctx: _HookStepContext
 
                 attn_logits = torch.matmul(query_states, key_rep.transpose(2, 3)) * mod.scaling
                 if attention_mask is not None:
-                    attn_logits = attn_logits + attention_mask[..., :k_len]
+                    if attention_mask.shape[-1] != k_len:
+                        raise ValueError(
+                            f"Layer {l_idx}: aligned attention mask width {attention_mask.shape[-1]} "
+                            f"!= KV length {k_len}"
+                        )
+                    attn_logits = attn_logits + attention_mask
 
                 # 2. Declarative Attention (DA) Logit Masking (preserves 100% of KV residency)
                 da_masks = getattr(hook_ctx, "da_masks", None)
@@ -202,6 +220,8 @@ def _install_seven_arm_attention_hooks(hf_model: Any, hook_ctx: _HookStepContext
                 if hasattr(hook_ctx, "layer_telemetries"):
                     hook_ctx.layer_telemetries[l_idx] = {
                         "kv_seq_len": k_len,
+                        "attention_mask_len": None if attention_mask is None else int(attention_mask.shape[-1]),
+                        "attention_mask_len_received": mask_len_received,
                         "kv_bytes_allocated": (key_states.nelement() + value_states.nelement()) * key_states.element_size(),
                         "physical_bytes_freed": physical_bytes_freed,
                     }
@@ -618,28 +638,31 @@ class Qwen35NeuralModel(nn.Module):
                         mapped_keys.add("model.language_model.norm.weight")
                         mapped_sf_params += int(norm_w.numel())
 
+                    # Projection tensors are mapped ONLY on exact shape match. A mismatched
+                    # tensor stays unmapped so coverage cannot be inflated by silent slicing.
                     if "mtp.fc.weight" in keys:
                         mtp_fc = sf.get_tensor("mtp.fc.weight").to(dtype=dtype)
                         mtp_t = mtp_fc.t()
-                        r_rows = min(self.mtp_proj.weight.shape[0], mtp_t.shape[0])
-                        c_cols = min(self.mtp_proj.weight.shape[1], mtp_t.shape[1])
-                        self.mtp_proj.weight[:r_rows, :c_cols].copy_(mtp_t[:r_rows, :c_cols])
-                        mtp_loaded += 1
-                        mapped_keys.add("mtp.fc.weight")
-                        mapped_sf_params += int(mtp_fc.numel())
+                        if tuple(mtp_t.shape) == tuple(self.mtp_proj.weight.shape):
+                            self.mtp_proj.weight.copy_(mtp_t)
+                            mtp_loaded += 1
+                            mapped_keys.add("mtp.fc.weight")
+                            mapped_sf_params += int(mtp_fc.numel())
 
                     if "model.visual.merger.linear_fc2.weight" in keys:
                         vis_w = sf.get_tensor("model.visual.merger.linear_fc2.weight").to(dtype=dtype)
-                        self.visual_merger.weight.copy_(vis_w[:hidden_size, :hidden_size])
-                        visual_loaded += 1
-                        mapped_keys.add("model.visual.merger.linear_fc2.weight")
-                        mapped_sf_params += int(vis_w.numel())
+                        if tuple(vis_w.shape) == tuple(self.visual_merger.weight.shape):
+                            self.visual_merger.weight.copy_(vis_w)
+                            visual_loaded += 1
+                            mapped_keys.add("model.visual.merger.linear_fc2.weight")
+                            mapped_sf_params += int(vis_w.numel())
                     if "model.visual.merger.linear_fc2.bias" in keys:
                         vis_b = sf.get_tensor("model.visual.merger.linear_fc2.bias").to(dtype=dtype)
-                        self.visual_merger.bias.copy_(vis_b[:hidden_size])
-                        visual_loaded += 1
-                        mapped_keys.add("model.visual.merger.linear_fc2.bias")
-                        mapped_sf_params += int(vis_b.numel())
+                        if tuple(vis_b.shape) == tuple(self.visual_merger.bias.shape):
+                            self.visual_merger.bias.copy_(vis_b)
+                            visual_loaded += 1
+                            mapped_keys.add("model.visual.merger.linear_fc2.bias")
+                            mapped_sf_params += int(vis_b.numel())
 
                     for i, layer in enumerate(self.layers):
                         ln_key = f"model.language_model.layers.{i}.input_layernorm.weight"
@@ -663,7 +686,9 @@ class Qwen35NeuralModel(nn.Module):
                                 full_k = f"model.language_model.layers.{i}.self_attn.{key_suffix}"
                                 if full_k in keys:
                                     t = sf.get_tensor(full_k).to(dtype=dtype)
-                                    getattr(layer, proj_attr).weight.copy_(t[:rows, :cols])
+                                    if tuple(t.shape) != (rows, cols):
+                                        continue  # shape mismatch: leave unmapped, never slice
+                                    getattr(layer, proj_attr).weight.copy_(t)
                                     language_loaded += 1
                                     mapped_keys.add(full_k)
                                     mapped_sf_params += int(t.numel())
@@ -673,19 +698,21 @@ class Qwen35NeuralModel(nn.Module):
                             out_key = f"model.language_model.layers.{i}.linear_attn.out_proj.weight"
                             if qkv_key in keys:
                                 qkv = sf.get_tensor(qkv_key).to(dtype=dtype)
-                                stride = qkv.shape[0] // 3
-                                layer.q_proj.weight.copy_(qkv[:r_dim, :hidden_size])
-                                layer.k_proj.weight.copy_(qkv[stride : stride + r_dim, :hidden_size])
-                                layer.v_proj.weight.copy_(qkv[2 * stride : 2 * stride + r_dim, :hidden_size])
-                                language_loaded += 3
-                                mapped_keys.add(qkv_key)
-                                mapped_sf_params += int(qkv.numel())
+                                if tuple(qkv.shape) == (3 * r_dim, hidden_size):
+                                    stride = r_dim
+                                    layer.q_proj.weight.copy_(qkv[:r_dim, :])
+                                    layer.k_proj.weight.copy_(qkv[stride : stride + r_dim, :])
+                                    layer.v_proj.weight.copy_(qkv[2 * stride : 2 * stride + r_dim, :])
+                                    language_loaded += 3
+                                    mapped_keys.add(qkv_key)
+                                    mapped_sf_params += int(qkv.numel())
                             if out_key in keys:
                                 t_out = sf.get_tensor(out_key).to(dtype=dtype)
-                                layer.out_proj.weight.copy_(t_out[:hidden_size, :r_dim])
-                                language_loaded += 1
-                                mapped_keys.add(out_key)
-                                mapped_sf_params += int(t_out.numel())
+                                if tuple(t_out.shape) == (hidden_size, r_dim):
+                                    layer.out_proj.weight.copy_(t_out)
+                                    language_loaded += 1
+                                    mapped_keys.add(out_key)
+                                    mapped_sf_params += int(t_out.numel())
 
         total_loaded = language_loaded + mtp_loaded + visual_loaded
         if total_loaded == 0:
@@ -736,8 +763,15 @@ class Qwen35NeuralModel(nn.Module):
         mm_encoder_outputs: dict[str, Any] | None = None,
         compute_mtp: bool = False,
         mtp_position_ids: torch.Tensor | None = None,
+        logits_to_keep: int = 1,
     ) -> dict[str, Any]:
-        """Full forward pass routing through hooked official HF model when attached, or scaffold layers."""
+        """Full forward pass routing through hooked official HF model when attached, or scaffold layers.
+
+        `logits_to_keep` = number of trailing positions whose logits are returned. `logits`,
+        `full_logits[:, -1]` and the MTP draft all refer to the LAST kept position.
+        """
+        if type(logits_to_keep) is not int or logits_to_keep < 1:
+            raise ValueError("logits_to_keep must be a positive integer")
         if self.hf_model is not None and self.hook_ctx is not None:
             from transformers.models.qwen3_5 import modeling_qwen3_5
 
@@ -759,7 +793,7 @@ class Qwen35NeuralModel(nn.Module):
                     position_ids=position_ids,
                     past_key_values=past_key_values,
                     mm_encoder_outputs=mm_encoder_outputs,
-                    logits_to_keep=1,
+                    logits_to_keep=logits_to_keep,
                     use_cache=True,
                     output_hidden_states=True,
                 )
@@ -795,7 +829,9 @@ class Qwen35NeuralModel(nn.Module):
                     "layer_telemetries": layer_telemetries,
                 }
 
-        # Reference PyTorch scaffold path
+        # Reference PyTorch scaffold path (last position only; multi-position verify is official-path only)
+        if logits_to_keep != 1:
+            raise ValueError("scaffold forward supports logits_to_keep=1 only")
         b, seq_len = input_ids.shape
         hidden = self.embed_tokens(input_ids)
         vis_mask = input_ids == self.config.image_token_id
@@ -851,6 +887,41 @@ class Qwen35NeuralModel(nn.Module):
         }
 
 
+DA_DECODE_ONLY_LABEL = "decode_only_scripted_da_diagnostic"
+
+
+def _da_scripted_tags(
+    anchor_len: int, phys_len: int, n_visual: int, image_present: bool,
+    question_start: int | None = None,
+) -> list[DATag]:
+    """SCRIPTED DA diagnostic geometry, fixed from the prompt anchor.
+
+    Sink, focus and visual-segment bounds are computed ONCE from the prefill length, so
+    the prompt region keeps the same tag class at every decode step. Only the trailing
+    LOCAL window moves with the generated suffix (phys_len). Deriving the bounds from the
+    growing KV length instead reclassified prompt keys between steps.
+
+    DOCUMENTED DEVIATION: when question_start is given (image prompts: the span after the
+    last vision_end token), that question/instruction span is GLOBAL, so every query can
+    read it. Without this the LOCAL window hid question tokens from the newest query.
+    Text-only prompts have no question split, so no deviation is applied to them.
+    """
+    sink_end = min(16, max(1, anchor_len // 4))
+    if not n_visual and image_present:
+        n_visual = min(4, max(0, anchor_len - sink_end - 1))
+    tags = [DATag(DATagType.GLOBAL, start_idx=0, end_idx=sink_end)]
+    if question_start is not None and question_start < anchor_len:
+        tags.append(DATag(DATagType.GLOBAL, start_idx=question_start, end_idx=anchor_len))
+    if anchor_len > sink_end + 1:
+        focus_end = min(anchor_len - 1, sink_end + max(1, n_visual))
+        tags.append(DATag(
+            DATagType.FOCUS, start_idx=sink_end, end_idx=focus_end,
+            focus_id="scripted_visual_segment",
+        ))
+        tags.append(DATag(DATagType.LOCAL, start_idx=focus_end, end_idx=phys_len, window=8))
+    return tags
+
+
 # --- 2. Production Seven-Arm Engine with True Backend Interventions ---
 
 @dataclass
@@ -867,7 +938,7 @@ class RealExecutionResult:
     logical_selection_fraction: float
     attention_read_restriction_ratio: float
     grounded_citations: list[dict[str, Any]]
-    mtp_acceptance_rate: float
+    mtp_acceptance_rate: float | None  # None = not verified (serving arm); see _speculative_mtp_greedy_k1
     attention_mask_restriction_ratio: float = 0.0
     gates: dict[str, str] = field(default_factory=dict)
     telemetry: dict[str, Any] = field(default_factory=dict)
@@ -980,6 +1051,14 @@ class RealSevenArmEngine:
             self.h2o_trackers[request_id] = tracker
         return self.h2o_trackers[request_id]
 
+    ECRD_ALPHA_RULE = "3.5 if official_hf_hooked and image_present else 20.0"
+
+    def _ecrd_alpha(self, image_present: bool) -> float:
+        """Condition-dependent ECRD boost. UNCALIBRATED: the two values differ by condition, so
+        ECRD results from official+image runs and from other runs are NOT directly comparable.
+        Do not retune against benchmark answers; disclosed in telemetry as the confounder."""
+        return 3.5 if (self.is_official_hf_hooked and image_present) else 20.0
+
     def _get_or_create_ecrd_processor(
         self,
         request_id: str,
@@ -1013,7 +1092,7 @@ class RealSevenArmEngine:
 
         tok = self.tokenizer if self.tokenizer is not None else _LocalTokenizer()
         p = pool or EvidencePool(request_id)
-        alpha = 3.5 if (self.is_official_hf_hooked and image_present) else 20.0
+        alpha = self._ecrd_alpha(image_present)
         proc = ECRDLogitsProcessor(
             evidence_pool=p,
             tokenizer=tok,
@@ -1135,6 +1214,106 @@ class RealSevenArmEngine:
         }
         return input_ids, pos_ids, rope_deltas, {"image": vis_out}, vis_trace
 
+    CPU_GREEDY_K1_LABEL = "cpu_greedy_k1_reference_not_vllm_mtp"
+
+    def _speculative_mtp_greedy_k1(
+        self,
+        prompt_ids: Sequence[int],
+        max_new_tokens: int,
+        draft_override: Any = None,
+    ) -> dict[str, Any]:
+        """CPU greedy k=1 speculative decoding with the official MTP head (reference, NOT vLLM MTP).
+
+        Invariant: the committed stream is always the target's greedy stream. Each step, the MTP
+        head proposes one draft d for the token after the pending token. One target forward over
+        [pending, d] from a state snapshot verifies it: accept iff d == target argmax after pending.
+        On reject, the snapshot (KV and Gated-DeltaNet conv/recurrent states) is restored and the
+        pending token is re-fed alone, so the next committed token comes from a single-token target
+        forward.
+
+        `draft_override(draft, proposal_index, n_emitted) -> int` is a test hook that replaces the
+        proposal. `n_emitted` = tokens already committed; an oracle hook can use it to propose the
+        target's known next token (forced accept) or a corrupted one (forced reject).
+        No speed is claimed. Acceptance is verifier-derived: accepted / proposed.
+        """
+        if not self.is_official_hf_hooked or getattr(self.model, "mtp_module", None) is None:
+            raise RuntimeError(
+                "cpu_greedy_k1 reference requires the official hooked checkpoint with its MTP head"
+            )
+        if type(max_new_tokens) is not int or max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be a positive integer")
+        ids = [int(t) for t in prompt_ids]
+        if not ids:
+            raise ValueError("prompt_ids must be non-empty")
+        vocab = self.config.vocab_size
+        from transformers.models.qwen3_5 import modeling_qwen3_5
+
+        cache = modeling_qwen3_5.DynamicCache(config=self.model.hf_model.config)
+
+        def _pos(start: int, n: int) -> torch.Tensor:
+            return (
+                torch.arange(start, start + n, device=self.device, dtype=torch.long)
+                .view(1, 1, n).expand(3, 1, n).clone()
+            )
+
+        def _feed(tokens: list[int], start: int, keep: int) -> dict[str, Any]:
+            # MTP position = absolute position of the next target token (after the fed chunk).
+            return self.model(
+                torch.tensor([tokens], device=self.device, dtype=torch.long),
+                past_key_values=cache,
+                position_ids=_pos(start, len(tokens)),
+                compute_mtp=True,
+                mtp_position_ids=_pos(start + len(tokens), 1),
+                logits_to_keep=keep,
+            )
+
+        with torch.no_grad():
+            out = _feed(ids, 0, 1)
+            cache_len = len(ids)  # tokens currently in the cache; `pending` is not yet fed
+            pending = int(torch.argmax(out["logits"][0]).item())
+            draft = int(torch.argmax(out["mtp_logits"][0, 0]).item())
+
+            emitted: list[int] = []
+            proposed = accepted = rejected = 0
+            while len(emitted) < max_new_tokens:
+                emitted.append(pending)
+                if len(emitted) >= max_new_tokens:
+                    break
+                proposal = draft
+                if draft_override is not None:
+                    proposal = int(draft_override(draft, proposed, len(emitted)))
+                if not 0 <= proposal < vocab:
+                    raise ValueError("draft proposal outside the vocabulary")
+                proposed += 1
+                snap = _snapshot_dynamic_cache(cache)
+                v = _feed([pending, proposal], cache_len, 2)
+                target_after_pending = int(torch.argmax(v["full_logits"][0, 0]).item())
+                if proposal == target_after_pending:
+                    accepted += 1
+                    emitted.append(proposal)
+                    cache_len += 2
+                    if len(emitted) >= max_new_tokens:
+                        break
+                    pending = int(torch.argmax(v["logits"][0]).item())
+                    draft = int(torch.argmax(v["mtp_logits"][0, 0]).item())
+                else:
+                    rejected += 1
+                    _restore_dynamic_cache(cache, snap)
+                    v1 = _feed([pending], cache_len, 1)
+                    cache_len += 1
+                    pending = int(torch.argmax(v1["logits"][0]).item())
+                    draft = int(torch.argmax(v1["mtp_logits"][0, 0]).item())
+
+        return {
+            "label": self.CPU_GREEDY_K1_LABEL,
+            "tokens": emitted[:max_new_tokens],
+            "proposed": proposed,
+            "accepted": accepted,
+            "rejected": rejected,
+            "acceptance_rate": (accepted / proposed) if proposed else None,
+            "speed_claim": None,
+        }
+
     def execute_request(
         self,
         request_id: str,
@@ -1177,7 +1356,8 @@ class RealSevenArmEngine:
         elif self.is_pretrained:
             arch_status = "PARTIALLY_WEIGHTED_PYTORCH_REFERENCE"
             seven_arm_gate = "GATED_OFFICIAL_HF_HOOK_REQUIRED"
-            mm_gate = "PASS" if (self.has_vision_encoder and image_present) else "GATED_PRETRAINED_CHECKPOINT_REQUIRED"
+            # Partial reference weights never qualify a real multimodal forward (R3-1).
+            mm_gate = "PARTIAL_COVERAGE_NOT_QUALIFIED"
         else:
             arch_status = "PYTORCH_ARCHITECTURAL_SCAFFOLD_UNWEIGHTED"
             seven_arm_gate = "GATED_PRETRAINED_CHECKPOINT_REQUIRED"
@@ -1186,7 +1366,12 @@ class RealSevenArmEngine:
         gates = {
             "POLICY_HARNESS_PASS": "PASS",
             "ACTUAL_BACKEND_HOOK_PASS": "PASS" if self.has_vllm_backend else "GATED_VLLM_BACKEND_ATTACHMENT_REQUIRED",
-            "REAL_MODEL_FORWARD_PASS": "PASS" if self.is_pretrained else "GATED_PRETRAINED_CHECKPOINT_REQUIRED",
+            # PASS only with official HF hooking (tensor+parameter coverage 1.0, parity verified).
+            "REAL_MODEL_FORWARD_PASS": (
+                "PASS" if self.is_official_hf_hooked
+                else "PARTIAL_COVERAGE_NOT_QUALIFIED" if self.is_pretrained
+                else "GATED_PRETRAINED_CHECKPOINT_REQUIRED"
+            ),
             "REAL_MULTIMODAL_INFERENCE_PASS": mm_gate,
             "SEVEN_ARM_PRETRAINED_PASS": seven_arm_gate,
             "MTP_CORRECTNESS_PASS": "GATED_NATIVE_MTP_VERIFIER_REQUIRED" if "mtp" in self.method_arm else "NOT_APPLICABLE",
@@ -1218,6 +1403,11 @@ class RealSevenArmEngine:
 
         past_kv: Any = None
         recurrent_s: list[Any] | None = None
+        da_anchor_len = len(full_prompt)  # DA geometry is anchored to the prefill, not the growing KV
+        da_n_visual = int(vis_trace.get("visual_token_embeddings_count", 0))
+        da_question_start: int | None = None
+        if image_present and self.config.vision_end_token_id in full_prompt:
+            da_question_start = len(full_prompt) - 1 - full_prompt[::-1].index(self.config.vision_end_token_id) + 1
 
         tokens_generated: list[int] = []
         step_latencies: list[float] = []
@@ -1264,6 +1454,11 @@ class RealSevenArmEngine:
         if "mtp" in self.method_arm:
             pending_mtp_candidate = int(torch.argmax(prefill_out["mtp_logits"][0, 0]).item())
 
+        # Fix each full-attention layer's H2O budget from the PREFILL length, once.
+        if tracker is not None:
+            for l_idx in self.config.full_attention_layers:
+                tracker.initialize_budget(l_idx, len(full_prompt))
+
         # Feed prefill attention scores into H2O tracker
         if tracker is not None:
             for l_idx, attn_w in prefill_out["attention_matrices"].items():
@@ -1299,23 +1494,11 @@ class RealSevenArmEngine:
                 # <focus magic_chunks="..."> protocol. No target sparsity is fitted.
                 # Bounds derive from the current prompt/vision geometry, and the
                 # observed mask density is calculated after actual construction.
-                sink_end = min(16, max(1, phys_kv_len // 4))
-                n_visual = int(vis_trace.get("visual_token_embeddings_count", 0))
-                if not n_visual and image_present:
-                    n_visual = min(4, max(0, phys_kv_len - sink_end - 1))
-                da_tags = [DATag(DATagType.GLOBAL, start_idx=0, end_idx=sink_end)]
-                if phys_kv_len > sink_end + 1:
-                    focus_end = min(
-                        phys_kv_len - 1, sink_end + max(1, n_visual)
-                    )
-                    da_tags.append(DATag(
-                        DATagType.FOCUS, start_idx=sink_end,
-                        end_idx=focus_end, focus_id="scripted_visual_segment"
-                    ))
-                    da_tags.append(DATag(
-                        DATagType.LOCAL, start_idx=focus_end,
-                        end_idx=phys_kv_len, window=8
-                    ))
+                da_tags = _da_scripted_tags(
+                    anchor_len=da_anchor_len, phys_len=phys_kv_len,
+                    n_visual=da_n_visual, image_present=image_present,
+                    question_start=da_question_start,
+                )
 
                 raw_mask = self.da_mask_gen.generate_attention_mask(
                     seq_len=phys_kv_len, tags=da_tags,
@@ -1426,12 +1609,21 @@ class RealSevenArmEngine:
         tpot_ms = float(np.mean(step_latencies)) if step_latencies else total_latency_ms
 
         citations = ecrd_proc.citations if ecrd_proc is not None else []
-        # There were zero accepted DRAFT tokens: the target alone committed every
-        # output token. Candidate match rate is a diagnostic, NOT acceptance rate.
-        mtp_acc_rate = 0.0
+        # This serving-style arm runs NO verifier and commits only target tokens, so no
+        # acceptance rate was measured. None = unverified (never a literal 0.0). The
+        # verifier-derived CPU reference lives in _speculative_mtp_greedy_k1 and is
+        # labelled cpu_greedy_k1_reference_not_vllm_mtp.
+        mtp_acc_rate: float | None = None
         mtp_proposal_match_rate = (
             mtp_matched_total / mtp_proposed_total if mtp_proposed_total else None
         )
+        if "da" in self.method_arm:
+            # G4: DA counts as exercised only when a real decode read was restricted.
+            gates["DA_MASKING_EXERCISED"] = (
+                "PASS" if final_da_restriction_ratio > 0.0 else "NOT_EXERCISED_NO_RESTRICTED_READS"
+            )
+        else:
+            gates["DA_MASKING_EXERCISED"] = "NOT_APPLICABLE"
         if "mtp" in self.method_arm:
             gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] = (
                 "PASS" if mtp_proposed_total > 0 else "INSUFFICIENT_TOKENS"
@@ -1492,6 +1684,25 @@ class RealSevenArmEngine:
                     "total_token_slots": h2o_last_step_total_slots,
                     "logical_selection_fraction": final_logical_fraction,
                     "physical_vram_saving_claimed": False,
+                    "protected_vision_tokens_in_prompt": int(
+                        sum(1 for t in full_prompt if t in (
+                            self.config.image_token_id,
+                            self.config.vision_start_token_id,
+                            self.config.vision_end_token_id,
+                        ))
+                    ),
+                    # Budget includes protected tokens (documented protocol). With a protected
+                    # vision block the budget is dominated by protected positions, so KV savings
+                    # are ~0 and these h2o arms are NOT multimodal KV-compression evidence.
+                    "multimodal_kv_compression_evidence": False if (
+                        any(t == self.config.image_token_id for t in full_prompt)
+                    ) else "NOT_APPLICABLE_NO_VISION_TOKENS",
+                    "limitation": (
+                        "Protected vision block (sinks + visual tokens) counts inside the fixed budget; "
+                        "KV retention savings on VLM prompts are ~0 (see evicted_token_slots/total_token_slots). "
+                        "h2o_* arms are not evidence of multimodal KV compression."
+                    ),
+                    "unprotected_original_h2o_variant": "NOT_IMPLEMENTED_OWNER_DECISION",
                 },
                 "mtp_candidate_diagnostic": {
                     "classification": "REFERENCE_DRAFT_NO_PERSISTENT_MTP_KV_NO_SPECULATIVE_SERVING",
@@ -1506,12 +1717,29 @@ class RealSevenArmEngine:
                     "speculative_speedup_claimed": False,
                 },
                 "visual_encoder_trace": vis_trace,
+                "ecrd_reweight": (
+                    {
+                        "reweight_alpha": self._ecrd_alpha(image_present),
+                        "alpha_rule": self.ECRD_ALPHA_RULE,
+                        "calibrated": False,
+                        "cross_condition_comparable": False,
+                        "unsupported_penalty_applied": False,
+                        "unsupported_penalty_note": "ECRDConfig.unsupported_penalty is inert in this processor",
+                    }
+                    if "ecrd" in self.method_arm else None
+                ),
                 "da_cost_accounting": {
                     "attention_mask_restriction_ratio": round(final_da_restriction_ratio, 4),
                     "decode_last_query_allowed_key_ratio": round(1.0 - final_da_restriction_ratio, 4),
                     "full_causal_mask_area_restriction_ratio": round(final_da_causal_area_ratio, 4),
                     "focus_visual_evidence_kept": bool(image_present),
                     "da_scope_provenance": "SCRIPTED_SEGMENT_DIAGNOSTIC_NOT_MODEL_DECLARED",
+                    "result_label": DA_DECODE_ONLY_LABEL,
+                    "nontrivial_masking_exercised": bool(final_da_restriction_ratio > 0.0),
+                    "prefill_masked": False,
+                    "deviations_from_scripted_geometry": (
+                        ["question_span_global"] if da_question_start is not None else []
+                    ),
                     "original_paper_protocol_qualified": False,
                     "physical_kv_bytes_freed": 0 if "da" in self.method_arm else total_physical_freed,
                     "kv_residency_preserved_ratio": 1.0 if "da" in self.method_arm else round(1.0 - final_logical_fraction, 4),

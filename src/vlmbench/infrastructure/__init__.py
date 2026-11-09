@@ -27,8 +27,6 @@ from .grounding_evidence import (
 )
 from .adapters import (
     HardwareGateError,
-    SevenArmEngine,
-    InfrastructureRunner,
     check_vllm_hardware_compatibility,
 )
 from .model_config import (
@@ -60,8 +58,6 @@ __all__ = [
     "EvidencePool",
     "ECRDLogitsProcessor",
     "HardwareGateError",
-    "SevenArmEngine",
-    "InfrastructureRunner",
     "check_vllm_hardware_compatibility",
     "Qwen35ModelConfig",
     "load_model_config",

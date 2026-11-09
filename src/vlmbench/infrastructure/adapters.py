@@ -382,23 +382,24 @@ class SevenArmEngine:
 
             # --- MTP Speculative Verification Simulation ---
             if "mtp" in self.method_arm:
+                # SYNTHETIC HARNESS: no MTP acceptance model exists here, so this block never
+                # commits and never reports an acceptance count. It only exercises the
+                # transaction plumbing (score proposals inside begin(), then roll back).
                 proposed_tokens = [(next_token + i + 1) % vocab_size for i in range(2)]
-                # Deterministic verification: 50% acceptance for simulation
-                accepted_count = 1 if step % 2 == 0 else 0
-
                 if self.mtp_tx is not None:
                     self.mtp_tx.begin()
-                    if accepted_count > 0:
-                        self.mtp_tx.commit(accepted_count)
-                        step_trace["mtp_action"] = f"commit_{accepted_count}"
-                    else:
-                        self.mtp_tx.rollback()
-                        step_trace["mtp_action"] = "rollback_full"
+                    for i in range(len(proposed_tokens)):
+                        spec_len = current_seq_len + i + 1
+                        spec_attn = np.full((self.num_kv_heads, 1, spec_len), 1.0 / spec_len, dtype=np.float32)
+                        for l_idx in range(self.num_layers):
+                            self.h2o_tracker.update_attention_scores(l_idx, spec_attn)
+                    self.mtp_tx.rollback()
+                    step_trace["mtp_action"] = "rollback_unverified_synthetic"
                 else:
-                    step_trace["mtp_action"] = f"verified_{accepted_count}"
-
+                    step_trace["mtp_action"] = "not_executed_no_h2o_transaction"
                 step_trace["mtp_proposed"] = proposed_tokens
-                step_trace["mtp_accepted_count"] = accepted_count
+                step_trace["mtp_accepted_count"] = None
+                step_trace["mtp_verification"] = "NOT_VERIFIED_SYNTHETIC_NO_ACCEPTANCE_MODEL"
 
             step_elapsed = (time.perf_counter() - step_t0) * 1000.0
             step_latencies.append(step_elapsed)
@@ -426,6 +427,7 @@ class SevenArmEngine:
 
         if self.da_mask_gen is not None and "da_read_ratio" in prep_meta:
             verification_trace["final_da_read_ratio"] = prep_meta["da_read_ratio"]
+            verification_trace["final_da_label"] = "SYNTHETIC_PROMPT_MASK_STATS_NOT_DECODE_ONLY_DIAGNOSTIC"
 
         output_text = f"Decoded {len(tokens_generated)} tokens via {self.method_arm}"
 

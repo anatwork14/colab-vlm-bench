@@ -180,6 +180,12 @@ class DAMaskGenerator:
         focus_ids: dict[int, str] = {}
 
         for tag in tags:
+            if tag.tag_type == DATagType.LOCAL and tag.window is not None:
+                w = tag.window
+                if isinstance(w, bool) or not isinstance(w, (int, np.integer)) or w < 0:
+                    raise ValueError(
+                        f"Malformed local window {w!r}: must be a non-negative integer"
+                    )
             s, e = max(0, tag.start_idx), min(seq_len, tag.end_idx)
             if s >= e:
                 continue

@@ -15,6 +15,7 @@ Implements:
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 import hashlib
@@ -54,6 +55,19 @@ class EvidenceItem:
         return hashlib.sha256(b).hexdigest()
 
 
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _words(text: str) -> tuple[str, ...]:
+    """Lowercase alphanumeric words. BPE markers, spaces and punctuation are dropped."""
+    return tuple(_WORD_RE.findall(text.lower()))
+
+
+def _contains_word_sequence(haystack: tuple[str, ...], needle: tuple[str, ...]) -> bool:
+    n = len(needle)
+    return n > 0 and any(haystack[i:i + n] == needle for i in range(len(haystack) - n + 1))
+
+
 class EvidencePool:
     """Stores verified multimodal evidence items for a generation request."""
 
@@ -91,9 +105,13 @@ class EvidencePool:
         clean = text.strip().lower()
         if not clean:
             return []
+        # Word-bounded match: the keyword's words must appear as a contiguous word
+        # sequence in the candidate text. Substring matches are NOT evidence
+        # ('red' must not match 'reduced' or 'shred'; 'tar' must not match 'target').
+        text_words = _words(clean)
         matched: set[str] = set()
         for kw, ev_ids in self._keyword_map.items():
-            if kw in clean or (len(clean) >= 3 and clean in kw):
+            if _contains_word_sequence(text_words, _words(kw)):
                 matched.update(ev_ids)
         return sorted(matched)
 
@@ -106,7 +124,9 @@ class EvidencePool:
 class ECRDConfig:
     """Configuration for Evidence-Constrained Reweighting Decoding."""
     reweight_alpha: float = 1.5           # Reward boost for evidence-aligned candidate tokens
-    unsupported_penalty: float = 0.5      # Penalty for tokens asserting unsupported claims
+    # INERT: documented but NOT applied. The processor only applies the alpha evidence boost;
+    # no unsupported-token detector exists, so beta * unsupported_penalty never changes logits.
+    unsupported_penalty: float = 0.5
     temperature: float = 0.0              # Greedy decoding
     max_auxiliary_tokens: int = 64        # Bound on auxiliary decider tokens
     track_citations: bool = True          # Record evidence IDs cited per token

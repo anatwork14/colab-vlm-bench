@@ -45,7 +45,7 @@ def test_mtp_cannot_commit_unverified_drafts_or_fake_acceptance():
         assert 0 <= diagnostic["proposals_matching_target"] <= 5
         assert diagnostic["committed_draft_tokens"] == 0
         assert diagnostic["speculative_speedup_claimed"] is False
-        assert result.mtp_acceptance_rate == 0.0
+        assert result.mtp_acceptance_rate is None  # unverified: no verifier in the serving arm
         assert result.gates["MTP_CORRECTNESS_PASS"] == "GATED_NATIVE_MTP_VERIFIER_REQUIRED"
         assert result.gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS"
     finally:
@@ -112,8 +112,33 @@ def test_da_does_not_fit_target_sparsity():
         assert 0.0 <= cost["full_causal_mask_area_restriction_ratio"] <= 1.0
         assert 0.0 <= cost["attention_mask_restriction_ratio"] <= 1.0
         assert cost["focus_visual_evidence_kept"] is False
-        assert result.attention_mask_restriction_ratio > 0.0, (
-            "The deliberately long input must exercise nontrivial scripted masking"
-        )
+        # Scripted DA restricts only reads outside the readable global/active-focus/local set.
+        # The flag must agree with the measured ratio; it is not forced positive here.
+        assert result.telemetry["da_cost_accounting"]["nontrivial_masking_exercised"] is (
+            result.attention_mask_restriction_ratio > 0.0)
     finally:
         engine.close()
+
+
+def test_p7_synthetic_adapter_cannot_emit_mtp_acceptance():
+    """Guard (round 2): the synthetic harness must not fabricate MTP acceptance.
+
+    It used to force `accepted = 1 if step % 2 == 0 else 0` and call it verification.
+    It must also be absent from the package's public exports.
+    """
+    import vlmbench.infrastructure as pkg
+    from vlmbench.infrastructure.adapters import InfrastructureRunner
+
+    adapters_src = (Path(__file__).resolve().parents[1]
+                    / "src/vlmbench/infrastructure/adapters.py").read_text()
+    assert "step % 2" not in adapters_src
+    assert "accepted_count = 1" not in adapters_src
+    assert "SevenArmEngine" not in pkg.__all__
+    assert "InfrastructureRunner" not in pkg.__all__
+
+    res = InfrastructureRunner(target_backend="pytorch").run_method_verification(
+        "mtp", max_tokens=6)
+    assert res.execution_classification == "SYNTHETIC_REFERENCE_POLICY_TEST_HARNESS"
+    for step in res.verification_trace["steps"]:
+        assert step.get("mtp_accepted_count") is None, step
+        assert not str(step.get("mtp_action", "")).startswith("commit"), step
