@@ -216,6 +216,13 @@ def run_job(args) -> int:
         derived_hash = sha256(derived_path) if derived_path.is_file() else "NOT_AVAILABLE"
         native_hash = sha256(native_path) if native_path.is_file() else "NOT_AVAILABLE"
         job_manifest = {"dataset": ds["id"], "model": args.model, "mode": args.mode,
+                        "execution_pass": ("NATURAL_EOS_QUALITY" if args.quality
+                                           else "FIXED_OUTPUT_SERVING_256"),
+                        "output_contract": {
+                            "max_tokens": (cfg["quality"]["max_output_tokens"] if args.quality
+                                           else cfg["performance"]["output_tokens"]),
+                            "ignore_eos": not args.quality,
+                        },
                         "dataset_native_sha256": native_hash,
                         "dataset_derived_sha256": derived_hash,
                         "config_sha256": fp, "gpu": inventory}

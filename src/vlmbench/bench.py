@@ -112,9 +112,13 @@ async def run_performance_cell(
 ) -> dict:
     """A complete cell includes unique warmups + measured requests, with a hard deadline."""
     p, s = cfg["performance"], cfg["serving"]
+    if p["output_tokens"] != 256 or cell["output_tokens"] != 256:
+        raise ValueError("Fixed serving pass requires exactly 256 output tokens")
     out = root / "cells" / f"{cell_id(cell)}.json"
     expected = {
         "config_sha256": fingerprint(cfg), "dataset_sha256": dataset_sha256, "cell": cell,
+        "execution_pass": "FIXED_OUTPUT_SERVING_256",
+        "output_contract": {"max_tokens": 256, "min_tokens": 256, "ignore_eos": True},
     }
     if verified_resume(out, expected):
         return {"status": "RESUMED_PASS_MEASURED", "cell": cell}
@@ -256,14 +260,17 @@ async def run_quality_predictions(cfg: dict, model_id: str, mode: str,
                 response = await client.post(url, json=payload)
                 response.raise_for_status()
                 data = response.json()
-                pred = data["choices"][0]["message"].get("content", "")
+                choice = data["choices"][0]
+                pred = choice["message"].get("content", "")
                 results.append({"id": row["id"], "status": "SUCCESS",
                                 "prediction": pred, "usage": data.get("usage", {}),
+                                "finish_reason": choice.get("finish_reason"),
                                 "e2e_ms": (perf_counter() - start) * 1000})
                 consecutive_failures = 0
             except Exception as exc:
                 results.append({"id": row["id"], "status": "FAILED",
-                                "error": f"{type(exc).__name__}: {exc}", "prediction": None})
+                                "error": f"{type(exc).__name__}: {exc}", "prediction": None,
+                                "finish_reason": None})
                 consecutive_failures += 1
             # Avoid losing all quality predictions if Colab disconnects.
             atomic_jsonl(output, results)
@@ -278,6 +285,9 @@ async def run_quality_predictions(cfg: dict, model_id: str, mode: str,
                 break
     receipt = {
         "dataset": dataset, "model": model_id, "mode": mode,
+        "execution_pass": "NATURAL_EOS_QUALITY",
+        "output_contract": {"max_tokens": cfg["quality"]["max_output_tokens"],
+                            "ignore_eos": False},
         "status": ("QUALITY_STOPPED_AFTER_REPEATED_FAILURES" if aborted_quality
                    else "QUALITY_PREDICTIONS_UNSCORED"),
         "count": len(results),

@@ -9,22 +9,54 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
 import subprocess
 import sys
 import tempfile
-import zipfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 SESSION_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 DRIVE_DEFAULT = "/content/drive/MyDrive/Colab-VLM-Bench-Agent"
 REQUIRE_PAID = {"annotate", "benchmark"}
+SESSION_STATE = Path.home() / ".config/colab-cli/sessions.json"
+
+
+def resolve_session(identifier: str) -> str:
+    """Resolve an alias or registered endpoint without mutating CLI state.
+
+    The CLI lists server assignments even when they have no local registration,
+    but its status/upload/exec commands require a local alias. Never turn a
+    missing registration into an implicit allocation or print proxy credentials.
+    """
+    verify_session(identifier)
+    try:
+        sessions = json.loads(SESSION_STATE.read_text(encoding="utf8"))
+    except FileNotFoundError:
+        sessions = {}
+    except (OSError, ValueError):
+        raise RuntimeError("Cannot read Colab session registry; inspect it locally") from None
+    if not isinstance(sessions, dict) or any(not isinstance(v, dict) for v in sessions.values()):
+        raise RuntimeError("Invalid Colab session registry; inspect it locally")
+    if identifier in sessions:
+        return identifier
+    aliases = [name for name, data in sessions.items() if data.get("endpoint") == identifier]
+    if len(aliases) > 1:
+        raise RuntimeError("Colab endpoint registration is ambiguous; specify its alias")
+    if aliases:
+        return verify_session(aliases[0])
+    raise RuntimeError(
+        f"Colab session {identifier!r} is not registered locally. "
+        "Use an existing local alias created by colab new. A [?] assignment "
+        "requires authorized local registration; no replacement runtime was allocated.")
 
 
 def command(argv: list[str], *, dry_run: bool = False) -> None:
     """No shell=True; arguments are literal, never agent-rendered shell code."""
+    argv = list(argv)
+    if len(argv) > 1 and argv[0] == "colab" and argv[1] != "new" and "-s" in argv:
+        index = argv.index("-s") + 1
+        argv[index] = resolve_session(argv[index])
     print("+", " ".join(argv), flush=True)
     if not dry_run:
         subprocess.run(argv, cwd=REPO, check=True)
@@ -46,10 +78,25 @@ def verify_drive(path: str) -> str:
 def check_git_clean() -> str:
     sha = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
-    dirty = subprocess.check_output(
-        ["git", "status", "--porcelain"], cwd=REPO, text=True).strip()
+    status = subprocess.check_output(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all",
+         "--ignore-submodules=none"], cwd=REPO, text=True)
+    # Editable installs generate metadata absent from git archive. Exempt only
+    # known untracked metadata files, never tracked edits or arbitrary code.
+    metadata = {"PKG-INFO", "SOURCES.txt", "dependency_links.txt", "entry_points.txt",
+                "requires.txt", "top_level.txt", "not-zip-safe", "zip-safe"}
+    dirty = []
+    for entry in status.split("\0"):
+        if not entry:
+            continue
+        path = Path(entry[3:])
+        if (entry.startswith("?? ") and path.parent.name.endswith(".egg-info")
+                and path.name in metadata):
+            continue
+        dirty.append(entry)
     if dirty:
-        raise RuntimeError("Commit/stash worktree before remote source transfer")
+        raise RuntimeError("Commit/stash worktree before remote source transfer: "
+                           + repr(dirty))
     return sha
 
 
