@@ -9,6 +9,8 @@ from vlmbench.infrastructure import (
 from vlmbench.multimodal_fixture import (
     CanonicalMultimodalFixture,
     CANONICAL_IMAGE_SHA256,
+    CANONICAL_PANOPTIC_SHA256,
+    get_supplementary_evaluation_suite,
 )
 from vlmbench.qualification import get_qualification_tokenizer
 
@@ -89,3 +91,43 @@ def test_progressive_qualification_test_c_multimodal_execution(model_dir, canoni
     assert report["gates"]["CCU_ISOLATION_PASS"] == "PASS"
 
     engine.close()
+
+
+def test_panoptic_mask_integrity(canonical_fixture):
+    """Verify the canonical panoptic mask fixture exists and matches SHA-256."""
+    assert canonical_fixture.verify_panoptic_integrity() is True
+    assert canonical_fixture.panoptic_sha256 == CANONICAL_PANOPTIC_SHA256
+
+
+def test_supplementary_evaluation_suite(canonical_fixture):
+    """Verify supplementary 4-task evaluation suite generates valid fixtures."""
+    suite = get_supplementary_evaluation_suite(canonical_fixture.image_path.parent)
+    assert len(suite) == 4
+    tasks = [f.task_type for f in suite]
+    assert "existence" in tasks
+    assert "attribute" in tasks
+    assert "relation" in tasks
+
+    # Verify existence negative fixture
+    neg_fix = suite[1]
+    assert neg_fix.ground_truth_label == "No"
+    assert "dog" in neg_fix.keywords
+
+    # Verify attribute fixture
+    attr_fix = suite[2]
+    assert attr_fix.ground_truth_label == "Yellow"
+
+    # Verify relation fixture
+    rel_fix = suite[3]
+    assert rel_fix.ground_truth_label == "Yes"
+    assert "remote" in rel_fix.keywords
+
+
+def test_multi_turn_chat_formatting(canonical_fixture, model_dir):
+    """Verify multi-turn chat template formatting for context streaming evaluation."""
+    tok = get_qualification_tokenizer(model_dir, require_real=True)
+    prompt_str, token_ids = canonical_fixture.format_multi_turn_qwen_chat(tok)
+    assert "<image>" in prompt_str
+    assert "Are there remote controls on the couch as well?" in prompt_str
+    assert len(token_ids) > len(canonical_fixture.format_qwen_chat_prompt(tok)[1])
+    assert 248056 in token_ids
