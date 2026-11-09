@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import subprocess
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,8 +13,43 @@ import pytest
 
 from vlmbench import agent_pipeline, hf_sources
 
-
 REPO = Path(__file__).resolve().parents[1]
+
+
+def test_session_dispatch_resolves_endpoint_without_exposing_tokens(tmp_path, monkeypatch):
+    cli = host_cli()
+    endpoint = "m-s-euw4b8-2ecqrdo7wn2zj"
+    state = tmp_path / "sessions.json"
+    state.write_text(json.dumps({"cpu-existing": {
+        "name": "cpu-existing", "endpoint": endpoint, "token": "PRIVATE"}}))
+    monkeypatch.setattr(cli, "SESSION_STATE", state)
+    calls = []
+    monkeypatch.setattr(cli.subprocess, "run", lambda argv, **kw: calls.append(argv))
+    cli.command(["colab", "status", "-s", endpoint])
+    assert calls == [["colab", "status", "-s", "cpu-existing"]]
+    assert cli.resolve_session("cpu-existing") == "cpu-existing"
+
+
+def test_unregistered_session_fails_before_subprocess_and_never_provisions(tmp_path, monkeypatch):
+    cli = host_cli()
+    monkeypatch.setattr(cli, "SESSION_STATE", tmp_path / "missing.json")
+    calls = []
+    monkeypatch.setattr(cli.subprocess, "run", lambda argv, **kw: calls.append(argv))
+    with pytest.raises(RuntimeError, match="not registered"):
+        cli.command(["colab", "upload", "-s", "m-s-unregistered", "a", "/content/a"])
+    assert calls == []
+    cli.command(["colab", "new", "-s", "cpu-new"])
+    assert calls == [["colab", "new", "-s", "cpu-new"]]
+
+
+def test_ambiguous_endpoint_registration_is_refused(tmp_path, monkeypatch):
+    cli = host_cli()
+    state = tmp_path / "sessions.json"
+    state.write_text(json.dumps({name: {"endpoint": "m-s-duplicate"}
+                                 for name in ("cpu-a", "cpu-b")}))
+    monkeypatch.setattr(cli, "SESSION_STATE", state)
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        cli.resolve_session("m-s-duplicate")
 
 
 def host_cli():
@@ -144,6 +180,9 @@ def test_remote_actions_never_infer_gpu_approval_or_extra_models(tmp_path, monke
 
 
 def test_pipeline_prepare_resumes_same_manifest_without_extra_hf_download(tmp_path, monkeypatch):
+    # This test exercises manifest reuse on a CPU session, independent of the
+    # developer host's physical accelerators. The GPU refusal has its own test.
+    monkeypatch.setattr("shutil.which", lambda cmd: None)
     p = {
         "root": tmp_path, "model_root": tmp_path / "model",
         "dataset_root": tmp_path / "dataset",
@@ -186,11 +225,41 @@ def test_pipeline_prepare_resumes_same_manifest_without_extra_hf_download(tmp_pa
 
 
 def test_prepare_refuses_accelerator_before_any_hf_download(monkeypatch):
-    import vlmbench.agent_pipeline as ap
     import shutil
     import subprocess
+
+    import vlmbench.agent_pipeline as ap
     monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/nvidia-smi")
     monkeypatch.setattr(subprocess, "run",
                         lambda *a, **kw: SimpleNamespace(returncode=0, stdout="A100-SXM4-40GB\n"))
     with pytest.raises(RuntimeError, match="GPU_SESSION_REFUSED_FOR_PREPARE"):
         ap.require_cpu_for_hf_intake()
+
+
+@pytest.mark.parametrize("filename,allowed", [
+    ("src/example.egg-info/PKG-INFO", True),
+    ("uv.lock", False),
+    (".gitignore", False),
+    ("src/new_module.py", False),
+    ("src/example.egg-info/surprise.py", False),
+])
+def test_git_clean_distinguishes_build_metadata_from_source(tmp_path, monkeypatch,
+                                                          filename, allowed):
+    cli = host_cli()
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "README.md").write_text("source\n")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.org",
+                    "commit", "-qm", "Initial source"], cwd=tmp_path, check=True)
+    monkeypatch.setattr(cli, "REPO", tmp_path)
+    changed = tmp_path / filename
+    changed.parent.mkdir(parents=True, exist_ok=True)
+    changed.write_text("generated or changed\n")
+    # Local status preferences must not hide untracked source files.
+    subprocess.run(["git", "config", "status.showUntrackedFiles", "no"],
+                   cwd=tmp_path, check=True)
+    if allowed:
+        assert cli.check_git_clean()
+    else:
+        with pytest.raises(RuntimeError, match="Commit/stash"):
+            cli.check_git_clean()
