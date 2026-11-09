@@ -28,6 +28,10 @@ class H2OConfig:
     protect_visual_tokens: bool = True # Protect genuine multimodal image tokens from eviction
     protect_system_tokens: int = 4     # Number of initial anchor/system tokens permanently retained
     tie_breaking: str = "recent"       # Deterministic tie-breaking: 'recent' prefers later tokens
+    # ITER2 Stage 2(c), upstream fidelity A4-02. Opt-in. False (default) keeps the layer-mean
+    # selection. True selects heavy hitters PER KV HEAD via compute_eviction_plan_per_head; the
+    # shared compute_eviction_plan refuses it. Not wired into the engine (needs per-head KV gather).
+    per_kv_head_selection: bool = False
 
 
 @dataclass
@@ -148,6 +152,11 @@ class H2OCacheTracker:
         Returns:
             (retained_mask, metrics_dict) where retained_mask is bool array of length current_length.
         """
+        if self.config.per_kv_head_selection:
+            raise NotImplementedError(
+                "per_kv_head_selection is opt-in: use compute_eviction_plan_per_head; the shared "
+                "single-mask plan would silently use the layer-mean selection"
+            )
         layer = self.layers[layer_idx]
         if layer.is_recurrent:
             return np.ones(current_length, dtype=bool), {
@@ -230,6 +239,50 @@ class H2OCacheTracker:
             "budget": budget,  # applies to UNPROTECTED tokens only (R4-1)
             "per_step_evicted_slot_rate": float(evicted_count / max(1, current_length)),
             "kv_bytes_freed": "NOT_MEASURED_LOGICAL_MASK_ONLY",
+        }
+        return retained, metrics
+
+    def compute_eviction_plan_per_head(self, layer_idx: int, current_length: int) -> tuple[np.ndarray, dict[str, Any]]:
+        """Per-KV-head heavy-hitter selection (upstream fidelity A4-02, tracker level).
+
+        Same budget rule as compute_eviction_plan, applied to each KV head's own scores: protected
+        tokens are kept in every head, the recent window is shared (newest unprotected tokens), and
+        each head keeps its own top heavy hitters among the remaining candidates. Returns a
+        (num_kv_heads, current_length) bool mask. Does NOT touch the layer's evicted mask or budget.
+        """
+        layer = self.layers[layer_idx]
+        H = self.num_kv_heads
+        if layer.is_recurrent:
+            retained = np.ones((H, current_length), dtype=bool)
+            return retained, {"retained_tokens_per_head": [current_length] * H, "budget": None}
+        if layer.scores.shape[1] < current_length:
+            layer.scores = np.pad(layer.scores, ((0, 0), (0, current_length - layer.scores.shape[1])),
+                                  constant_values=0.0)
+        protected = self._protected_mask(layer, current_length)
+        if layer.budget is None:
+            layer.budget = self._budget_for_unprotected(current_length - int(protected.sum()))
+        budget = layer.budget
+        unprotected_idx = np.where(~protected)[0]
+        unprotected_len = len(unprotected_idx)
+        retained = np.zeros((H, current_length), dtype=bool)
+        if unprotected_len <= budget:
+            retained[:, :] = True
+        else:
+            retained[:, protected] = True
+            recent_size = min(budget, max(1, int(budget * self.config.recent_ratio))) if budget > 0 else 0
+            recent_idx = unprotected_idx[unprotected_len - recent_size:]
+            retained[:, recent_idx] = True
+            hh_budget = budget - recent_size
+            candidate_indices = unprotected_idx[:unprotected_len - recent_size]
+            if len(candidate_indices) > 0 and hh_budget > 0:
+                for h in range(H):
+                    cand_scores = layer.scores[h, candidate_indices]
+                    order = np.lexsort((candidate_indices, cand_scores))[::-1]
+                    retained[h, candidate_indices[order[:min(len(order), hh_budget)]]] = True
+        metrics = {
+            "retained_tokens_per_head": retained.sum(axis=1).tolist(),
+            "budget": budget,
+            "per_head": True,
         }
         return retained, metrics
 
