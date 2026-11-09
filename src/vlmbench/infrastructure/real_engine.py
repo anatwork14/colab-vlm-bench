@@ -573,6 +573,21 @@ class Qwen35NeuralModel(nn.Module):
             )
             self.visual_merger = nn.Linear(self.config.hidden_size, self.config.hidden_size, bias=True)
 
+    @property
+    def hf_forward_active(self) -> bool:
+        """True when forward() runs the attached official HF model (R4-4).
+
+        A config.json checkpoint attaches the HF model even when coverage is partial. Cache layout
+        and decode position handling must follow THIS flag, not the qualification flag.
+        """
+        return self.hf_model is not None and self.hook_ctx is not None
+
+    @property
+    def forward_path_label(self) -> str:
+        if not self.hf_forward_active:
+            return "scaffold_reference"
+        return "official_hf_hooked" if self.is_official_hf_hooked else "official_hf_partial_coverage_UNQUALIFIED"
+
     def load_pretrained_weights(
         self,
         checkpoint_dir: str | Path,
@@ -791,7 +806,7 @@ class Qwen35NeuralModel(nn.Module):
         """
         if type(logits_to_keep) is not int or logits_to_keep < 1:
             raise ValueError("logits_to_keep must be a positive integer")
-        if self.hf_model is not None and self.hook_ctx is not None:
+        if self.hf_forward_active:
             from transformers.models.qwen3_5 import modeling_qwen3_5
 
             lock = self._hf_lock or threading.Lock()
@@ -839,6 +854,7 @@ class Qwen35NeuralModel(nn.Module):
                         layer_telemetries.append({"type": "recurrent_deltanet", "kv_bytes_allocated": 0, "physical_bytes_freed": 0})
 
                 return {
+                    "forward_path": self.forward_path_label,
                     "logits": logits,
                     "full_logits": out.logits.float(),
                     "mtp_logits": mtp_logits,
@@ -897,6 +913,7 @@ class Qwen35NeuralModel(nn.Module):
             mtp_logits = self.lm_head(mtp_hidden)
 
         return {
+            "forward_path": self.forward_path_label,
             "logits": logits,
             "mtp_logits": mtp_logits,
             "past_key_values": new_past_kv,
@@ -1503,6 +1520,8 @@ class RealSevenArmEngine:
         if "mtp" in self.method_arm:
             pending_mtp_candidate = int(torch.argmax(prefill_out["mtp_logits"][0, 0]).item())
 
+        forward_path_executed = prefill_out["forward_path"]
+
         # Fix each full-attention layer's H2O budget from the PREFILL length, once.
         if tracker is not None:
             for l_idx in self.config.full_attention_layers:
@@ -1530,7 +1549,7 @@ class RealSevenArmEngine:
 
             # Determine active physical KV cache length for attention layers
             first_attn_layer = self.config.full_attention_layers[0]
-            if self.is_official_hf_hooked and past_kv is not None:
+            if self.model.hf_forward_active and past_kv is not None:
                 phys_kv_len = past_kv.layers[first_attn_layer].keys.shape[2] + 1
             elif past_kv is not None and past_kv[first_attn_layer] is not None:
                 phys_kv_len = past_kv[first_attn_layer][0].shape[2] + 1
@@ -1572,7 +1591,7 @@ class RealSevenArmEngine:
                 step_total = 0
                 step_retained = 0
                 for l_idx in self.config.full_attention_layers:
-                    if self.is_official_hf_hooked and past_kv is not None:
+                    if self.model.hf_forward_active and past_kv is not None:
                         k_phys_len = past_kv.layers[l_idx].keys.shape[2] + 1
                     elif past_kv is not None and past_kv[l_idx] is not None:
                         k_phys_len = past_kv[l_idx][0].shape[2] + 1
@@ -1592,7 +1611,7 @@ class RealSevenArmEngine:
 
             # Compute 3D RoPE position_ids for decode step when using official HF model
             step_pos_ids: torch.Tensor | None = None
-            if self.is_official_hf_hooked:
+            if self.model.hf_forward_active:
                 step_pos_ids = torch.full((3, 1, 1), curr_len - 1, device=self.device, dtype=torch.long)
                 if rope_deltas is not None:
                     step_pos_ids = step_pos_ids + rope_deltas.view(1, 1, 1)
@@ -1732,6 +1751,7 @@ class RealSevenArmEngine:
                 "device": self.device,
                 "architectural_status": arch_status,
                 "is_official_hf_hooked": self.is_official_hf_hooked,
+                "forward_path_executed": forward_path_executed,
                 "vllm_backend_status": "MOCKED_PYTORCH_FALLBACK" if not self.has_vllm_backend else "ATTACHED_VLLM_0_29_0",
                 "pretrained_weights": self.pretrained_weight_summary,
                 "kv_memory_accounting": {
