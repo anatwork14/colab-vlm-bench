@@ -785,3 +785,37 @@ def test_r4_h2o_telemetry_has_explicit_cumulative_fields():
     assert isinstance(acc["final_retained_fraction"], float)
     assert acc["physical_vram_saving_claimed"] is False
     assert "no physical" in acc["limitation"].lower() or "not measured" in acc["limitation"].lower()
+
+
+# --- R4-2 (lead round 4, auditor MEDIUM): MTP labels and documentation claims ---
+
+def test_r4_serving_mtp_arm_reports_target_agreement_not_acceptance():
+    """The serving-style mtp arm never verifies or commits drafts. Its candidate-vs-target
+    agreement must not be named like an acceptance rate, and it must point at the CPU reference
+    label without claiming the reference ran in this request."""
+    cfg = _p7_small_cfg()
+    engine = RealSevenArmEngine(method_arm="mtp", config=cfg, device="cpu")
+    try:
+        res = engine.execute_request("r4_mtp_labels", prompt_token_ids=list(range(10, 30)),
+                                     max_new_tokens=6, image_present=False)
+    finally:
+        engine.close()
+    diag = res.telemetry["mtp_candidate_diagnostic"]
+    assert "proposal_match_rate" not in diag, "name reads like an acceptance rate"
+    assert "proposal_target_agreement_diagnostic" in diag
+    assert diag["proposal_target_agreement_is_acceptance"] is False
+    assert diag["committed_draft_tokens"] == 0
+    assert res.mtp_acceptance_rate is None
+    ref = diag["cpu_greedy_k1_reference"]
+    assert ref["label"] == "cpu_greedy_k1_reference_not_vllm_mtp"
+    assert ref["run_in_this_request"] is False
+
+
+def test_r4_engine_module_docstring_makes_no_unverified_mtp_or_concurrency_claims():
+    import vlmbench.infrastructure.real_engine as re_mod
+    doc = re_mod.__doc__
+    assert "488" not in doc, "hard-coded tensor counts must be dropped or derived"
+    assert "15,220" not in doc and "852,985,920" not in doc and "20,452,864" not in doc
+    assert "bit-exact" not in doc.lower(), "rollback is only in _speculative_mtp_greedy_k1"
+    assert "zero state pollution" not in doc.lower()
+    assert "_speculative_mtp_greedy_k1" in doc, "docstring must say where verification lives"

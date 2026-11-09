@@ -720,3 +720,12 @@ def test_r4_per_step_rate_is_named_per_step_and_cumulative_is_not_in_plan():
     _, m = tracker.compute_eviction_plan(0, current_length=341)
     assert "per_step_evicted_slot_rate" in m and "logical_selection_fraction" not in m
     assert m["protected_tokens"] == 304 and m["budget"] == 32
+
+
+# --- R4-2: h2o.py header must say the MTP transaction is used only by the synthetic adapter ---
+
+def test_r4_h2o_module_header_scopes_mtp_transaction_to_synthetic_adapter():
+    import vlmbench.infrastructure.h2o as h2o_mod
+    doc = h2o_mod.__doc__
+    assert "synthetic" in doc.lower()
+    assert "not used by the real engine" in doc.lower()
