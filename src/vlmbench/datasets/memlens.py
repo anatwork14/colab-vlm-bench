@@ -49,7 +49,7 @@ def normalize_memlens(
         with source.open("rb") as fp:
             for item in ijson.items(fp, "item"):
                 if not isinstance(item, dict):
-                    raise ValueError("MemLens expects a top-level JSON list of objects")
+                    raise TypeError("MemLens expects a top-level JSON list of objects")
                 qid = str(item["question_id"])
                 if qid in seen:
                     raise ValueError(f"Duplicate MemLens question id: {qid}")
