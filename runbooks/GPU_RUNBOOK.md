@@ -2,6 +2,29 @@
 
 **Status: NOT_RUN. Not approved for paid execution.** Written from the static CPU audit ([NUMERIC_INTEGRITY_LEDGER.md](../docs/audit/NUMERIC_INTEGRITY_LEDGER.md)) at `ebbf60d`. Each command spends owner-approved compute only when it carries `--approve-paid` on that invocation. The detailed protocol is in [docs/AGENT_COLAB_CLI.md](../docs/AGENT_COLAB_CLI.md) and [docs/PRIORITY_EXECUTION.md](../docs/PRIORITY_EXECUTION.md). Use this file for the gate order and stop rules.
 
+## One-page gate checklist (R4-C)
+
+Evidence basis: integrated HEAD `50762b0` (branch `mission/20261109-integrated`). Its gate-related tests (`test_resume_policy`, `test_gpu_helper_safety`, `test_derivation_routes`, `test_e2e_comparability`, `test_run_job_preflight`, `test_repro_manifest`, `test_telemetry_visibility`, `test_measurement_regressions`) gave 88 passed when run on a `git archive` of that commit. Round-4 fixes `89c552b` (R4-A) and `e83dc8d` (R4-B) are on the bench branch and are **not** in that integrated HEAD. No GPU run exists. No gate is closed by a paid run.
+
+| Gate | Status | Evidence at `50762b0` | Still needed (owner or lead) |
+|---|---|---|---|
+| G-A resume only COMPLETED receipts (F-05) | **PASS** | Code `92c8b68`; independent review `docs/audit/REVIEW_INTEGRATED.md` §5, F-05 PASS | Lead acceptance |
+| G-B non-PASS is not success (F-06) | **BLOCKED** | Code `00260cc` + R3-B `9bb96f5`; the only independent verdict in the integrated tree is F-06 PARTIAL, written before R3-B. Its PASS (`REVIEW_INTEGRATED_R4.md` §1j) is not committed to integrated | Commit the R4 review, or re-review the R3-B fix |
+| G-C no legacy controller or remote_entry (F-07) | **BLOCKED** | Code `4975562`; `test_gpu_helper_safety` passes; no independent review of F-07 in the integrated tree | Lead review; use `scripts/colab_agent.py` only |
+| G-D revisions and checksums pinned (F-13, F-14) | **BLOCKED (owner)** | `docs/audit/PINNED_INPUTS.md`: `qwen35_08b` and `qwen35_4b` UNPINNED; `memlens` and `mmlongbench_doc` BLOCKED. Per-file safetensors hashes not run (F-14) | Owner inputs 1 and 2 below |
+| G-E E2E and proxy-denominator definitions reviewed (F-01, F-02) | **PASS** | `REVIEW_INTEGRATED.md` §5: F-01 PASS; F-02 PASS with a definition caveat, addressed by R3-F `58fb755` | Lead sign-off is not recorded in the repo |
+| G-F vLLM 0.29.0 and A100 40 GB BF16 verified on the session | **NOT_TESTED** | Pin present: `serving.backend_version` = 0.29.0 and `requirements-agent-gpu.txt`; the config expects an A100 (`expected_gpu_substring`: `A100`, `min_vram_mib`: 39000). No GPU session has been run | Owner inputs 3 and 4; a real session check |
+| G-G one derivation route per serving pool (F-09) | **BLOCKED** | Code `573be47`; `test_derivation_routes` passes; no independent review of F-09 in the integrated tree | Independent review |
+
+**Owner-supplied inputs still needed (no values invented here):**
+1. Dataset revision commit SHAs for `xiyuRenBill/MEMLENS` (`memlens`) and `yubo2333/MMLongBench-Doc` (`mmlongbench_doc`). The generator refuses placeholders. The owner also confirms the authoritative upstream owner, since the GitHub and HF owner names differ (F-13).
+2. Commit SHAs for `Qwen/Qwen3.5-0.8B` (`qwen35_08b`) and `Qwen/Qwen3.5-4B` (`qwen35_4b`), written to `models[].revision` and `.hf_source.json`. Both are UNPINNED in the pilot config.
+3. vLLM version: the config and requirements say 0.29.0. The owner confirms that is the pin to use. Nothing here verifies it runs Qwen3.5 MTP on the GPU.
+4. GPU authorization: the pilot config expects an A100 40 GB. No L4 configuration exists, and `docs/AGENT_COLAB_CLI.md` forbids mixing L4, T4 or 80 GB. Owner explicitly authorizes A100 40 GB. Any L4 use needs a new config and review, not done here.
+5. Paid execution: per-invocation `--approve-paid` and `owner_approved_compute` for the specific allocation. `configs/a100_qwen_priority_pilot.json` has `dry_run: true`, which must not be changed before that approval.
+
+**Superseded:** the status column in §0 below predates the integrated review. Where the two disagree, this checklist is the current status.
+
 ## 0. Blocking gates (do not start a paid run until each is closed or the owner accepts it in writing)
 
 | Gate | Why | Owner / status |
