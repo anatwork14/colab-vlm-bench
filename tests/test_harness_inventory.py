@@ -28,6 +28,7 @@ def _load():
 inv = _load()
 
 SHA = "7d209f58a7d368d8b0ba629959464b44204bcba9"  # a realistic, non-degenerate revision (placeholders are refused)
+GPU_UUID = "GPU-test-0000-0000-0000-000000000000"
 
 
 def healthy_env(**overrides):
@@ -44,7 +45,8 @@ def healthy_env(**overrides):
         "authorization_ok": True,
         "vllm_installed": True,
         "live_probe": {"ok": True, "reasons": []},
-        "gpu": {"name": "NVIDIA A100 40GB", "compute_cap": 8.0, "memory_total_mib": 40960},
+        "gpu": {"name": "NVIDIA A100 40GB", "uuid": GPU_UUID, "compute_cap": 8.0, "memory_total_mib": 40960},
+        "gpu_pin": {"name": "NVIDIA A100 40GB", "uuid": GPU_UUID},  # ITER3 C1: identity comes from the signed pin
         "serving_max_model_len": 32768,
         "datasets": {"memlens": {"present": True, "checksum_verified": True},
                      "mmlongbench_doc": {"present": True, "checksum_verified": True}},
@@ -121,8 +123,10 @@ def test_no_owner_authorization_blocks_paid_cells():
 
 
 def test_1080ti_compute_capability_6_1_blocks_bf16_cells():
+    # the signed pin names this same device, so identity passes and only the capability check can fail
     env = healthy_env(vllm_installed=True,
-                      gpu={"name": "NVIDIA GeForce GTX 1080 Ti", "compute_cap": 6.1,
+                      gpu_pin={"name": "NVIDIA GeForce GTX 1080 Ti", "uuid": GPU_UUID},
+                      gpu={"name": "NVIDIA GeForce GTX 1080 Ti", "uuid": GPU_UUID, "compute_cap": 6.1,
                            "memory_total_mib": 11264})
     st = _status(_cell(), env)
     assert st["status"] == "BLOCKED_GPU_CAPABILITY"
@@ -131,7 +135,9 @@ def test_1080ti_compute_capability_6_1_blocks_bf16_cells():
 
 def test_no_gpu_at_all_blocks_gpu_capability():
     st = _status(_cell(), healthy_env(gpu=None))
-    assert st["status"] == "BLOCKED_GPU_CAPABILITY"
+    # identity is checked first (ITER3 C1), so it is the primary status; capability still blocks too
+    assert st["status"] == "BLOCKED_GPU_IDENTITY"
+    assert "BLOCKED_GPU_CAPABILITY" in st["blockers"]
 
 
 def test_vllm_not_importable_blocks():
@@ -246,10 +252,11 @@ def test_probe_weights_without_manifest_is_unverified(tmp_path):
 def test_probe_gpu_parses_nvidia_smi_csv():
     def runner(args, **kwargs):
         class Done:
-            stdout = "NVIDIA GeForce GTX 1080 Ti, 6.1, 11264\n"
+            stdout = "NVIDIA GeForce GTX 1080 Ti, GPU-abc, 6.1, 11264\n"
         return Done()
     gpu = inv.probe_gpu(runner=runner)
-    assert gpu == {"name": "NVIDIA GeForce GTX 1080 Ti", "compute_cap": 6.1, "memory_total_mib": 11264}
+    assert gpu == {"name": "NVIDIA GeForce GTX 1080 Ti", "uuid": "GPU-abc", "compute_cap": 6.1,
+                   "memory_total_mib": 11264}
 
 
 def test_probe_gpu_without_nvidia_smi_returns_none():
