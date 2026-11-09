@@ -265,6 +265,11 @@ async def run_performance_cell(
         "peak_total_gpu_used_mib": gpu_report["peak_total_gpu_used_mib"],
         "minimum_available_system_ram_gib": gpu_report["minimum_available_system_ram_gib"],
         "minimum_free_local_ssd_gib": gpu_report["minimum_free_local_ssd_gib"],
+        # Telemetry trust fields: a non-zero failure count means the GPU peak is not reliable.
+        "gpu_samples": gpu_report.get("samples"),
+        "gpu_parse_failures": gpu_report.get("parse_failures"),
+        "gpu_query_failures": gpu_report.get("query_failures"),
+        "gpu_count_max": gpu_report.get("gpu_count_max"),
         "peak_system_ram_used_gib": gpu_report["peak_system_ram_used_gib"],
         "physical_kv_bytes": "NOT_MEASURED",
         "mtp_acceptance_rate": "NOT_MEASURED",
