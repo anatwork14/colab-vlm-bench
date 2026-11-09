@@ -309,3 +309,29 @@ def test_seven_arm_hook_coverage_is_not_a_correctness_claim():
     source = SCRIPT.read_text(encoding="utf8")
     assert "SEVEN_ARM_HOOK_COVERAGE_PASS" in source
     assert "SEVEN_ARM_PRETRAINED_PASS\": _test_status" not in source
+
+
+# ITER2 N-9 (REVIEW_ITER2B §3): a gate is derived from the arms it applies to. An arm that reports
+# NOT_APPLICABLE for a gate is not a disagreement; two different applicable labels are.
+
+def test_an_arm_reporting_not_applicable_does_not_make_a_shared_gate_fail():
+    tests = _all_passing_tests()
+    arms = tests["test_d_seven_arms"]["arms"]
+    arms["base"]["gates"]["ACTUAL_BACKEND_HOOK_PASS"] = "NOT_APPLICABLE"
+    gates = qual.compute_release_gates(tests, device_name=GPU)
+    assert gates["ACTUAL_BACKEND_HOOK_PASS"] == ENGINE_GATES["ACTUAL_BACKEND_HOOK_PASS"]
+
+
+def test_two_different_applicable_labels_are_still_a_fail():
+    tests = _all_passing_tests()
+    tests["test_d_seven_arms"]["arms"]["h2o_base"]["gates"]["ACTUAL_BACKEND_HOOK_PASS"] = "PASS"
+    gates = qual.compute_release_gates(tests, device_name=GPU)
+    assert gates["ACTUAL_BACKEND_HOOK_PASS"] == "FAIL"
+
+
+def test_a_gate_that_no_arm_applies_to_is_not_tested():
+    tests = _all_passing_tests()
+    for arm in tests["test_d_seven_arms"]["arms"].values():
+        arm["gates"]["ACTUAL_BACKEND_HOOK_PASS"] = "NOT_APPLICABLE"
+    gates = qual.compute_release_gates(tests, device_name=GPU)
+    assert gates["ACTUAL_BACKEND_HOOK_PASS"] == "NOT_TESTED"

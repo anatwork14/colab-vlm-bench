@@ -691,23 +691,32 @@ MTP_ARMS = ("mtp", "h2o_mtp", "da_mtp")
 
 
 def _engine_gate(test_d: dict[str, Any] | None, name: str, arms: tuple[str, ...] | None = None) -> str:
-    """The value the engine itself reported, used only if every arm in scope reports it and they agree.
+    """The value the engine reported for `name`, derived from the arms the gate applies to.
 
-    `arms` limits the gate to the arms it describes (None = all arms). A missing arm in scope, or a
-    `NOT_APPLICABLE` value, is NOT_TESTED: NOT_APPLICABLE is not a gate value.
+    `arms` given (MTP gates): every listed arm must report a measured value; a missing arm, a missing
+    gate or NOT_APPLICABLE in those arms is NOT_TESTED. `arms` None (shared gates): only arms that
+    apply to the gate count. An arm reporting NOT_APPLICABLE is not a disagreement. If no arm applies,
+    the gate is NOT_TESTED. Applicable arms that report different labels are FAIL.
     """
     status = _test_status(test_d)
     if status != "PASS":
         return status
     reported = (test_d or {}).get("arms", {})
-    scope = list(reported) if arms is None else list(arms)
-    if not scope or any(arm not in reported for arm in scope):
-        return "NOT_TESTED"
-    if any(name not in reported[arm].get("gates", {}) for arm in scope):
-        return "NOT_TESTED"
-    values = {reported[arm]["gates"][name] for arm in scope}
-    if "NOT_APPLICABLE" in values:
-        return "NOT_TESTED"
+    if arms is not None:
+        if not arms or any(arm not in reported for arm in arms):
+            return "NOT_TESTED"
+        if any(name not in reported[arm].get("gates", {}) for arm in arms):
+            return "NOT_TESTED"
+        values = {reported[arm]["gates"][name] for arm in arms}
+        if "NOT_APPLICABLE" in values:
+            return "NOT_TESTED"
+    else:
+        values = {
+            arm["gates"][name] for arm in reported.values()
+            if name in arm.get("gates", {}) and arm["gates"][name] != "NOT_APPLICABLE"
+        }
+        if not values:
+            return "NOT_TESTED"
     if len(values) != 1:
         return "FAIL"
     return values.pop()
