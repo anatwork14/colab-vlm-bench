@@ -182,3 +182,8 @@ def test_execute_request_h2o_mtp_text_only_runs_policy_speculation(h2o_engine, p
     assert spec["verifier_calls"] == 1 + spec["proposed"] + spec["rejected"] + spec["fallback_steps"]
     assert res.tokens_generated == ref
     assert res.gates["MTP_CORRECTNESS_PASS"] == "CPU_REFERENCE_SPECULATION_EXECUTED_NOT_VLLM"
+    # ITER2 D10 N-7: the policy route declares the memory-field scopes, including None meaning.
+    scopes = res.telemetry["memory_field_scopes"]
+    assert "not per decode step" in scopes["final_retained_kv_payload_bytes"]
+    assert "None = not measured" in scopes["physical_kv_bytes_freed"]
+    assert res.physical_kv_bytes_freed is None

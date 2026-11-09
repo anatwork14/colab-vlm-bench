@@ -153,3 +153,7 @@ def test_r3_execute_request_mtp_arm_reports_verifier_derived_acceptance(engine, 
     expected = spec["accepted"] / spec["proposed"] if spec["proposed"] else None
     assert res.mtp_acceptance_rate == expected
     assert res.gates["MTP_CORRECTNESS_PASS"] == "CPU_REFERENCE_SPECULATION_EXECUTED_NOT_VLLM"
+    # ITER2 D10 N-7: the speculative route carries the memory-field scope glossary too.
+    scopes = res.telemetry["memory_field_scopes"]
+    assert "not per decode step" in scopes["final_retained_kv_payload_bytes"]
+    assert "None" in scopes["physical_kv_bytes_freed"]

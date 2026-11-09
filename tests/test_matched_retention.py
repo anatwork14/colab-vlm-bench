@@ -54,12 +54,12 @@ def test_calibration_finds_the_budget_whose_measured_retention_is_closest_to_tar
     def measure(ratio):
         return float(max(1, int(40 * ratio)) + 4)
 
-    cal = calibrate_h2o_ratio_to_retained(measure, 29, prompt_len=40, min_budget=1)
+    cal = calibrate_h2o_ratio_to_retained(measure, 29, prompt_len=40, min_budget=1, image_present=False)
     assert cal["budget"] == 25
     assert cal["measured_mean_retained"] == 29.0
     assert cal["budget_ratio"] == (25 + 0.5) / 40
     with pytest.raises(ValueError):
-        calibrate_h2o_ratio_to_retained(measure, 29, prompt_len=0, min_budget=1)
+        calibrate_h2o_ratio_to_retained(measure, 29, prompt_len=0, min_budget=1, image_present=False)
 
 
 def test_h2o_calibrated_to_starlight_mean_retention_matches_it_within_one_entry():
@@ -72,7 +72,7 @@ def test_h2o_calibrated_to_starlight_mean_retention_matches_it_within_one_entry(
         return _run("h2o_base", h2o_budget_ratio=ratio, h2o_min_budget=1).telemetry[
             "retained_entries_per_layer"]["mean"]
 
-    cal = calibrate_h2o_ratio_to_retained(measure, star_mean, len(PROMPT), min_budget=1)
+    cal = calibrate_h2o_ratio_to_retained(measure, star_mean, len(PROMPT), min_budget=1, image_present=False)
     assert abs(cal["measured_mean_retained"] - star_mean) <= 1.0, (star_mean, cal)
 
 
@@ -82,3 +82,39 @@ def test_memory_fields_state_the_scope_per_decode_step_prefill_unbounded(arm):
     res = _run(arm)
     acct = res.telemetry["kv_memory_accounting"]
     assert acct["scope"] == "per decode step, prefill cache unbounded", acct
+
+
+# ITER2 D10 N-7 (review): every memory/KV-byte field must declare its own scope. The block-level
+# scope string does not describe final_retained_kv_payload_bytes (a final-state snapshot).
+MEMORY_FIELDS = (
+    "physical_kv_bytes_allocated",
+    "physical_kv_bytes_freed",
+    "final_retained_kv_payload_bytes",
+    "compaction_tensor_byte_deltas_sum",
+)
+
+
+@pytest.mark.parametrize("arm", ["base", "h2o_base", "starlight_s1"])
+def test_every_memory_field_declares_its_own_scope(arm):
+    res = _run(arm)
+    scopes = res.telemetry["memory_field_scopes"]
+    for name in MEMORY_FIELDS:
+        assert isinstance(scopes.get(name), str) and scopes[name], name
+    assert "final" in scopes["final_retained_kv_payload_bytes"].lower()
+    assert "not per decode step" in scopes["final_retained_kv_payload_bytes"]
+    assert "per decode step" in scopes["compaction_tensor_byte_deltas_sum"]
+    assert "per decode step" in scopes["physical_kv_bytes_freed"]
+    assert "None" in scopes["physical_kv_bytes_freed"] and "0" in scopes["physical_kv_bytes_freed"]
+
+
+# ITER2 D10 N-8 (review): the budget <-> retained mapping in calibrate_h2o_ratio_to_retained holds
+# only for text-only prompts. Image prompts add protected visual entries OUTSIDE the budget, so the
+# helper must refuse them rather than return a budget off by the protected count.
+def test_calibration_refuses_image_prompts_and_says_why():
+    from vlmbench.infrastructure.h2o import calibrate_h2o_ratio_to_retained
+
+    def measure(ratio):
+        raise AssertionError("the engine must not be measured for an image prompt")
+
+    with pytest.raises(ValueError, match="text-only"):
+        calibrate_h2o_ratio_to_retained(measure, 29, prompt_len=40, min_budget=1, image_present=True)

@@ -30,7 +30,8 @@ class H2OConfig:
     tie_breaking: str = "recent"       # Deterministic tie-breaking: 'recent' prefers later tokens
     # ITER2 Stage 2(c), upstream fidelity A4-02. Opt-in. False (default) keeps the layer-mean
     # selection. True selects heavy hitters PER KV HEAD via compute_eviction_plan_per_head; the
-    # shared compute_eviction_plan refuses it. Not wired into the engine (needs per-head KV gather).
+    # shared compute_eviction_plan and the STARLIGHT keep_mask_without_protection both refuse it
+    # (ITER2 D10 N-13). Not wired into the engine (needs per-head KV gather).
     per_kv_head_selection: bool = False
 
 
@@ -248,20 +249,26 @@ class H2OCacheTracker:
         Same budget rule as compute_eviction_plan, applied to each KV head's own scores: protected
         tokens are kept in every head, the recent window is shared (newest unprotected tokens), and
         each head keeps its own top heavy hitters among the remaining candidates. Returns a
-        (num_kv_heads, current_length) bool mask. Does NOT touch the layer's evicted mask or budget.
+        (num_kv_heads, current_length) bool mask.
+
+        Pure with respect to the layer (ITER2 D10 N-12): it writes nothing to the layer. The evicted
+        mask, the stored budget and the stored scores are left unchanged. If the layer's budget is
+        still None it is computed from the current unprotected count for this call only (not stored);
+        scores shorter than current_length are zero-padded in a local copy only.
         """
         layer = self.layers[layer_idx]
         H = self.num_kv_heads
         if layer.is_recurrent:
             retained = np.ones((H, current_length), dtype=bool)
             return retained, {"retained_tokens_per_head": [current_length] * H, "budget": None}
-        if layer.scores.shape[1] < current_length:
-            layer.scores = np.pad(layer.scores, ((0, 0), (0, current_length - layer.scores.shape[1])),
-                                  constant_values=0.0)
+        scores = layer.scores
+        if scores.shape[1] < current_length:
+            scores = np.pad(scores, ((0, 0), (0, current_length - scores.shape[1])), constant_values=0.0)
         protected = self._protected_mask(layer, current_length)
-        if layer.budget is None:
-            layer.budget = self._budget_for_unprotected(current_length - int(protected.sum()))
-        budget = layer.budget
+        if layer.budget is not None:
+            budget = layer.budget
+        else:
+            budget = self._budget_for_unprotected(current_length - int(protected.sum()))
         unprotected_idx = np.where(~protected)[0]
         unprotected_len = len(unprotected_idx)
         retained = np.zeros((H, current_length), dtype=bool)
@@ -276,7 +283,7 @@ class H2OCacheTracker:
             candidate_indices = unprotected_idx[:unprotected_len - recent_size]
             if len(candidate_indices) > 0 and hh_budget > 0:
                 for h in range(H):
-                    cand_scores = layer.scores[h, candidate_indices]
+                    cand_scores = scores[h, candidate_indices]
                     order = np.lexsort((candidate_indices, cand_scores))[::-1]
                     retained[h, candidate_indices[order[:min(len(order), hh_budget)]]] = True
         metrics = {
@@ -294,7 +301,15 @@ class H2OCacheTracker:
         candidates that are protected instead of evicting them. Existing h2o_base behaviour is
         unchanged; this is a separate method and does not touch the layer's budget or masks.
         Returns a bool keep mask of length `length` with exactly min(keep_budget, length) True.
+
+        Refuses per_kv_head_selection=True (ITER2 D10 N-13): this candidate selection is layer-mean
+        based and would silently ignore the flag. Per-head STARLIGHT candidates are not implemented.
         """
+        if self.config.per_kv_head_selection:
+            raise NotImplementedError(
+                "per_kv_head_selection is not supported on the STARLIGHT candidate path: "
+                "keep_mask_without_protection is layer-mean based and would silently ignore the flag"
+            )
         if length < 0 or keep_budget < 0:
             raise ValueError("length and keep_budget must be non-negative")
         keep = np.zeros(length, dtype=bool)
@@ -448,7 +463,8 @@ class H2OMTPTransaction:
 
 
 
-def calibrate_h2o_ratio_to_retained(measure, target_mean_retained: float, prompt_len: int, min_budget: int) -> dict:
+def calibrate_h2o_ratio_to_retained(measure, target_mean_retained: float, prompt_len: int, min_budget: int,
+                                    *, image_present: bool) -> dict:
     """Matched retention by MEASUREMENT: find the H2O budget whose measured mean retained count
     is closest to a target (ITER2 D4 S-2).
 
@@ -458,7 +474,22 @@ def calibrate_h2o_ratio_to_retained(measure, target_mean_retained: float, prompt
     b with int(prompt_len * ratio) == b, ratio = (b + 0.5) / prompt_len. Bisection assumes the
     measured mean is non-decreasing in b; the best of the bisection point and its neighbours is
     returned with its measured value, so the residual is reported, never hidden.
+
+    TEXT-ONLY PROMPTS ONLY (ITER2 D10 N-8). The engine budget is
+    max(min_budget, int(unprotected_length * ratio)), and unprotected_length excludes protected
+    tokens (sinks and, with protect_visual_tokens, image tokens). The mapping above equals the
+    engine's budget only when no token is protected outside the budget. An image prompt therefore
+    gets a budget off by its protected count, so `image_present=True` is refused.
+    `image_present` is required: the caller must state it.
     """
+    if type(image_present) is not bool:
+        raise TypeError("image_present must be an explicit bool")
+    if image_present:
+        raise ValueError(
+            "calibrate_h2o_ratio_to_retained is valid only for TEXT-ONLY prompts: image prompts add "
+            "protected visual entries outside the budget, so the budget-to-retained mapping is off by "
+            "the protected count. Calibrate on a text-only prompt or extend the helper first."
+        )
     if type(prompt_len) is not int or prompt_len < 1:
         raise ValueError("prompt_len must be a positive integer")
     lo = max(1, int(min_budget))
