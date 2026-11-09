@@ -1000,3 +1000,40 @@ def test_r5_ratio_one_alone_still_evicts_generated_tokens():
     finally:
         h2o.close()
     assert res.telemetry["h2o_logical_selection_accounting"]["cumulative_evicted_slots"] > 0
+
+
+# --- R5-2 (auditor R4 §2): text-side retention next to the total retention ---
+
+def test_r5_text_side_retention_fields_are_consistent_and_labelled():
+    cfg = _p7_small_cfg()
+    vision = [cfg.vision_start_token_id] + [cfg.image_token_id] * 8 + [cfg.vision_end_token_id]
+    prompt = vision + list(range(10, 40))
+    engine = RealSevenArmEngine(method_arm="h2o_base", config=cfg, device="cpu",
+                                h2o_min_budget=4)
+    try:
+        res = engine.execute_request("r5_text_side", prompt_token_ids=prompt,
+                                     max_new_tokens=6, image_present=False)
+    finally:
+        engine.close()
+    acc = res.telemetry["h2o_logical_selection_accounting"]
+    assert acc["unprotected_prefill_slots"] > 0
+    assert isinstance(acc["unprotected_retained_slots_last_step"], int)
+    assert acc["text_side_retained_fraction"] == pytest.approx(
+        acc["unprotected_retained_slots_last_step"] / acc["unprotected_prefill_slots"])
+    assert acc["text_side_retained_fraction"] < 1.0, "eviction must be visible on the text side"
+    assert acc["total_retention_near_1_expected_on_vlm_prompts"] is True
+    assert "EXPECTED" in acc["total_retention_interpretation"]
+    assert "text_side_retained_fraction" in acc["total_retention_interpretation"]
+
+
+def test_r5_text_side_fields_are_none_before_any_decode_step():
+    cfg = _p7_small_cfg()
+    engine = RealSevenArmEngine(method_arm="h2o_base", config=cfg, device="cpu")
+    try:
+        res = engine.execute_request("r5_text_side_none", prompt_token_ids=list(range(10, 50)),
+                                     max_new_tokens=1, image_present=False)
+    finally:
+        engine.close()
+    acc = res.telemetry["h2o_logical_selection_accounting"]
+    assert acc["unprotected_retained_slots_last_step"] is None
+    assert acc["text_side_retained_fraction"] is None
