@@ -1563,6 +1563,11 @@ class RealSevenArmEngine:
                 "architectural_status": arch_status,
                 "is_official_hf_hooked": self.is_official_hf_hooked,
                 "measurement_label": "cpu_pytorch_reference_not_vllm",
+                "kv_memory_accounting": {
+                    "scope": "per decode step, prefill cache unbounded",
+                    "classification": "NO_EVICTION_PHYSICAL_LENGTH_ONLY",
+                    "final_retained_kv_payload_bytes": spec["kv_bytes_allocated"],
+                },
                 "retained_entries_per_layer": _retained_entries_summary(
                     spec["retained_samples"],
                     unit="per_verifier_forward_full_attention_layer",
@@ -2248,6 +2253,8 @@ class RealSevenArmEngine:
                 "vllm_backend_status": "MOCKED_PYTORCH_FALLBACK" if not self.has_vllm_backend else "ATTACHED_VLLM_0_29_0",
                 "pretrained_weights": self.pretrained_weight_summary,
                 "kv_memory_accounting": {
+                    # S-8 (lead ruling): every memory field states its coverage.
+                    "scope": "per decode step, prefill cache unbounded",
                     "legacy_field": "physical_kv_bytes_freed",
                     "classification": "SUM_OF_KV_TENSOR_FOOTPRINT_DELTAS_NOT_GPU_VRAM_SAVING",
                     "compaction_tensor_byte_deltas_sum": total_physical_freed,
