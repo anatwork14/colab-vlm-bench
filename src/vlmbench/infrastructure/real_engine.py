@@ -1573,6 +1573,25 @@ class RealSevenArmEngine:
                     "total_token_slots": h2o_last_step_total_slots,
                     "logical_selection_fraction": final_logical_fraction,
                     "physical_vram_saving_claimed": False,
+                    "protected_vision_tokens_in_prompt": int(
+                        sum(1 for t in full_prompt if t in (
+                            self.config.image_token_id,
+                            self.config.vision_start_token_id,
+                            self.config.vision_end_token_id,
+                        ))
+                    ),
+                    # Budget includes protected tokens (documented protocol). With a protected
+                    # vision block the budget is dominated by protected positions, so KV savings
+                    # are ~0 and these h2o arms are NOT multimodal KV-compression evidence.
+                    "multimodal_kv_compression_evidence": False if (
+                        any(t == self.config.image_token_id for t in full_prompt)
+                    ) else "NOT_APPLICABLE_NO_VISION_TOKENS",
+                    "limitation": (
+                        "Protected vision block (sinks + visual tokens) counts inside the fixed budget; "
+                        "KV retention savings on VLM prompts are ~0 (see evicted_token_slots/total_token_slots). "
+                        "h2o_* arms are not evidence of multimodal KV compression."
+                    ),
+                    "unprotected_original_h2o_variant": "NOT_IMPLEMENTED_OWNER_DECISION",
                 },
                 "mtp_candidate_diagnostic": {
                     "classification": "REFERENCE_DRAFT_NO_PERSISTENT_MTP_KV_NO_SPECULATIVE_SERVING",
