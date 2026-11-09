@@ -47,5 +47,45 @@ def test_token_comparison_reports_divergence_without_hiding_it():
 def test_label_and_limits_are_the_agreed_ones():
     assert smoke.LABEL == "pytorch_reference_gtx1080ti_smoke_not_vllm_not_performance"
     assert smoke.MIN_FREE_MIB == 3072
-    assert smoke.WALL_LIMIT_S == 600
+    # ITER2 D9: the GPU run and the short CPU fp32 reference are separate runs with their own budgets.
+    assert smoke.WALL_LIMIT_S == {"cuda": 600, "cpu": 300}
     assert smoke.ARMS == ("base", "h2o_base")
+    assert smoke.MAX_NEW_TOKENS <= 8
+
+
+def _receipt(status="RUN_COMPLETED", sha="a" * 40, dtype="float16", tokens=None, inputs=("text0", "text1", "image")):
+    tokens = tokens or {arm: [[1, 2]] * len(inputs) for arm in smoke.ARMS}
+    return {
+        "status": status, "git_sha": sha, "dtype": dtype,
+        "results": {
+            arm: [{"input": name, "tokens": list(t), "tokens_generated_count": len(t)}
+                  for name, t in zip(inputs, tokens[arm])]
+            for arm in smoke.ARMS
+        },
+    }
+
+
+def test_compare_reports_identical_tokens_when_every_input_matches():
+    out = smoke.compare_receipts(_receipt(), _receipt(dtype="float32"))
+    assert out["token_agreement"] == "IDENTICAL_ALL_INPUTS"
+    assert out["gpu_dtype"] == "float16" and out["reference_dtype"] == "float32"
+
+
+def test_compare_names_the_first_divergence_and_does_not_hide_it():
+    cpu = _receipt(dtype="float32", tokens={"base": [[1, 2], [5, 6], [7, 8]], "h2o_base": [[1, 2], [1, 2], [1, 2]]})
+    out = smoke.compare_receipts(_receipt(), cpu)
+    assert out["token_agreement"] == "DIVERGENCE_PRESENT_SEE_COMPARISON"
+    assert out["comparison"]["base"][1]["first_divergence"] == 0
+    assert out["comparison"]["h2o_base"][0]["identical"] is True
+
+
+@pytest.mark.parametrize("bad", [
+    {"status": "ABORTED: wall-clock"},
+    {"sha": "b" * 40},
+    {"inputs": ("text0", "text9", "image")},
+])
+def test_compare_refuses_incomplete_mismatched_or_unrelated_receipts(bad):
+    cpu = _receipt(dtype="float32", **{k: v for k, v in bad.items() if k != "status"},
+                   **({"status": bad["status"]} if "status" in bad else {}))
+    with pytest.raises(ValueError):
+        smoke.compare_receipts(_receipt(), cpu)
