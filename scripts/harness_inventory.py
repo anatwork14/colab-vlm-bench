@@ -644,6 +644,11 @@ def render_markdown(report: dict) -> str:
         "Regenerate with the command in §5. Per-cell records are in `docs/harness/PILOT_INVENTORY.json`.", "",
         "A cell is **READY** only when every check passes, including a verified GPU smoke receipt. "
         "No GPU job has run, so no cell can be READY here.", "",
+        f"**Mode:** `{report['mode']}`. " + (
+            "A live probe ran in this report. READY means preconditions probed in this run, not an attestation: "
+            "a determined local actor who controls the machine can forge local files and probe output."
+            if report["mode"] == "live_probes"
+            else "Plan-only: the live probe was skipped, so no cell can be READY in this report."), "",
         "## 1. Counts by status", "",
         "| Matrix | Cells | " + " | ".join(report["status_vocabulary"]) + " |",
         "|---|---:|" + "---:|" * len(report["status_vocabulary"]),
