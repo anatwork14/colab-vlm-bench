@@ -42,8 +42,10 @@ bash scripts/colab_controller.sh \
   --session vlmbench-a100 \
   --config /LOCAL/APPROVED/a100_qwen_priority_pilot.local.json \
   --model qwen35_08b --mode base --dataset memlens \
-  --max-cells 6 --publish
+  --max-cells 6
 ~~~
+
+The helper never commits or pushes. Copy the report from `runbooks/<campaign_id>/` after review, then commit it by hand. `--publish` is refused (audit F-07).
 
 Repeat in matched order for `mtp`, other dataset and `qwen35_4b`. A separate invocation with `--quality` runs a deterministic **native-context subset**; it is not a full official quality score. Before confirmatory, construct a **new** local config copied from a100_qwen_priority_full.json with its own fixed campaign ID, digests and seeds.
 
