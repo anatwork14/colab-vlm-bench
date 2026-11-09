@@ -27,7 +27,7 @@ def _load():
 
 inv = _load()
 
-SHA = "a" * 40  # a syntactically valid revision for a healthy-environment fixture
+SHA = "7d209f58a7d368d8b0ba629959464b44204bcba9"  # a realistic, non-degenerate revision (placeholders are refused)
 
 
 def healthy_env(**overrides):
@@ -35,9 +35,9 @@ def healthy_env(**overrides):
     env = {
         "weights": {
             "qwen35_08b": {"present": True, "sizes_ok": True, "hashes_ok": True,
-                           "max_position_embeddings": 262144, "manifest_present": True},
+                           "max_position_embeddings": 262144, "manifest_present": True, "manifest_verified": True},
             "qwen35_4b": {"present": True, "sizes_ok": True, "hashes_ok": True,
-                          "max_position_embeddings": 262144, "manifest_present": True},
+                          "max_position_embeddings": 262144, "manifest_present": True, "manifest_verified": True},
         },
         "revisions": {"qwen35_08b": SHA, "qwen35_4b": SHA},
         "dataset_revisions": {"memlens": SHA, "mmlongbench_doc": SHA},
@@ -173,7 +173,7 @@ def test_dataset_without_verified_checksum_blocks():
 
 def test_weights_without_a_matching_manifest_are_not_verified():
     env = healthy_env()
-    env["weights"]["qwen35_08b"]["hashes_ok"] = False
+    env["weights"]["qwen35_08b"].update(hashes_ok=False, manifest_verified=False, manifest_pinned=True)
     assert _status(_cell(), env)["status"] == "BLOCKED_WEIGHTS_MISMATCH"
 
 
@@ -256,17 +256,6 @@ def test_probe_gpu_without_nvidia_smi_returns_none():
         raise FileNotFoundError("nvidia-smi")
     assert inv.probe_gpu(runner=runner) is None
 
-
-def test_probe_authorization_requires_an_explicit_approval_for_this_campaign(tmp_path):
-    path = tmp_path / "auth.json"
-    assert inv.probe_authorization(path, "camp") is False
-    path.write_text(json.dumps({"owner_approved_compute": True, "campaign_ids": ["other"]}))
-    assert inv.probe_authorization(path, "camp") is False
-    path.write_text(json.dumps({"owner_approved_compute": True, "campaign_ids": ["camp"]}))
-    assert inv.probe_authorization(path, "camp") is True
-
-
-# ---------------------------------------------------------------- real environment: invariants only
 
 def test_inventory_invariants_hold_on_an_empty_models_root():
     report = inv.build_report(PILOT, MATRIX, models_root=ROOT / "models-not-here",

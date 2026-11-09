@@ -32,6 +32,9 @@ from vlmbench.methods import NATIVE_AVAILABLE, manifest_from_path, plan  # noqa:
 DEFAULT_MODELS_ROOT = Path("/mnt/ssd/genos2/research_workspace/models")
 DEFAULT_AUTHORIZATION = REPO / "docs/harness/OWNER_AUTHORIZATION.json"
 DEFAULT_FEASIBILITY = REPO / "docs/harness/DATASET_FEASIBILITY.json"  # read-only metadata, not approval
+DEFAULT_RECEIPT_INDEX = REPO / "docs/harness/GPU_RECEIPT_INDEX.json"  # committed; a receipt counts only if listed here
+OWNER_NAMESPACE = "vlmbench-owner-compute"  # ssh-keygen -Y signature namespace for owner compute approval
+OWNER_PRINCIPAL = "owner"
 LOCAL_WEIGHTS_MANIFEST = "starlight_local_manifest.json"
 REQUIRED_CAPABILITY = 8.0       # BF16 native support (Ampere, sm_80 and newer). Assumption, stated in report.
 REQUIRED_VRAM_MIB = 39000       # matches vlmbench.config.validate (A100 40GB contract)
@@ -124,13 +127,14 @@ def classify_cell(cell: dict, env: dict) -> dict:
     outcomes["weights_present"] = "PASS" if w.get("present") else "FAIL"
     if not w.get("present"):
         outcomes["weights_verified"] = "NOT_TESTED"
-    elif not w.get("manifest_present"):
+    elif w.get("manifest_pinned") and w.get("hashes_ok") is False:
+        outcomes["weights_verified"] = "FAIL_MISMATCH"
+    elif not w.get("manifest_verified"):
+        # a manifest counts only when pinned by hash and covering every weight file (probe_weights)
         outcomes["weights_verified"] = "FAIL_UNVERIFIED"
-    elif w.get("hashes_ok") is None:
-        outcomes["weights_verified"] = "NOT_TESTED"
     else:
-        outcomes["weights_verified"] = "PASS" if (w.get("sizes_ok") and w["hashes_ok"]) else "FAIL"
-    outcomes["model_revision_pinned"] = "PASS" if (revision and SHA40.match(revision)) else "FAIL"
+        outcomes["weights_verified"] = "PASS"
+    outcomes["model_revision_pinned"] = "PASS" if (revision and not is_degenerate_sha(revision)) else "FAIL"
     outcomes["owner_authorization"] = "PASS" if env["authorization_ok"] else "FAIL"
     outcomes["vllm_importable"] = "PASS" if env["vllm_installed"] else "FAIL"
     if gpu is None:
@@ -147,7 +151,7 @@ def classify_cell(cell: dict, env: dict) -> dict:
     outcomes["dataset_checksum"] = ("NOT_TESTED" if not ds.get("present")
                                     else "PASS" if ds.get("checksum_verified") else "FAIL")
     ds_rev = env["dataset_revisions"].get(dataset)
-    outcomes["dataset_revision_pinned"] = "PASS" if (ds_rev and SHA40.match(ds_rev)) else "FAIL"
+    outcomes["dataset_revision_pinned"] = "PASS" if (ds_rev and not is_degenerate_sha(ds_rev)) else "FAIL"
     outcomes["disk_headroom"] = "PASS" if env["disk_free_gib"] >= env["min_free_gib"] else "FAIL"
     outcomes["gpu_smoke_receipt"] = "PASS" if smoke else "NOT_TESTED"
 
@@ -157,6 +161,8 @@ def classify_cell(cell: dict, env: dict) -> dict:
         if out.startswith("FAIL"):
             if name == "weights_verified" and out == "FAIL_UNVERIFIED":
                 blockers.append("BLOCKED_WEIGHTS_UNVERIFIED")
+            elif name == "weights_verified" and out == "FAIL_MISMATCH":
+                blockers.append("BLOCKED_WEIGHTS_MISMATCH")
             elif name == "arm_supported":
                 blockers.append(ARM_CODE)
             else:
@@ -191,8 +197,15 @@ def summarize(statuses: list[dict]) -> dict:
 
 # ---------------------------------------------------------------- probes (I/O)
 
-def probe_weights(model_dir: Path, manifest_path: Path | None, *, hash_files: bool) -> dict:
+def is_degenerate_sha(value: str | None) -> bool:
+    """A 40-hex string that is a placeholder (one or two repeated characters) is not a pin."""
+    return not value or not SHA40.match(value) or len(set(value.lower())) <= 3
+
+
+def probe_weights(model_dir: Path, manifest_path: Path | None, *, hash_files: bool,
+                  pinned_manifest_sha256: str | None = None) -> dict:
     result = {"path": str(model_dir), "present": False, "manifest_present": False,
+              "manifest_pinned": False, "manifest_verified": False,
               "sizes_ok": None, "hashes_ok": None, "max_position_embeddings": None}
     config = model_dir / "config.json"
     if not (model_dir.is_dir() and config.is_file()):
@@ -207,7 +220,11 @@ def probe_weights(model_dir: Path, manifest_path: Path | None, *, hash_files: bo
     if manifest_path is None or not manifest_path.is_file():
         return result
     result["manifest_present"] = True
-    files = json.loads(manifest_path.read_text(encoding="utf8"))["files"]
+    manifest_bytes = manifest_path.read_bytes()
+    result["manifest_pinned"] = bool(pinned_manifest_sha256) and sha256_hex(manifest_bytes) == pinned_manifest_sha256
+    files = json.loads(manifest_bytes.decode("utf8"))["files"]
+    weight_files = {p.name for p in model_dir.glob("*.safetensors")}
+    covered = bool(files) and weight_files <= set(files)
     sizes_ok, hashes_ok = True, True
     for rel, rec in files.items():
         path = model_dir / rel
@@ -224,7 +241,13 @@ def probe_weights(model_dir: Path, manifest_path: Path | None, *, hash_files: bo
                 hashes_ok = False
     result["sizes_ok"] = sizes_ok
     result["hashes_ok"] = hashes_ok if hash_files else None
+    result["manifest_verified"] = bool(result["manifest_pinned"] and covered and sizes_ok
+                                       and result["hashes_ok"] is True)
     return result
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def probe_gpu(runner=subprocess.run) -> dict | None:
@@ -244,18 +267,74 @@ def probe_gpu(runner=subprocess.run) -> dict | None:
         return None
 
 
-def probe_authorization(path: Path, campaign_id: str) -> bool:
-    if not path.is_file():
-        return False
+def verify_owner_authorization(record_path: Path, campaign_id: str, plan_path: Path,
+                               allowed_signers: Path | None, runner=subprocess.run) -> dict:
+    """Owner approval counts only as an ssh-keygen signature over the record, by a key in an
+    owner signer file kept outside the repository, naming this campaign and this plan's hash.
+    A bare JSON file, however it reads, never authorizes.
+    """
+    out = {"verified": False, "reason": ""}
+    sig = record_path.with_name(record_path.name + ".sig")
+    if not record_path.is_file() or not sig.is_file():
+        out["reason"] = "no signed owner record"
+        return out
+    if allowed_signers is None or not allowed_signers.is_file():
+        out["reason"] = "no owner signer file (kept outside the repository)"
+        return out
     try:
-        record = json.loads(path.read_text(encoding="utf8"))
-    except json.JSONDecodeError:
-        return False
-    return record.get("owner_approved_compute") is True and campaign_id in record.get("campaign_ids", [])
+        record = json.loads(record_path.read_text(encoding="utf8"))
+    except (OSError, json.JSONDecodeError):
+        out["reason"] = "owner record is not valid JSON"
+        return out
+    if not plan_path.is_file():
+        out["reason"] = "plan file missing"
+        return out
+    plan_sha = sha256_hex(plan_path.read_bytes())
+    entries = [c for c in record.get("campaigns", []) if isinstance(c, dict)]
+    match = [c for c in entries if c.get("campaign_id") == campaign_id and c.get("plan_sha256") == plan_sha]
+    if not match:
+        out["reason"] = "record does not name this campaign with this plan hash"
+        return out
+    if not record.get("resource") or not record.get("approved_on"):
+        out["reason"] = "record lacks resource or approval date"
+        return out
+    cmd = ["ssh-keygen", "-Y", "verify", "-f", str(allowed_signers), "-I", OWNER_PRINCIPAL,
+           "-n", OWNER_NAMESPACE, "-s", str(sig)]
+    try:
+        done = runner(cmd, input=record_path.read_bytes(), capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        out["reason"] = "signature check could not run"
+        return out
+    if done.returncode != 0:
+        out["reason"] = "signature does not verify against the owner signer file"
+        return out
+    out["verified"] = True
+    out["reason"] = "signed by an owner key for this campaign and plan"
+    return out
 
 
-def probe_vllm() -> bool:
-    return importlib.util.find_spec("vllm") is not None
+def verify_vllm(pinned_version: str | None, runner=subprocess.run) -> dict:
+    """vLLM counts only when importing it and its compiled kernels succeeds and the version equals
+    the configured pin. A stub package or an unpinned install is not verified."""
+    out = {"verified": False, "installed": False, "kernels_importable": False, "version": None,
+           "pinned_version": pinned_version}
+    if not pinned_version:
+        out["reason"] = "no vLLM version pinned in config"
+        return out
+    code = "import vllm, vllm._C; print(vllm.__version__)"
+    try:
+        done = runner([sys.executable, "-c", code], capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.SubprocessError):
+        out["reason"] = "could not run the import check"
+        return out
+    if done.returncode != 0:
+        out["reason"] = "import of vllm or vllm._C failed"
+        return out
+    version = done.stdout.strip().splitlines()[-1] if done.stdout.strip() else ""
+    out.update(installed=True, kernels_importable=True, version=version)
+    out["verified"] = version == pinned_version
+    out["reason"] = "pinned version and kernels import" if out["verified"] else "version differs from pin"
+    return out
 
 
 def probe_dataset(spec: dict) -> dict:
@@ -273,17 +352,26 @@ def probe_dataset(spec: dict) -> dict:
             "checksum_verified": checksum_verified}
 
 
-def load_receipts(receipts_dir: Path | None) -> dict:
-    if receipts_dir is None or not receipts_dir.is_dir():
+def load_receipts(receipts_dir: Path | None, index_path: Path | None = DEFAULT_RECEIPT_INDEX) -> dict:
+    """A receipt counts only when the committed index lists it with a matching SHA-256 and it
+    reports PASS_MEASURED for that same cell. A file in the directory alone never counts."""
+    if receipts_dir is None or index_path is None or not index_path.is_file():
+        return {}
+    try:
+        entries = json.loads(index_path.read_text(encoding="utf8")).get("receipts", [])
+    except (OSError, json.JSONDecodeError, AttributeError):
         return {}
     found = {}
-    for path in sorted(receipts_dir.glob("*.json")):
+    for entry in entries:
+        path = receipts_dir / str(entry.get("file", ""))
+        if not path.is_file() or sha256_hex(path.read_bytes()) != entry.get("sha256"):
+            continue
         try:
             rec = json.loads(path.read_text(encoding="utf8"))
         except json.JSONDecodeError:
             continue
-        if rec.get("status") == "PASS_MEASURED" and rec.get("cell_id") == path.stem:
-            found[path.stem] = True
+        if rec.get("status") == "PASS_MEASURED" and rec.get("cell_id") == entry.get("cell_id"):
+            found[entry["cell_id"]] = True
     return found
 
 
@@ -301,7 +389,11 @@ def git_head() -> str:
 def build_report(pilot_config: Path, matrix_manifest: Path, *, models_root: Path,
                  authorization: Path, receipts_dir: Path | None, min_free_gib: float,
                  hash_weights: bool, probe_gpu_fn=probe_gpu,
-                 feasibility_path: Path | None = DEFAULT_FEASIBILITY) -> dict:
+                 feasibility_path: Path | None = DEFAULT_FEASIBILITY,
+                 allowed_signers: Path | None = None,
+                 pinned_manifest_sha256: dict[str, str] | None = None,
+                 owner_record: Path | None = None,
+                 receipt_index: Path | None = DEFAULT_RECEIPT_INDEX) -> dict:
     config = load_config(pilot_config)
     manifest = manifest_from_path(matrix_manifest)
     pilot_cells = enumerate_pilot_cells(pilot_config)
@@ -314,18 +406,21 @@ def build_report(pilot_config: Path, matrix_manifest: Path, *, models_root: Path
         model_dir = models_root / hf_id
         manifest_file = model_dir / LOCAL_WEIGHTS_MANIFEST
         weights[mid] = probe_weights(model_dir, manifest_file if manifest_file.is_file() else None,
-                                     hash_files=hash_weights)
+                                     hash_files=hash_weights,
+                                     pinned_manifest_sha256=(pinned_manifest_sha256 or {}).get(mid))
         rev = models[mid].get("revision")
         revisions[mid] = rev if rev else None
     datasets = {d["id"]: probe_dataset(d) for d in config["datasets"]}
     dataset_revisions = {d["id"]: d.get("revision") or None for d in config["datasets"]}
     gpu = probe_gpu_fn()
-    receipts = load_receipts(receipts_dir)
+    receipts = load_receipts(receipts_dir, receipt_index)
     disk_free = shutil.disk_usage(models_root if models_root.exists() else REPO).free / 2**30
     campaign_pilot = config["campaign_id"]
-    authorized_pilot = probe_authorization(authorization, campaign_pilot)
-    authorized_full = probe_authorization(authorization, manifest["campaign_id"])
-    vllm = probe_vllm()
+    record = owner_record or authorization
+    authorized_pilot = verify_owner_authorization(record, campaign_pilot, pilot_config, allowed_signers)["verified"]
+    authorized_full = verify_owner_authorization(record, manifest["campaign_id"], matrix_manifest,
+                                                 allowed_signers)["verified"]
+    vllm = verify_vllm(config.get("vllm_pin"))["verified"]
 
     def env_for(serving_max, authorized):
         return {"weights": weights, "revisions": revisions, "dataset_revisions": dataset_revisions,
