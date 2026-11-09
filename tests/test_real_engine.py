@@ -10,6 +10,8 @@ Validates:
 7. Complete seven-arm qualification gate reporting.
 """
 import concurrent.futures
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -604,3 +606,51 @@ def test_p7_h2o_decode_mask_aligned_with_compacted_kv_official():
             assert t["attention_mask_len"] == t["kv_seq_len"], (
                 f"mask {t['attention_mask_len']} != compacted KV {t['kv_seq_len']}")
     engine.close()
+
+
+# --- P7 round 2 item 6: model config pinning (no silent 0.8B fallback) ---
+
+_QWEN08_CKPT = Path("/mnt/ssd/genos2/research_workspace/models/Qwen/Qwen3.5-0.8B")
+
+
+def test_p7_hardcoded_08b_config_matches_pinned_checkpoint_config():
+    """Regression: qwen35_08b() disagreed with the pinned config.json (heads 16 vs 8,
+    head_dim 64 vs 256, FFN 2816 vs 3584, EOS 151645 vs 248044)."""
+    if not (_QWEN08_CKPT / "config.json").is_file():
+        pytest.skip("pinned Qwen3.5-0.8B checkpoint not present")
+    pinned = Qwen35ModelConfig.from_checkpoint(_QWEN08_CKPT)
+    hard = Qwen35ModelConfig.qwen35_08b()
+    for field_name in ("vocab_size", "hidden_size", "num_hidden_layers", "num_attention_heads",
+                       "num_key_value_heads", "head_dim", "intermediate_size",
+                       "max_position_embeddings", "eos_token_id", "image_token_id",
+                       "vision_start_token_id", "vision_end_token_id",
+                       "full_attention_layers", "recurrent_layers"):
+        assert getattr(hard, field_name) == getattr(pinned, field_name), field_name
+
+
+def test_p7_checkpoint_config_is_verified_against_manifest_pin():
+    if not (_QWEN08_CKPT / "config.json").is_file():
+        pytest.skip("pinned Qwen3.5-0.8B checkpoint not present")
+    cfg = Qwen35ModelConfig.from_checkpoint(_QWEN08_CKPT)
+    assert cfg.pin_status == "PINNED_MANIFEST_CONFIG_SHA256"
+    assert cfg.pin_revision == "2fc06364715b967f1860aea9cf38778875588b17"
+
+
+def test_p7_unknown_or_unpinned_model_id_is_refused_not_defaulted_to_08b():
+    from vlmbench.infrastructure.model_config import load_model_config
+
+    with pytest.raises(ValueError, match="Unknown or unpinned"):
+        load_model_config("Qwen/Qwen3.5-9B")
+    with pytest.raises(ValueError, match="Unknown or unpinned"):
+        load_model_config("Qwen/Qwen3.5-14B")  # contains '4b'-like substrings: must not silently map
+    with pytest.raises(ValueError, match="Unknown or unpinned"):
+        load_model_config("/nonexistent/some-model")
+
+
+def test_p7_4b_config_is_explicitly_unpinned():
+    from vlmbench.infrastructure.model_config import load_model_config
+
+    cfg = load_model_config("Qwen/Qwen3.5-4B")
+    assert cfg.model_id == "Qwen/Qwen3.5-4B"
+    assert cfg.pin_status == "UNPINNED_NO_LOCAL_CONFIG_JSON"
+    assert load_model_config("Qwen/Qwen3.5-0.8B").pin_status == "HARDCODED_NOT_FROM_LOCAL_FILE"
