@@ -302,3 +302,29 @@ def test_A_NOT_ACTIVATED_label_is_not_needed_for_grounding_arm_on_this_fixture()
     # The grounding keyword is present in PROMPT, so n_grounding must be > 0 on the pressure run.
     recs = _records(_run("starlight_s1", pool=_pool("oracle_run", ["the"])))
     assert any(r["n_grounding"] > 0 for r in recs)
+
+
+def test_I7_surviving_entries_keep_their_original_position_ids_across_steps():
+    # Added after the implementation (coverage of an existing property), not red-first.
+    # Records key entries by ORIGINAL position. A renumbering bug would make a survivor's id appear
+    # as a smaller or new id in the next step, so every survivor must reappear with the same id.
+    result = _run("starlight_s1", pool=_pool("oracle_run", ["the"]), new=12)
+    by_layer: dict[int, list[dict]] = {}
+    for rec in _records(result):
+        by_layer.setdefault(rec["layer"], []).append(rec)
+    for layer, recs in by_layer.items():
+        for prev, nxt in zip(recs, recs[1:]):
+            survivors = {e["position"] for e in prev["entries"] if e["decision"] != "EVICT"}
+            present_next = {e["position"] for e in nxt["entries"]}
+            assert survivors <= present_next, (layer, nxt["step"])
+            assert max(present_next) == nxt["entries"][-1]["position"]  # newest token is the last entry
+
+
+def test_A_MASK_da_attention_mask_is_not_reported_as_kv_saving_on_starlight_arms():
+    # Added after the implementation (coverage of an existing property). A logical DA restriction must
+    # never appear as a KV-residency or byte saving for the STARLIGHT arms.
+    result = _run("starlight_s1", pool=_pool("oracle_run", ["the"]))
+    cost = result.telemetry["da_cost_accounting"]
+    assert cost["attention_mask_restriction_ratio"] is None
+    assert result.attention_mask_restriction_ratio is None
+    assert cost["original_paper_protocol_qualified"] is False

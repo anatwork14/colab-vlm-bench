@@ -178,7 +178,7 @@ def test_expired_evidence_protects_nothing_and_is_reported():
         max_new_tokens=2, evidence_pool=pool)
     s = result.telemetry["starlight"]
     assert s["grounding_protected_by_evidence"] == {}
-    assert s["grounding_evidence_verdicts"] == {"ev_1": ["expired", "pool_request_id_mismatch"]}
+    assert s["grounding_evidence_verdicts"] == {"ev_1": ["expired", "pool_request_id_mismatch", "EXPIRED_EVIDENCE"]}
     assert s["protected_count_by_source"]["grounding"] == 0
 
 

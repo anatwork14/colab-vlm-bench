@@ -14,7 +14,7 @@ ValueError, so an inconsistent caller cannot silently break the budget.
 
 Budget accounting: the engine computes the H2O candidate set at budget - |protected| over all
 entries (H2O's own protection is disabled under STARLIGHT, so the controller owns protection).
-Then retained = keep ∪ protected has size <= budget by construction. Vetoes are the H2O
+Then retained = keep union protected has size <= budget by construction. Vetoes are the H2O
 candidates that the controller protects instead of evicting.
 
 Every result is labelled cpu_pytorch_reference_not_vllm. Nothing here is GPU or vLLM evidence.
@@ -38,6 +38,13 @@ DECISION_RETAIN_H2O_KEPT = "RETAIN_H2O_KEPT"
 
 SIGNAL_SOURCES: tuple[str, ...] = ("da", "grounding")
 
+# Closed enum of per-entry reason codes (auditor oracle I-3). Every decision carries one.
+REASON_EVICT = "H2O_CANDIDATE_UNPROTECTED"
+REASON_VETOED = "H2O_CANDIDATE_VETOED_BY_PROTECTION"
+REASON_PROTECTED = "PROTECTED_NOT_H2O_CANDIDATE"
+REASON_KEPT = "H2O_KEPT"
+REASON_CODES: tuple[str, ...] = (REASON_EVICT, REASON_VETOED, REASON_PROTECTED, REASON_KEPT)
+
 
 @dataclass(frozen=True)
 class EntryDecision:
@@ -50,6 +57,7 @@ class EntryDecision:
     signals_fired: tuple[str, ...]
     decision: str
     reason: str
+    reason_code: str
 
 
 @dataclass(frozen=True)
@@ -195,21 +203,24 @@ def plan_starlight_layer(
         is_prot = i in protected
         fired = fired_by_index.get(i, ())
         if i in eligible:
-            decision, reason = DECISION_EVICT, "h2o candidate and not protected"
+            decision, reason, code = DECISION_EVICT, "h2o candidate and not protected", REASON_EVICT
         elif is_cand and is_prot:
             decision = DECISION_RETAIN_PROTECTED_VETOED
             reason = f"h2o candidate vetoed: protected by {', '.join(fired)}"
+            code = REASON_VETOED
         elif is_prot:
             decision = DECISION_RETAIN_PROTECTED
             reason = f"protected by {', '.join(fired)}; not an h2o candidate"
+            code = REASON_PROTECTED
         else:
             decision = DECISION_RETAIN_H2O_KEPT
             reason = "not an h2o candidate; retained"
+            code = REASON_KEPT
         if status == STATUS_INFEASIBLE:
             reason = f"INFEASIBLE (protected {len(protected)} > budget {budget}); {reason}"
         decisions.append(EntryDecision(
             entry_id=i, layer=layer, h2o_candidate=is_cand, internally_protected=is_prot,
-            signals_fired=fired, decision=decision, reason=reason,
+            signals_fired=fired, decision=decision, reason=reason, reason_code=code,
         ))
 
     protected_counts = {

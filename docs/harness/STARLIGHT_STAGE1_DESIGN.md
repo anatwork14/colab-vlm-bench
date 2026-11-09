@@ -29,7 +29,7 @@ external eviction   = H2O-proposed candidates only
 | `src/vlmbench/infrastructure/grounding_evidence.py` | Two read-only accessors, `items()` and `keyword_index()`. ECRD behaviour unchanged. |
 | `src/vlmbench/infrastructure/real_engine.py` | Arms `starlight_s1`, `starlight_s1_no_da`, `starlight_s1_no_grounding` (`STARLIGHT_ARM_SIGNALS`). Per-step helper `_starlight_build_step_plans`. Telemetry under `telemetry["starlight"]`. |
 
-Tests: `tests/test_starlight_policy.py` (14), `tests/test_starlight_signals.py` (16),
+Tests: `tests/test_starlight_policy.py` (14), `tests/test_starlight_signals.py` (16), `tests/test_starlight_oracle.py` (23),
 `tests/test_starlight_engine.py` (17).
 
 ## 3. Candidate set and budget
@@ -177,3 +177,59 @@ an H2O variant label is never attached to a STARLIGHT run.
 3. Image-region evidence: map bounding boxes to visual token positions in Stage 2, or keep it
    text-only?
 4. Evidence expiry: add a timestamp or turn index to `EvidenceItem`?
+
+## 12. Coverage against the auditor oracle (wF:p9, `docs/harness/STARLIGHT_INVARIANTS_ORACLE.md`)
+
+The oracle is a specification, not evidence. This matrix states what the tests show. A "partial"
+or "not covered" item is not a pass. Test file: `tests/test_starlight_oracle.py` unless noted.
+Decision records are opt-in (`starlight_record_decisions=True`).
+
+| Oracle item | Status | Where / note |
+|---|---|---|
+| I-1 eligibility formula | covered | `test_I1_I2_*`, recomputed from records |
+| I-2 protected never evicted | covered | `test_I1_I2_*`; policy random tests; engine invariant counter |
+| I-3 no silent discard, closed reason enum | covered | `test_I3_*`; `REASON_CODES` |
+| I-4 infeasibility explicit | covered | pure protection-over-budget test; engine helper test |
+| I-5 budget when feasible | covered | pure random consistent plans; engine `max_retained_per_layer_step` |
+| I-6 GDN exempt and labelled | partial | exempt and labelled (`test_HC12_*`). The byte-identity hash of GDN state is NOT tested. |
+| I-7 position preservation | partial | survivors keep original ids (`test_I7_*`). RoPE tensor values are NOT compared. |
+| I-8 vision_start/end never evicted | NOT satisfied (open A-4) | measured as `structural_tokens_evicted` and marked `NOT_RATIFIED_A4_POLICY_DEPENDENT`. Not protected. |
+| I-9 determinism | covered | `test_I9_HC15_*` |
+| I-10 complete decision records | covered | `test_I10_*`; records are keyed by original position |
+| A-DA | covered | `test_A_DA_*` on the conflict fixture |
+| A-GROUND | covered | `test_A_GROUND_*` on the conflict fixture |
+| A-NODA, A-NOGROUND | covered | `test_A_NODA_and_A_NOGROUND_*` on every step |
+| A-H2O | covered | `test_A_H2O_*` |
+| A-TOGGLE | covered | `test_A_TOGGLE_*`, with the H2O-only negative control |
+| A-MASK | covered | `test_A_MASK_*` |
+| HC-1 DA/H2O conflict | covered | helper conflict test and A-DA/A-TOGGLE. Oracle wording "H2O top-score" conflicts with its own candidate definition (candidates are low-score). Implemented as low-score candidate vs protection. |
+| HC-2 grounding/H2O conflict | covered | helper conflict test and A-GROUND/A-TOGGLE |
+| HC-3 protection > budget | covered | pure and helper tests (INFEASIBLE, protected kept) |
+| HC-3b protection = budget | covered | `test_HC3b_*` |
+| HC-4 expired evidence | covered | `test_HC4_*`: not protected, reason code `EXPIRED_EVIDENCE` |
+| HC-4b stale evidence | partial | source-hash mismatch covered (pure). Turn IDs do not exist in this engine. A request-ID mismatch is reported as expired. |
+| HC-5 irrelevant evidence measured | NOT covered | per-evidence protected counts are measured. Relevance labels are absent, so `protected_irrelevant_fraction` = `NOT_MEASURED_NO_RELEVANCE_LABELS`. |
+| HC-6 long-context pressure | covered | per-step I-3 checks on the pressure run |
+| HC-7 missing declaration | partial, open A-5 | explicit `NO_EVIDENCE_DECLARED`, protects nothing. NOT fail-closed. Owner decision. |
+| HC-8 malformed declaration | covered for spans and sha | `test_HC8_*` raises. No score declarations exist, so NaN scores are not applicable. |
+| HC-9 multi-request isolation | partial | sequential isolation test. Interleaved batches are not possible: `execute_request` is synchronous. |
+| HC-10 multi-turn / evicted never returns | partial | `test_HC10_*` covers evicted-not-returning within a request. The engine carries no KV across calls, so cross-turn KV is not applicable. |
+| HC-11 no eligible candidates | covered | `test_HC11_*`. Unmet budget with no candidates raises ValueError (open A-2). |
+| HC-12 GDN exemption | partial | label and exemption covered. Hash identity NOT tested. |
+| HC-13 vision span integrity | partial, open A-4 | structural tokens measured; not protected |
+| HC-14 cache consistency | partial | length counter checked every step (`test_HC14_*`). Logit recomputation NOT done. |
+| HC-15 determinism | covered | `test_I9_HC15_*` |
+
+Auditor ambiguities (A-1..A-6) and the choices made:
+
+- A-1 budget granularity: per (request, FA layer), applied to both KV heads (oracle default).
+- A-2 budget unmet with no eligible candidates: NOT a status. The policy raises ValueError. Open.
+- A-3 per-head protection: a protected position is protected in all KV heads of the layer
+  (conservative oracle default). Positions are shared across heads.
+- A-4 structural tokens: not ratified. Measured, not protected. Open.
+- A-5 missing declarations: explicit status, no protection. Not fail-closed. Open.
+- A-6 eviction timing: decode only. Prefill is never evicted. Each record states `phase: "decode"`.
+
+Tests added after the implementation, not red-first (coverage of existing behaviour):
+`test_I7_*`, `test_A_MASK_*`, `test_HC13` (measurement), and the grounding-verdict reason-code
+change in `test_expired_evidence_*`.

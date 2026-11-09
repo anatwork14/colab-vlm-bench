@@ -1000,6 +1000,15 @@ STARLIGHT_MEASUREMENT_LABEL = "cpu_pytorch_reference_not_vllm"
 # Arms that run the DA attention mask. Exact membership, never a substring test: the name
 # "starlight_s1_no_da" contains "da" but is a protection-only ablation and must not build a mask.
 DA_MASKING_ARMS: tuple[str, ...] = ("da_base", "da_mtp")
+# Oracle reason codes for evidence verdicts (HC-4, HC-4b): status -> closed code.
+EVIDENCE_REASON_CODES: dict[str, str] = {
+    "valid": "VALID",
+    "expired": "EXPIRED_EVIDENCE",
+    "stale": "STALE_DECLARATION",
+    "unverified": "UNVERIFIED_EVIDENCE",
+}
+GDN_EXEMPT_LABEL = "GDN_EXEMPT_NOT_TOKEN_ADDRESSABLE"
+STRUCTURAL_POLICY_LABEL = "NOT_RATIFIED_A4_POLICY_DEPENDENT"
 
 
 def _image_sha256(image_bytes: bytes | None, image_path: str | Path | None) -> str | None:
@@ -1066,6 +1075,7 @@ class RealSevenArmEngine:
         eos_token_ids: Sequence[int] | None = None,
         tokenizer: Any | None = None,
         checkpoint_dir: str | Path | None = None,
+        starlight_record_decisions: bool = False,
     ):
         if method_arm not in self.SUPPORTED_ARMS:
             raise ValueError(f"Unknown method arm: {method_arm}")
@@ -1124,6 +1134,8 @@ class RealSevenArmEngine:
         self.h2o_config = H2OConfig(budget_ratio=h2o_budget_ratio, min_budget=h2o_min_budget)
         # STARLIGHT arms are protection-only ablations of the H2O tracker; None for the seven.
         self.starlight_signals: tuple[str, ...] | None = STARLIGHT_ARM_SIGNALS.get(method_arm)
+        # Opt-in per-entry decision records (auditor oracle I-10). Off by default: records are large.
+        self.starlight_record_decisions = bool(starlight_record_decisions)
         self.da_fsm = DAFSM() if method_arm in DA_MASKING_ARMS else None
         self.da_mask_gen = DAMaskGenerator() if method_arm in DA_MASKING_ARMS else None
         self.ecrd_processors: dict[str, ECRDLogitsProcessor] = {}
@@ -1473,6 +1485,63 @@ class RealSevenArmEngine:
             step_plans.append(plan)
         return plans_tensor, next_orig, step_plans
 
+    def _starlight_step_records(
+        self,
+        step: int,
+        appended_position: int,
+        step_plans: Sequence[StarlightLayerPlan],
+        orig_before: dict[int, np.ndarray],
+        next_orig: dict[int, np.ndarray],
+        budget_total: int,
+        structural_positions: set[int],
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Per (step, full-attention layer) decision records keyed by ORIGINAL token position.
+
+        Returns (records, structural_tokens_evicted_this_step). Structural = vision_start/vision_end.
+        Flags are read from the plan's own signal labels, not recomputed from the arm name.
+        """
+        records: list[dict[str, Any]] = []
+        structural_evicted = 0
+        for plan in step_plans:
+            l_idx = plan.layer
+            orig_full = [int(x) for x in np.append(orig_before[l_idx], appended_position)]
+            retained_positions = {int(x) for x in next_orig[l_idx]}
+            for pos in orig_full:
+                if pos not in retained_positions and pos in structural_positions:
+                    structural_evicted += 1
+            entries = []
+            for d in plan.decisions:
+                entries.append({
+                    "position": orig_full[d.entry_id],
+                    "h2o_candidate": d.h2o_candidate,
+                    "da_protected": any(sig.startswith("da:") for sig in d.signals_fired),
+                    "grounding_protected": any(sig.startswith("grounding:") for sig in d.signals_fired),
+                    "decision": d.decision,
+                    "reason_code": d.reason_code,
+                })
+            n_protected = sum(1 for e in entries if e["da_protected"] or e["grounding_protected"])
+            records.append({
+                "step": step,
+                "phase": "decode",
+                "layer": l_idx,
+                "budget": budget_total,
+                "pre": plan.length,
+                "retained": len(plan.retained),
+                "evicted": len(plan.evicted),
+                "status": plan.status,
+                "n_da": sum(1 for e in entries if e["da_protected"]),
+                "n_grounding": sum(1 for e in entries if e["grounding_protected"]),
+                "n_h2o_candidates": sum(1 for e in entries if e["h2o_candidate"]),
+                "n_eligible": len(plan.evicted),
+                "n_protected": n_protected,
+                # Protected entries that cannot fit the budget (INFEASIBLE only); 0 when feasible.
+                "n_protected_outside_budget": (
+                    max(0, n_protected - budget_total) if plan.status == STATUS_INFEASIBLE else 0
+                ),
+                "entries": entries,
+            })
+        return records, structural_evicted
+
     def execute_request(
         self,
         request_id: str,
@@ -1586,6 +1655,10 @@ class RealSevenArmEngine:
         starlight_text_fraction: float | None = None
         starlight_text_positions: np.ndarray | None = None
         starlight_next_orig: dict[int, np.ndarray] = {}
+        starlight_records: list[dict[str, Any]] = []
+        starlight_structural: set[int] = set()
+        starlight_structural_evicted = 0
+        starlight_cache_mismatch_steps = 0
         if starlight_active:
             # Total budget per full-attention layer, fixed from the prefill length (as H2O does).
             starlight_budget = max(self.h2o_config.min_budget, int(len(full_prompt) * self.h2o_config.budget_ratio))
@@ -1596,6 +1669,10 @@ class RealSevenArmEngine:
             starlight_text_positions = np.asarray(
                 [i for i, t in enumerate(full_prompt) if t not in visual_ids], dtype=np.int64,
             )
+            starlight_structural = {
+                i for i, t in enumerate(full_prompt)
+                if t in (self.config.vision_start_token_id, self.config.vision_end_token_id)
+            }
             if "da" in starlight_enabled:
                 # SCRIPTED DIAGNOSTIC DA scope, anchored to the prefill. Only GLOBAL (sink, question) and
                 # FOCUS spans protect; the LOCAL window is a mask-only scope and does not protect.
@@ -1616,7 +1693,7 @@ class RealSevenArmEngine:
                     starlight_grounding_status = "NO_EVIDENCE_DECLARED"
                 else:
                     starlight_verdicts = {
-                        eid: list(verdict) for eid, verdict in
+                        eid: [status, reason, EVIDENCE_REASON_CODES[status]] for eid, (status, reason) in
                         evidence_validity(evidence_pool, request_id, image_sha).items()
                     }
                     if self.tokenizer is None:
@@ -1769,6 +1846,13 @@ class RealSevenArmEngine:
                     starlight_da_spans, starlight_grounding, starlight_enabled,
                 )
                 starlight_summaries.append(summarize_plans(step_plans))
+                step_records, step_structural = self._starlight_step_records(
+                    step, curr_len - 1, step_plans, starlight_orig, starlight_next_orig,
+                    starlight_budget, starlight_structural,
+                )
+                starlight_structural_evicted += step_structural
+                if self.starlight_record_decisions:
+                    starlight_records.extend(step_records)
                 starlight_max_retained = max(starlight_max_retained, max(len(p.retained) for p in step_plans))
                 if starlight_text_positions is not None and starlight_text_positions.size:
                     starlight_text_fraction = float(np.mean([
@@ -1848,6 +1932,14 @@ class RealSevenArmEngine:
                             tracker.compact_layer_state(l_idx, retained_np)
                         tracker.update_attention_scores(l_idx, attn_w[0].float().cpu().numpy())
                 if starlight_active:
+                    # H-6 length-counter check: the physical cache must hold exactly the retained entries.
+                    for l_idx in self.config.full_attention_layers:
+                        if self.model.hf_forward_active:
+                            cache_len = past_kv.layers[l_idx].keys.shape[2]
+                        else:
+                            cache_len = past_kv[l_idx][0].shape[2]
+                        if cache_len != len(starlight_next_orig[l_idx]):
+                            starlight_cache_mismatch_steps += 1
                     starlight_orig = starlight_next_orig
 
                 for telem in out["layer_telemetries"]:
@@ -2134,6 +2226,16 @@ class RealSevenArmEngine:
                 "text_side_retained_fraction_last_step": (
                     round(starlight_text_fraction, 4) if starlight_text_fraction is not None else None
                 ),
+                "decision_records": starlight_records if self.starlight_record_decisions else None,
+                "gdn_layer_records": [
+                    {"layer": l_idx, "decision": GDN_EXEMPT_LABEL, "evicted": 0}
+                    for l_idx in self.config.recurrent_layers
+                ],
+                "structural_tokens_evicted": starlight_structural_evicted,
+                "structural_policy": STRUCTURAL_POLICY_LABEL,
+                "cache_length_mismatch_steps": starlight_cache_mismatch_steps,
+                # HC-5 needs external relevance labels, which this engine does not have. Reported as such.
+                "protected_irrelevant_fraction": "NOT_MEASURED_NO_RELEVANCE_LABELS",
                 "physical_vram_saving_claimed": False,
                 "limitation": (
                     "CPU PyTorch reference, not vLLM. Scripted DA geometry, token-level keyword matching, "
