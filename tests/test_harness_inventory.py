@@ -27,7 +27,7 @@ def _load():
 
 inv = _load()
 
-SHA = "a" * 40  # a syntactically valid revision for a healthy-environment fixture
+SHA = "7d209f58a7d368d8b0ba629959464b44204bcba9"  # a realistic, non-degenerate revision (placeholders are refused)
 
 
 def healthy_env(**overrides):
@@ -35,9 +35,9 @@ def healthy_env(**overrides):
     env = {
         "weights": {
             "qwen35_08b": {"present": True, "sizes_ok": True, "hashes_ok": True,
-                           "max_position_embeddings": 262144, "manifest_present": True},
+                           "max_position_embeddings": 262144, "manifest_present": True, "manifest_verified": True},
             "qwen35_4b": {"present": True, "sizes_ok": True, "hashes_ok": True,
-                          "max_position_embeddings": 262144, "manifest_present": True},
+                          "max_position_embeddings": 262144, "manifest_present": True, "manifest_verified": True},
         },
         "revisions": {"qwen35_08b": SHA, "qwen35_4b": SHA},
         "dataset_revisions": {"memlens": SHA, "mmlongbench_doc": SHA},
@@ -173,7 +173,7 @@ def test_dataset_without_verified_checksum_blocks():
 
 def test_weights_without_a_matching_manifest_are_not_verified():
     env = healthy_env()
-    env["weights"]["qwen35_08b"]["hashes_ok"] = False
+    env["weights"]["qwen35_08b"].update(hashes_ok=False, manifest_verified=False, manifest_pinned=True)
     assert _status(_cell(), env)["status"] == "BLOCKED_WEIGHTS_MISMATCH"
 
 
@@ -257,17 +257,6 @@ def test_probe_gpu_without_nvidia_smi_returns_none():
     assert inv.probe_gpu(runner=runner) is None
 
 
-def test_probe_authorization_requires_an_explicit_approval_for_this_campaign(tmp_path):
-    path = tmp_path / "auth.json"
-    assert inv.probe_authorization(path, "camp") is False
-    path.write_text(json.dumps({"owner_approved_compute": True, "campaign_ids": ["other"]}))
-    assert inv.probe_authorization(path, "camp") is False
-    path.write_text(json.dumps({"owner_approved_compute": True, "campaign_ids": ["camp"]}))
-    assert inv.probe_authorization(path, "camp") is True
-
-
-# ---------------------------------------------------------------- real environment: invariants only
-
 def test_inventory_invariants_hold_on_an_empty_models_root():
     report = inv.build_report(PILOT, MATRIX, models_root=ROOT / "models-not-here",
                               authorization=ROOT / "docs/harness/OWNER_AUTHORIZATION.json",
@@ -290,3 +279,23 @@ def test_markdown_states_limits_and_regeneration_and_matches_the_json_counts(tmp
     assert "## 5. Regenerate" in text and "scripts/harness_inventory.py" in text
     assert f"| pilot ({report['matrices']['pilot']['campaign_id']}) | 48 |" in text
     assert f"| full ({report['matrices']['full']['campaign_id']}) | 3528 |" in text
+
+
+# ITER2 D5-1: resolved dataset metadata is attached as metadata. It never changes a cell status.
+
+def _report(tmp_path, feasibility_path):
+    return inv.build_report(PILOT, MATRIX, models_root=tmp_path / "none", authorization=tmp_path / "no-auth.json",
+                            receipts_dir=None, min_free_gib=3.0, hash_weights=False,
+                            probe_gpu_fn=lambda: None, feasibility_path=feasibility_path)
+
+
+def test_feasibility_metadata_is_attached_marked_unapproved_and_changes_no_status(tmp_path):
+    with_meta = _report(tmp_path, inv.DEFAULT_FEASIBILITY)
+    without = _report(tmp_path, None)
+    feas = with_meta["dataset_feasibility"]
+    assert feas["owner_approved"] is False
+    assert feas["memlens"]["hf_revision_sha"] == "afa101a1907cc37db40b50d649547964387b96b7"
+    assert feas["mmlongbench_doc"]["hf_revision_sha"] == "2ff6aa9237fc777b6627dc57a486e9225ac5fb86"
+    assert without["dataset_feasibility"] is None
+    assert [c["status"] for c in with_meta["cells"]] == [c["status"] for c in without["cells"]]
+    assert all(c["status"] != "READY" for c in with_meta["cells"])

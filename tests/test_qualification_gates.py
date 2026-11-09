@@ -58,9 +58,10 @@ def test_all_passing_tests_give_measured_labels():
     assert gates["POLICY_HARNESS_PASS"] == "PASS"
     assert gates["REAL_MODEL_FORWARD_PASS"] == "PASS"
     assert gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS"
-    assert gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS"
+    assert gates["SEVEN_ARM_HOOK_COVERAGE_PASS"] == "PASS"
     assert gates["MTP_PROPOSAL_DIAGNOSTIC_PASS"] == "PASS"
-    assert gates["CCU_REQUEST_ISOLATION_TEST_PASS"] == "PASS"
+    assert gates["PYTORCH_THREAD_CITATION_LEAK_CHECK"] == "PASS"
+    assert "CCU_REQUEST_ISOLATION_TEST_PASS" not in gates
     # engine-reported gates are carried through only when every arm agrees
     assert gates["ACTUAL_BACKEND_HOOK_PASS"] == ENGINE_GATES["ACTUAL_BACKEND_HOOK_PASS"]
     assert gates["MTP_CORRECTNESS_PASS"] == ENGINE_GATES["MTP_CORRECTNESS_PASS"]
@@ -95,7 +96,7 @@ def test_failed_seven_arm_test_fails_engine_gates():
     tests = _all_passing_tests()
     tests["test_d_seven_arms"] = {"status": "FAIL", "error": "arm mtp broke"}
     gates = qual.compute_release_gates(tests, device_name=GPU)
-    assert gates["SEVEN_ARM_PRETRAINED_PASS"] == "FAIL"
+    assert gates["SEVEN_ARM_HOOK_COVERAGE_PASS"] == "FAIL"
     assert gates["ACTUAL_BACKEND_HOOK_PASS"] == "FAIL"
     assert gates["MTP_CORRECTNESS_PASS"] == "FAIL"
 
@@ -205,3 +206,106 @@ def test_main_refuses_existing_receipt_before_running_any_test(tmp_path, monkeyp
         qual.main()
     assert exc.value.code != 0
     assert existing.read_text(encoding="utf8") == "{}"
+
+
+# ITER2 G-1 (REVIEW_ITER2 §4): the MTP gate reads the MTP arms only. Non-MTP arms have no MTP
+# correctness to report, so their values never enter the gate.
+
+def test_non_mtp_arms_do_not_turn_a_gated_mtp_gate_into_fail():
+    tests = _all_passing_tests()
+    for arm in ("base", "h2o_base", "da_base", "ecrd_base"):
+        tests["test_d_seven_arms"]["arms"][arm]["gates"]["MTP_CORRECTNESS_PASS"] = "NOT_APPLICABLE"
+    gates = qual.compute_release_gates(tests, device_name=GPU)
+    assert gates["MTP_CORRECTNESS_PASS"] == ENGINE_GATES["MTP_CORRECTNESS_PASS"]
+
+
+def test_an_mtp_arm_disagreeing_with_the_others_still_fails_the_gate():
+    tests = _all_passing_tests()
+    tests["test_d_seven_arms"]["arms"]["da_mtp"]["gates"]["MTP_CORRECTNESS_PASS"] = "PASS"
+    gates = qual.compute_release_gates(tests, device_name=GPU)
+    assert gates["MTP_CORRECTNESS_PASS"] == "FAIL"
+
+
+def test_not_applicable_is_not_a_gate_value():
+    gates = qual.compute_release_gates(_all_passing_tests(), device_name=GPU)
+    assert "NOT_APPLICABLE" not in gates.values()
+
+
+def test_a_missing_mtp_arm_leaves_the_mtp_gate_not_tested():
+    tests = _all_passing_tests()
+    del tests["test_d_seven_arms"]["arms"]["da_mtp"]
+    gates = qual.compute_release_gates(tests, device_name=GPU)
+    assert gates["MTP_CORRECTNESS_PASS"] == "NOT_TESTED"
+
+
+def test_an_mtp_arm_reporting_not_applicable_leaves_the_mtp_gate_not_tested():
+    tests = _all_passing_tests()
+    tests["test_d_seven_arms"]["arms"]["h2o_mtp"]["gates"]["MTP_CORRECTNESS_PASS"] = "NOT_APPLICABLE"
+    gates = qual.compute_release_gates(tests, device_name=GPU)
+    assert gates["MTP_CORRECTNESS_PASS"] == "NOT_TESTED"
+
+
+# ITER2 G-2 (REVIEW_ITER2 §4): Test G checks PyTorch-thread citation leakage and token equality with
+# solo runs. It is not multi-request serving isolation; CCU_ISOLATION_PASS stays GATED per engine result.
+
+def test_token_check_passes_when_every_concurrent_output_equals_its_solo_output():
+    solo = {"r0": [1, 2, 3], "r1": [4, 5]}
+    conc = {"r0": [1, 2, 3], "r1": [4, 5]}
+    assert qual.token_isolation_check(solo, conc) == {"pass": True, "compared": 2, "mismatches": []}
+
+
+def test_token_check_names_the_request_whose_tokens_differ():
+    solo = {"r0": [1, 2, 3], "r1": [4, 5]}
+    conc = {"r0": [1, 2, 3], "r1": [4, 6]}
+    result = qual.token_isolation_check(solo, conc)
+    assert result["pass"] is False
+    assert result["mismatches"] == ["r1: tokens differ"]
+
+
+def test_token_check_fails_on_a_missing_or_extra_request():
+    solo = {"r0": [1], "r1": [2]}
+    assert qual.token_isolation_check(solo, {"r0": [1]})["mismatches"] == ["r1: missing concurrent output"]
+    assert qual.token_isolation_check(solo, {"r0": [1], "r1": [2], "r9": [3]})["pass"] is False
+
+
+def test_token_check_is_not_vacuous():
+    assert qual.token_isolation_check({}, {})["pass"] is False
+    assert qual.token_isolation_check({"r0": []}, {"r0": []})["pass"] is False
+
+
+def test_citation_leak_check_accepts_citations_only_to_the_request_own_evidence():
+    expected = {"req_0": {"ev_0"}, "req_1": {"ev_1"}}
+    cits = {"req_0": [{"evidence_ids": ["ev_0"]}], "req_1": [{"evidence_ids": ["ev_1"]}]}
+    assert qual.citation_leak_violations(cits, expected) == []
+
+
+def test_citation_leak_check_reports_a_cross_request_citation():
+    expected = {"req_0": {"ev_0"}, "req_1": {"ev_1"}}
+    cits = {"req_0": [{"evidence_ids": ["ev_0", "ev_1"]}], "req_1": [{"evidence_ids": ["ev_1"]}]}
+    assert qual.citation_leak_violations(cits, expected) == ["req_0 cited ev_1"]
+
+
+def test_citation_leak_check_requires_each_request_to_cite_something():
+    expected = {"req_0": {"ev_0"}}
+    assert qual.citation_leak_violations({"req_0": []}, expected) == ["req_0: no grounded citations"]
+
+
+def test_old_ccu_gate_name_is_gone_from_the_script():
+    source = SCRIPT.read_text(encoding="utf8")
+    assert "CCU_REQUEST_ISOLATION_TEST_PASS" not in source
+    assert "PYTORCH_THREAD_CITATION_LEAK_CHECK" in source
+
+
+# ITER2 G-3 (REVIEW_ITER2 §4): the seven-arm release gate records hook attachment and tensor coverage
+# across the seven arms. It does not measure inference correctness; that is the MTP and Test G gates.
+
+def test_seven_arm_gate_is_named_for_what_it_measures():
+    gates = qual.compute_release_gates(_all_passing_tests(), device_name=GPU)
+    assert gates["SEVEN_ARM_HOOK_COVERAGE_PASS"] == "PASS"
+    assert "SEVEN_ARM_PRETRAINED_PASS" not in gates
+
+
+def test_seven_arm_hook_coverage_is_not_a_correctness_claim():
+    source = SCRIPT.read_text(encoding="utf8")
+    assert "SEVEN_ARM_HOOK_COVERAGE_PASS" in source
+    assert "SEVEN_ARM_PRETRAINED_PASS\": _test_status" not in source

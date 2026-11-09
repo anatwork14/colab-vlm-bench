@@ -1,0 +1,5 @@
+{
+  "schema": "gpu_receipt_index/1",
+  "note": "A cell receipt counts toward READY only if listed here with its SHA-256 (ITER2 I-1). The GPU smoke receipts are not cell receipts and are not listed.",
+  "receipts": []
+}
