@@ -7,7 +7,7 @@ import torch
 from safetensors.torch import save_file
 
 from vlmbench.checkpoint_payload import (
-    audit_safetensors_payload, require_exact_payload_match,
+    audit_safetensors_payload, require_exact_payload_match, safe_receipt_output_path,
 )
 
 
@@ -80,3 +80,13 @@ def test_scalar_tensor_shape_is_valid(tmp_path):
     require_exact_payload_match(report)
     assert report["total_tensor_elements"] == 1
     assert report["sum_tensor_dtype_times_shape_bytes"] == 4
+
+
+def test_receipts_cannot_overwrite_source_model_tree(tmp_path):
+    model_dir = tmp_path / "Qwen3.5-0.8B"
+    model_dir.mkdir()
+    with pytest.raises(ValueError, match="outside the original checkpoint"):
+        safe_receipt_output_path(model_dir, model_dir / "audit.json")
+    assert safe_receipt_output_path(model_dir, tmp_path / "results" / "audit.json") == (
+        tmp_path / "results" / "audit.json"
+    )

@@ -122,3 +122,12 @@ def require_exact_payload_match(result: dict) -> None:
             f"Mismatch index.total_size - computed dtype/shape bytes: "
             f"{result['difference_bytes']} bytes"
         )
+
+
+def safe_receipt_output_path(checkpoint_dir: str | Path, output_path: str | Path) -> Path:
+    """Keep optional audit artifacts outside the original checkpoint tree."""
+    checkpoint = Path(checkpoint_dir).resolve()
+    output = Path(output_path).resolve()
+    if output == checkpoint or checkpoint in output.parents:
+        raise ValueError("Audit JSON output must be outside the original checkpoint source")
+    return output

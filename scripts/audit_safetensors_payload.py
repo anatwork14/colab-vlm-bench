@@ -8,6 +8,7 @@ from pathlib import Path
 from vlmbench.checkpoint_payload import (
     audit_safetensors_payload,
     require_exact_payload_match,
+    safe_receipt_output_path,
 )
 
 
@@ -23,8 +24,9 @@ def main() -> None:
     print(json.dumps(result, indent=2, sort_keys=True))
     require_exact_payload_match(result)
     if args.json_out:
-        args.json_out.parent.mkdir(parents=True, exist_ok=True)
-        args.json_out.write_text(json.dumps(result, indent=2), encoding="utf8")
+        out_path = safe_receipt_output_path(args.checkpoint_dir, args.json_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(result, indent=2), encoding="utf8")
 
 
 if __name__ == "__main__":
