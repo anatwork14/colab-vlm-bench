@@ -36,6 +36,7 @@ UPSTREAM_COMMIT = "d73f0dc0be7e0a2ff6a403d5fe65fcd96461f384"
 EVAL_SCORE_SHA256 = "cafa268358b08521cfc9a805c67d86732d943677e4408c5751f336123d09631f"
 EXTRACT_ANSWER_SHA256 = "fa6a747bd6a8e96fb6884eb7201663268a5df700ad71d85db3bc5e04a157722f"
 EXTRACTION_PROMPT_SHA256 = "96a22c3003c22801f1f19717be45070b1d6b9ce76b42e171e044f63b641de659"
+OFFICIAL_EXTRACTOR_MODEL = "gpt-4o"  # upstream eval/extract_answer.py at d73f0dc: model_name="gpt-4o"
 NOT_ANSWERABLE = "Not answerable"
 
 
@@ -262,21 +263,46 @@ class ExtractedAnswer:
             )
 
 
+def is_official_extraction(ext: ExtractedAnswer) -> bool:
+    """True only for the official extractor model and the official extraction prompt hash."""
+    return ext.extractor_model == OFFICIAL_EXTRACTOR_MODEL and ext.extractor_prompt_sha256 == EXTRACTION_PROMPT_SHA256
+
+
+def _blocked(reason: str, **extra: Any) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "status": "BLOCKED_NO_JUDGE",
+        "reason": reason,
+        "official_acc": None,
+        "official_f1": None,
+        "deterministic_stage_ported": True,
+    }
+    out.update(extra)
+    return out
+
+
 def official_status(extracted: Iterable[ExtractedAnswer] | None) -> dict[str, Any]:
-    """Official numbers exist only when stage 2 output is present. Otherwise the status is blocked."""
+    """Without stage-2 output there is no official number: the status is BLOCKED_NO_JUDGE."""
     if extracted is None:
-        return {
-            "status": "BLOCKED_NO_JUDGE",
-            "reason": "official stage 2 (LLM answer extraction, eval/extract_answer.py) has not been run",
-            "official_acc": None,
-            "official_f1": None,
-            "deterministic_stage_ported": True,
-        }
+        return _blocked("official stage 2 (LLM answer extraction, eval/extract_answer.py) has not been run",
+                        reason_code="NO_EXTRACTION")
     raise NotImplementedError("scoring of extracted answers is applied via score_records()")
 
 
 def score_records(records: Sequence[dict], extracted: dict[str, ExtractedAnswer]) -> dict[str, Any]:
-    """Stage 3 over records (gold answer, answer_format, evidence, doc_type) and stage-2 output."""
+    """Stage 3 over records and stage-2 output. The official label needs official extraction for every
+    question. Any other extraction, or a missing one, is BLOCKED_NO_JUDGE with no numbers.
+
+    Limit: the scorer cannot verify that the extractor ran. It checks the model name and prompt hash the
+    caller declares, so OFFICIAL_SCORED_STAGE3_ONLY is only as strong as the caller's record of stage 2.
+    """
+    missing = [rec["question_id"] for rec in records if rec["question_id"] not in extracted]
+    if missing:
+        return _blocked("no stage-2 extraction for some questions", missing_question_ids=missing)
+    refused = [qid for qid in (r["question_id"] for r in records) if not is_official_extraction(extracted[qid])]
+    if refused:
+        return _blocked("extraction is not from the official extractor model and prompt hash",
+                        refused_question_ids=refused, official_extractor_model=OFFICIAL_EXTRACTOR_MODEL,
+                        official_prompt_sha256=EXTRACTION_PROMPT_SHA256)
     scored = []
     for rec in records:
         ext = extracted[rec["question_id"]]
@@ -285,12 +311,10 @@ def score_records(records: Sequence[dict], extracted: dict[str, ExtractedAnswer]
         item["score"] = eval_score(rec["answer"], ext.pred, rec["answer_format"])
         scored.append(item)
     out = breakdowns(scored)
-    models = sorted({e.extractor_model for e in extracted.values()})
-    hashes = sorted({e.extractor_prompt_sha256 for e in extracted.values()})
     out.update({
         "status": "OFFICIAL_SCORED_STAGE3_ONLY",
-        "extractor_models": models,
-        "extractor_prompt_sha256": hashes,
+        "extractor_models": sorted({e.extractor_model for e in extracted.values()}),
+        "extractor_prompt_sha256": sorted({e.extractor_prompt_sha256 for e in extracted.values()}),
         "upstream_commit": UPSTREAM_COMMIT,
     })
     return out

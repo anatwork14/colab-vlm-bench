@@ -78,3 +78,45 @@ def test_extracted_answers_must_record_extractor_and_prompt_hash():
         ms.ExtractedAnswer(question_id="q1", pred="10", extractor_model="", extractor_prompt_sha256="")
     ok = ms.ExtractedAnswer(question_id="q1", pred="10", extractor_model="gpt-4o", extractor_prompt_sha256="a" * 64)
     assert ok.pred == "10"
+
+
+# ITER2 N-3 (REVIEW_ITER2B §3): the official stage-3 label requires the official extraction.
+# A caller-supplied extraction with any model name and any hash must not be labelled official.
+
+RECORD = {"question_id": "q1", "answer": "10", "answer_format": "Int", "evidence_pages": "[3]",
+          "evidence_sources": "['Pure-text (Plain-text)']", "doc_type": "Research report / Introduction", }
+
+
+def test_official_extractor_model_is_the_upstream_default():
+    # upstream eval/extract_answer.py at d73f0dc: def extract_answer(..., model_name="gpt-4o")
+    assert ms.OFFICIAL_EXTRACTOR_MODEL == "gpt-4o"
+
+
+def test_the_auditor_reproducer_is_not_labelled_official():
+    out = ms.score_records([RECORD], {"q1": ms.ExtractedAnswer("q1", "10", "x", "0" * 64)})
+    assert out["status"] == "BLOCKED_NO_JUDGE"
+    assert out["official_acc"] is None and out["official_f1"] is None
+    assert "overall_acc" not in out
+
+
+def test_right_model_with_a_wrong_prompt_hash_is_not_official():
+    out = ms.score_records([RECORD], {"q1": ms.ExtractedAnswer("q1", "10", "gpt-4o", "0" * 64)})
+    assert out["status"] == "BLOCKED_NO_JUDGE"
+
+
+def test_right_prompt_hash_with_another_model_is_not_official():
+    out = ms.score_records([RECORD], {"q1": ms.ExtractedAnswer("q1", "10", "gpt-3.5", ms.EXTRACTION_PROMPT_SHA256)})
+    assert out["status"] == "BLOCKED_NO_JUDGE"
+
+
+def test_a_question_without_an_extraction_blocks_rather_than_raising_or_scoring():
+    out = ms.score_records([RECORD], {})
+    assert out["status"] == "BLOCKED_NO_JUDGE" and out["official_acc"] is None
+
+
+def test_the_official_extractor_and_prompt_produce_the_official_stage3_label():
+    ext = ms.ExtractedAnswer("q1", "10", ms.OFFICIAL_EXTRACTOR_MODEL, ms.EXTRACTION_PROMPT_SHA256)
+    out = ms.score_records([RECORD], {"q1": ext})
+    assert out["status"] == "OFFICIAL_SCORED_STAGE3_ONLY"
+    assert out["overall_acc"] == 1.0
+    assert out["extractor_prompt_sha256"] == [ms.EXTRACTION_PROMPT_SHA256]

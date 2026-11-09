@@ -279,7 +279,7 @@ def test_all_seven_arms_real_neural_forward_and_gates():
 
 
 def test_real_engine_pretrained_checkpoint_loading(tmp_path):
-    """Verify partial reference safetensors sets PARTIALLY_WEIGHTED_PYTORCH_REFERENCE and gates SEVEN_ARM_PRETRAINED_PASS."""
+    """Verify partial reference safetensors sets PARTIALLY_WEIGHTED_PYTORCH_REFERENCE and gates SEVEN_ARM_HOOK_COVERAGE_PASS."""
     from safetensors.torch import save_file
 
     small_cfg = Qwen35ModelConfig(
@@ -337,7 +337,7 @@ def test_real_engine_pretrained_checkpoint_loading(tmp_path):
     # previously read PASS here; they now report the partial-coverage status explicitly.
     assert res.gates["REAL_MODEL_FORWARD_PASS"] == "PARTIAL_COVERAGE_NOT_QUALIFIED"
     assert res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PARTIAL_COVERAGE_NOT_QUALIFIED"
-    assert res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "GATED_OFFICIAL_HF_HOOK_REQUIRED"
+    assert res.gates["SEVEN_ARM_HOOK_COVERAGE_PASS"] == "GATED_OFFICIAL_HF_HOOK_REQUIRED"
     assert res.telemetry["architectural_status"] == "PARTIALLY_WEIGHTED_PYTORCH_REFERENCE"
     assert res.telemetry["pretrained_weights"]["mapped_tensors_count"] == 13
     assert res.telemetry["pretrained_weights"]["unmapped_tensors_count"] == 1
@@ -375,7 +375,7 @@ def test_official_hf_hooking_coverage_and_logits_parity():
         image_present=True,
         question="Are there cats lying on the couch in the living room?",
     )
-    assert res.gates["SEVEN_ARM_PRETRAINED_PASS"] == "PASS"
+    assert res.gates["SEVEN_ARM_HOOK_COVERAGE_PASS"] == "PASS"
     assert res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] == "PASS"
     assert res.telemetry["architectural_status"] == "OFFICIAL_HF_PRETRAINED_HOOKED_MODEL"
     assert res.telemetry["visual_encoder_trace"]["invoked"] is True
@@ -689,7 +689,7 @@ def test_p7_r3_low_coverage_partial_checkpoint_never_passes_real_forward_gates(t
     res = engine.execute_request("p7_r3_low_cov", prompt_token_ids=[10, 11, 12], max_new_tokens=2)
     assert res.gates["REAL_MODEL_FORWARD_PASS"] != "PASS"
     assert res.gates["REAL_MULTIMODAL_INFERENCE_PASS"] != "PASS"
-    assert res.gates["SEVEN_ARM_PRETRAINED_PASS"] != "PASS"
+    assert res.gates["SEVEN_ARM_HOOK_COVERAGE_PASS"] != "PASS"
     assert res.gates["REAL_MODEL_FORWARD_PASS"] == "PARTIAL_COVERAGE_NOT_QUALIFIED"
     assert engine.pretrained_weight_summary["parameter_coverage_ratio"] < 0.15
     engine.close()
