@@ -898,8 +898,8 @@ def test_r4_forward_path_telemetry_names_the_path_that_ran(monkeypatch):
 
     real_loader = re_mod._load_official_hf_bundle
 
-    def degraded_loader(ckpt_path, device):
-        bundle = real_loader(ckpt_path, device=device)
+    def degraded_loader(ckpt_path, device, dtype_override=None):
+        bundle = real_loader(ckpt_path, device=device, dtype_override=dtype_override)
         degraded = dict(bundle)  # copy: do not mutate the cached bundle shared by other tests
         degraded["summary"] = {**bundle["summary"], "tensor_coverage_ratio": 0.5}
         return degraded

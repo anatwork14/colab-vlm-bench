@@ -60,7 +60,34 @@ from .adapters import HardwareGateError, check_vllm_hardware_compatibility
 
 
 _PRETRAINED_STATE_CACHE: dict[tuple[str, int, int, int, int], tuple[dict[str, torch.Tensor], dict[str, Any]]] = {}
-_OFFICIAL_HF_BUNDLE_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+_OFFICIAL_HF_BUNDLE_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
+_DTYPE_BY_OVERRIDE = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
+
+
+def select_official_dtype(
+    device: str,
+    cuda_available: bool,
+    capability_major: int | None,
+    override: str | None = None,
+) -> torch.dtype:
+    """dtype of the official hooked model. Default unchanged: bf16 on sm_80+ CUDA, fp32 otherwise.
+
+    An explicit override ("fp16", "bf16", "fp32") wins. fp16 is allowed only on CUDA, so a CPU
+    run cannot pick it up silently.
+    """
+    on_cuda = str(device).startswith("cuda") and cuda_available
+    if override is None:
+        return torch.bfloat16 if (on_cuda and capability_major is not None and capability_major >= 8) else torch.float32
+    if override not in _DTYPE_BY_OVERRIDE:
+        raise ValueError(f"unknown dtype override {override!r}; expected one of {sorted(_DTYPE_BY_OVERRIDE)}")
+    if override == "fp16" and not on_cuda:
+        raise ValueError("fp16 override requires a CUDA device")
+    return _DTYPE_BY_OVERRIDE[override]
+
+
+def official_cache_key(ckpt_path: Path, device: str, dtype: torch.dtype) -> tuple[str, str, str]:
+    """A bundle is reusable only for the same checkpoint, device and dtype."""
+    return (str(ckpt_path), str(device), str(dtype))
 _DEFAULT_FIXTURE_IMAGE = Path(__file__).resolve().parent.parent.parent.parent / "tests" / "fixtures" / "000000039769.png"
 
 
@@ -304,23 +331,18 @@ def _restore_dynamic_cache(cache: Any, snap: list[Any]) -> None:
             layer.is_recurrent_states_initialized = dict(s[5])
 
 
-def _load_official_hf_bundle(ckpt_path: Path, device: str) -> dict[str, Any]:
+def _load_official_hf_bundle(ckpt_path: Path, device: str, dtype_override: str | None = None) -> dict[str, Any]:
     """Load official Qwen3_5ForConditionalGeneration + 15-tensor Qwen35MTPModule + AutoProcessor."""
-    cache_key = (str(ckpt_path), str(device))
+    cuda_ok = str(device).startswith("cuda") and torch.cuda.is_available()
+    capability = torch.cuda.get_device_capability(0)[0] if cuda_ok else None
+    dtype = select_official_dtype(device, torch.cuda.is_available(), capability, dtype_override)
+    cache_key = official_cache_key(ckpt_path, device, dtype)
     if cache_key in _OFFICIAL_HF_BUNDLE_CACHE:
         return _OFFICIAL_HF_BUNDLE_CACHE[cache_key]
 
     from safetensors import safe_open
     from transformers import AutoProcessor
     from transformers.models.qwen3_5 import Qwen3_5ForConditionalGeneration
-
-    # Select hardware-native dtype: BF16 on sm_80+ (A100), FP32 on sm_61/CPU
-    use_bf16 = (
-        str(device).startswith("cuda")
-        and torch.cuda.is_available()
-        and torch.cuda.get_device_capability(0)[0] >= 8
-    )
-    dtype = torch.bfloat16 if use_bf16 else torch.float32
 
     shards = sorted(ckpt_path.glob("*.safetensors"))
     all_sf_keys: dict[str, int] = {}
@@ -598,6 +620,7 @@ class Qwen35NeuralModel(nn.Module):
         checkpoint_dir: str | Path,
         device: str = "cpu",
         prefer_official_hf: bool = True,
+        dtype_override: str | None = None,
     ) -> dict[str, Any]:
         """Attach official hooked Qwen3_5ForConditionalGeneration + Qwen35MTPModule (100% coverage)
         when a full HF checkpoint is present, or fallback to partial reference loading for synthetic tests.
@@ -612,7 +635,7 @@ class Qwen35NeuralModel(nn.Module):
 
         # 1. Full Official Hugging Face Qwen3.5 Checkpoint Hooking (P0-01: 473+15=488 tensors, 100% coverage)
         if prefer_official_hf and (ckpt_path / "config.json").is_file():
-            bundle = _load_official_hf_bundle(ckpt_path, device=device)
+            bundle = _load_official_hf_bundle(ckpt_path, device=device, dtype_override=dtype_override)
             self.hf_model = bundle["hf_model"]
             self.mtp_module = bundle["mtp_module"]
             self.processor = bundle["processor"]
@@ -1076,6 +1099,7 @@ class RealSevenArmEngine:
         tokenizer: Any | None = None,
         checkpoint_dir: str | Path | None = None,
         starlight_record_decisions: bool = False,
+        dtype_override: str | None = None,
     ):
         if method_arm not in self.SUPPORTED_ARMS:
             raise ValueError(f"Unknown method arm: {method_arm}")
@@ -1113,7 +1137,7 @@ class RealSevenArmEngine:
         model = Qwen35NeuralModel(self.config, allocate_scaffold=not is_full_hf_ckpt)
         if self.checkpoint_dir is not None:
             self.pretrained_weight_summary = model.load_pretrained_weights(
-                self.checkpoint_dir, device=self.device
+                self.checkpoint_dir, device=self.device, dtype_override=dtype_override
             )
             self.is_pretrained = True
             self.is_official_hf_hooked = model.is_official_hf_hooked
