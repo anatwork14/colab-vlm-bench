@@ -77,10 +77,15 @@ def compare_tokens(a: list[int], b: list[int]) -> dict[str, Any]:
 
 
 def compare_receipts(gpu: dict[str, Any], cpu: dict[str, Any]) -> dict[str, Any]:
-    """Token comparison between two COMPLETED runs at one git SHA. Refuses anything else."""
+    """Token comparison between two COMPLETED runs at one git SHA: the FIRST argument must be the CUDA
+    receipt and the SECOND the CPU fp32 reference (C-9). Refuses anything else, including two GPU receipts."""
     for name, receipt in (("gpu", gpu), ("cpu", cpu)):
         if receipt.get("status") != "RUN_COMPLETED":
             raise ValueError(f"{name} receipt is not RUN_COMPLETED: {receipt.get('status')!r}")
+    for name, receipt, device in (("gpu", gpu, "cuda"), ("cpu", cpu, "cpu")):
+        if receipt.get("device") != device or receipt.get("tag") != TAG[device]:
+            raise ValueError(f"{name} argument must be the {device} receipt "
+                             f"(got device={receipt.get('device')!r}, tag={receipt.get('tag')!r})")
     if gpu["git_sha"] != cpu["git_sha"]:
         raise ValueError("receipts come from different git SHAs")
     identical_all = True
