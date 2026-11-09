@@ -434,7 +434,8 @@ def evidence_validity(pool: Any, current_request_id: str, image_sha256: str | No
         return verdicts
     for item in pool.items():
         if not item.verified:
-            verdicts[item.evidence_id] = ("unverified", "verified_false")
+            # The flag is the caller's declaration; the controller does not verify content (C-3).
+            verdicts[item.evidence_id] = ("unverified", "caller_declared_verified_false")
         elif pool.request_id != current_request_id:
             verdicts[item.evidence_id] = ("expired", "pool_request_id_mismatch")
         elif image_sha256 is None:
@@ -444,6 +445,35 @@ def evidence_validity(pool: Any, current_request_id: str, image_sha256: str | No
         else:
             verdicts[item.evidence_id] = ("valid", "source_sha256_match")
     return verdicts
+
+
+# ITER3 R2 C-3: provenance labels. The `verified` flag is never checked by this controller, so it is always
+# reported as a caller declaration. `source_sha256` is labelled as checked only when it was compared with
+# the request's image bytes; text-only requests have nothing to compare against.
+VERIFIED_FLAG_LABEL = "CALLER_DECLARED_NOT_VERIFIED"
+SOURCE_UNCHECKED_LABEL = "CALLER_DECLARED_NOT_VERIFIED"
+SOURCE_CHECKED_MATCH_LABEL = "CHECKED_IMAGE_BYTES_MATCH"
+SOURCE_CHECKED_MISMATCH_LABEL = "CHECKED_IMAGE_BYTES_MISMATCH"
+
+
+def evidence_provenance(pool: Any, image_sha256: str | None) -> dict[str, dict[str, str]]:
+    """Per evidence id: the provenance label of its `verified` flag and of its `source_sha256`.
+
+    `verified_flag` is always CALLER_DECLARED_NOT_VERIFIED. `source_sha256` is CHECKED_IMAGE_BYTES_MATCH or
+    CHECKED_IMAGE_BYTES_MISMATCH only when an image hash exists to compare, else CALLER_DECLARED_NOT_VERIFIED.
+    """
+    out: dict[str, dict[str, str]] = {}
+    if pool is None:
+        return out
+    for item in pool.items():
+        if image_sha256 is None:
+            source = SOURCE_UNCHECKED_LABEL
+        elif item.source_sha256.lower() == image_sha256.lower():
+            source = SOURCE_CHECKED_MATCH_LABEL
+        else:
+            source = SOURCE_CHECKED_MISMATCH_LABEL
+        out[item.evidence_id] = {"verified_flag": VERIFIED_FLAG_LABEL, "source_sha256": source}
+    return out
 
 
 def grounding_protection_from_pool(

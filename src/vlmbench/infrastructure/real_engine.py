@@ -53,7 +53,7 @@ from .declarative_attention import DAConfig, DAFSM, DAMaskGenerator, DATag, DATa
 from .grounding_evidence import ECRDConfig, EvidencePool, EvidenceItem, ECRDLogitsProcessor
 from .starlight import (
     STATUS_INFEASIBLE, StarlightLayerPlan, combine_summaries, compact_orig_positions,
-    da_protection_from_spans, evidence_validity, grounding_protection_from_pool,
+    da_protection_from_spans, evidence_provenance, evidence_validity, grounding_protection_from_pool,
     plan_starlight_layer, summarize_plans,
 )
 from .adapters import HardwareGateError, check_vllm_hardware_compatibility
@@ -2374,6 +2374,7 @@ class RealSevenArmEngine:
         starlight_grounding: dict[int, tuple[str, ...]] = {}
         starlight_grounding_status = "NOT_STARTED" if "grounding" in starlight_enabled else "DISABLED_ABLATION"
         starlight_verdicts: dict[str, list[str]] = {}
+        starlight_provenance: dict[str, dict[str, str]] = {}
         starlight_summaries: list[dict[str, Any]] = []
         starlight_max_retained = 0
         starlight_text_fraction: float | None = None
@@ -2423,6 +2424,7 @@ class RealSevenArmEngine:
                         eid: [status, reason, EVIDENCE_REASON_CODES[status]] for eid, (status, reason) in
                         evidence_validity(evidence_pool, request_id, image_sha).items()
                     }
+                    starlight_provenance = evidence_provenance(evidence_pool, image_sha)
                     if self.tokenizer is None:
                         starlight_grounding_status = "UNAVAILABLE_NO_TOKENIZER"
                     elif image_present and image_sha is None:
@@ -2966,6 +2968,8 @@ class RealSevenArmEngine:
                 "grounding_declaration_missing": grounding_missing,
                 "arm_status": arm_status,
                 "grounding_evidence_verdicts": starlight_verdicts,
+                # ITER3 R2 C-3: `verified` is a caller declaration; source hash is checked only vs image bytes.
+                "grounding_evidence_provenance": starlight_provenance,
                 "grounding_protected_by_evidence": grounding_by_evidence,
                 "candidate_basis": (
                     "SHARED H2O keep set (mean of head-mean scores over all full-attention layers) over all "

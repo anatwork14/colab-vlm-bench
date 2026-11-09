@@ -89,7 +89,7 @@ and the text-side budget shrinks by the same amount.
 
 | Status | Reason | Protects |
 |---|---|---|
-| `unverified` | `verified_false` | no |
+| `unverified` | `caller_declared_verified_false` (caller flag; never checked by the controller) | no |
 | `expired` | `pool_request_id_mismatch` (pool built for another request) | no |
 | `stale` | `source_sha256_mismatch` (image hash differs from the declared source) | no |
 | `valid` | `source_sha256_match` | yes |
