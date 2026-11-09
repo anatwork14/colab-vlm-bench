@@ -159,11 +159,24 @@ def _install_seven_arm_attention_hooks(hf_model: Any, hook_ctx: _HookStepContext
 
                 kv_bytes_before = (key_states.nelement() + value_states.nelement()) * key_states.element_size()
                 physical_bytes_freed = 0
+                pre_compaction_len = key_states.shape[2]
+                mask_len_received = None if attention_mask is None else int(attention_mask.shape[-1])
+
+                # Attention mask invariant: HF builds the decode mask from the PRE-compaction
+                # cache, so its width must equal the pre-compaction KV length exactly.
+                if attention_mask is not None and mask_len_received != pre_compaction_len:
+                    raise ValueError(
+                        f"Layer {l_idx}: attention mask width {mask_len_received} does not match "
+                        f"KV length {pre_compaction_len}; refusing a silent slice"
+                    )
 
                 # 1. H2O Physical KV Eviction & Tensor Compaction on official DynamicLayer cache
                 h2o_plans = getattr(hook_ctx, "h2o_eviction_plans", None)
                 h2o_retained = h2o_plans.get(l_idx) if h2o_plans else None
                 if h2o_retained is not None and len(h2o_retained) < key_states.shape[2]:
+                    if attention_mask is not None:
+                        # Select mask columns by the SAME retained positions as the KV cache.
+                        attention_mask = torch.index_select(attention_mask, dim=-1, index=h2o_retained)
                     key_states = torch.index_select(key_states, dim=2, index=h2o_retained).contiguous()
                     value_states = torch.index_select(value_states, dim=2, index=h2o_retained).contiguous()
                     if past_key_values is not None and l_idx < len(past_key_values.layers):
@@ -180,7 +193,12 @@ def _install_seven_arm_attention_hooks(hf_model: Any, hook_ctx: _HookStepContext
 
                 attn_logits = torch.matmul(query_states, key_rep.transpose(2, 3)) * mod.scaling
                 if attention_mask is not None:
-                    attn_logits = attn_logits + attention_mask[..., :k_len]
+                    if attention_mask.shape[-1] != k_len:
+                        raise ValueError(
+                            f"Layer {l_idx}: aligned attention mask width {attention_mask.shape[-1]} "
+                            f"!= KV length {k_len}"
+                        )
+                    attn_logits = attn_logits + attention_mask
 
                 # 2. Declarative Attention (DA) Logit Masking (preserves 100% of KV residency)
                 da_masks = getattr(hook_ctx, "da_masks", None)
@@ -202,6 +220,8 @@ def _install_seven_arm_attention_hooks(hf_model: Any, hook_ctx: _HookStepContext
                 if hasattr(hook_ctx, "layer_telemetries"):
                     hook_ctx.layer_telemetries[l_idx] = {
                         "kv_seq_len": k_len,
+                        "attention_mask_len": None if attention_mask is None else int(attention_mask.shape[-1]),
+                        "attention_mask_len_received": mask_len_received,
                         "kv_bytes_allocated": (key_states.nelement() + value_states.nelement()) * key_states.element_size(),
                         "physical_bytes_freed": physical_bytes_freed,
                     }
