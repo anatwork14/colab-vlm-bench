@@ -1009,6 +1009,14 @@ class RealSevenArmEngine:
             self.h2o_trackers[request_id] = tracker
         return self.h2o_trackers[request_id]
 
+    ECRD_ALPHA_RULE = "3.5 if official_hf_hooked and image_present else 20.0"
+
+    def _ecrd_alpha(self, image_present: bool) -> float:
+        """Condition-dependent ECRD boost. UNCALIBRATED: the two values differ by condition, so
+        ECRD results from official+image runs and from other runs are NOT directly comparable.
+        Do not retune against benchmark answers; disclosed in telemetry as the confounder."""
+        return 3.5 if (self.is_official_hf_hooked and image_present) else 20.0
+
     def _get_or_create_ecrd_processor(
         self,
         request_id: str,
@@ -1042,7 +1050,7 @@ class RealSevenArmEngine:
 
         tok = self.tokenizer if self.tokenizer is not None else _LocalTokenizer()
         p = pool or EvidencePool(request_id)
-        alpha = 3.5 if (self.is_official_hf_hooked and image_present) else 20.0
+        alpha = self._ecrd_alpha(image_present)
         proc = ECRDLogitsProcessor(
             evidence_pool=p,
             tokenizer=tok,
@@ -1529,6 +1537,17 @@ class RealSevenArmEngine:
                     "speculative_speedup_claimed": False,
                 },
                 "visual_encoder_trace": vis_trace,
+                "ecrd_reweight": (
+                    {
+                        "reweight_alpha": self._ecrd_alpha(image_present),
+                        "alpha_rule": self.ECRD_ALPHA_RULE,
+                        "calibrated": False,
+                        "cross_condition_comparable": False,
+                        "unsupported_penalty_applied": False,
+                        "unsupported_penalty_note": "ECRDConfig.unsupported_penalty is inert in this processor",
+                    }
+                    if "ecrd" in self.method_arm else None
+                ),
                 "da_cost_accounting": {
                     "attention_mask_restriction_ratio": round(final_da_restriction_ratio, 4),
                     "decode_last_query_allowed_key_ratio": round(1.0 - final_da_restriction_ratio, 4),
