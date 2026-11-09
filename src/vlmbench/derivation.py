@@ -51,7 +51,7 @@ def generate_candidates(native_path: Path, output: Path, dataset: str,
             parts.extend(selected_images)
             parts.append(question_part)
             result.append({
-                "id": str(row["id"]) + "__t" + str(target),
+                "id": f"{row['id']}__text{target}",
                 "dataset": dataset, "track": "derived_serving",
                 "derived_from": str(row["id"]),
                 "messages": [{"role": "user", "content": parts}],
