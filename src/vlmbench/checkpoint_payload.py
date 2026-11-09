@@ -78,7 +78,8 @@ def audit_safetensors_payload(
                 if dtype not in _DTYPE_BYTES or _DTYPE_BYTES[dtype] is None:
                     raise ValueError(f"Unsupported packed/unknown dtype {dtype!r} in {key}")
                 dims = info.get_shape()
-                if not dims or any(not isinstance(d, int) or d <= 0 for d in dims):
+                # Scalar tensors have shape [] and contain exactly 1 element.
+                if any(not isinstance(d, int) or d <= 0 for d in dims):
                     raise ValueError(f"Invalid tensor shape {dims} in {key}")
                 n = math.prod(dims)
                 nbytes = n * _DTYPE_BYTES[dtype]
@@ -109,7 +110,9 @@ def audit_safetensors_payload(
         "shards": shard_info,
         "source_revision_verified": False,
         "source_revision_note": "Index and local header checks alone do not prove HF revision/weights provenance.",
-        "full_file_integrity_verified": bool(hash_shards),
+        "full_file_integrity_verified": False,
+        "shard_sha256_computed": bool(hash_shards),
+        "integrity_note": "Computed hashes are observations until compared against a trusted pinned publisher manifest.",
     }
 
 

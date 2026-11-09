@@ -65,4 +65,18 @@ def test_index_shard_key_mismatch_is_rejected(tmp_path):
 def test_optional_full_shard_hash(tmp_path):
     report = audit_safetensors_payload(fixture_ckpt(tmp_path), hash_shards=True)
     assert len(report["shards"]["model.safetensors"]["sha256"]) == 64
-    assert report["full_file_integrity_verified"] is True
+    assert report["shard_sha256_computed"] is True
+    assert report["full_file_integrity_verified"] is False
+
+
+def test_scalar_tensor_shape_is_valid(tmp_path):
+    save_file({"scalar": torch.tensor(7.0, dtype=torch.float32)},
+              tmp_path / "model.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {"total_size": 4},
+        "weight_map": {"scalar": "model.safetensors"},
+    }))
+    report = audit_safetensors_payload(tmp_path)
+    require_exact_payload_match(report)
+    assert report["total_tensor_elements"] == 1
+    assert report["sum_tensor_dtype_times_shape_bytes"] == 4
