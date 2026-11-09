@@ -47,9 +47,10 @@ def test_h2o_score_accumulation_and_budget():
 
     retained, metrics = tracker.compute_eviction_plan(0, current_length=seq_len)
     assert len(retained) == seq_len
-    # 50% budget of 10 tokens = 5 retained tokens
-    assert metrics["retained_tokens"] == 5
-    assert metrics["evicted_tokens"] == 5
+    # R4-1: 2 sinks are protected and outside the budget. Unprotected = 8, budget = int(8 * 0.5) = 4.
+    # Retained = 2 + 4 = 6 (was 5 when the sinks sat inside the budget).
+    assert metrics["retained_tokens"] == 6
+    assert metrics["evicted_tokens"] == 4
     # First 2 system tokens permanently protected
     assert retained[0] and retained[1]
     # Recent tokens retained
@@ -419,7 +420,7 @@ def test_seven_arm_engine_all_arms_suite():
         if "h2o" in arm:
             assert "final_h2o" in res.verification_trace
             assert res.verification_trace["final_h2o"]["retained_tokens"] > 0
-            assert "logical_selection_fraction" in res.verification_trace["final_h2o"]
+            assert "per_step_evicted_slot_rate" in res.verification_trace["final_h2o"]
         if "da" in arm:
             assert "final_da_read_ratio" in res.verification_trace
         if "ecrd" in arm:
@@ -446,10 +447,11 @@ def test_h2o_visual_protection_not_miscounted_as_heavy_hitters():
     kept, metrics = tracker.compute_eviction_plan(0, current_length=20)
     assert np.all(kept[5:10]), "Protected visual evidence must stay resident"
     assert kept[0] and kept[1], "Sink tokens must stay resident"
-    assert metrics["heavy_hitters"] == 0, (
-        "Protected visual tokens cannot be counted as score-selected heavy hitters"
-    )
+    # R4-1: heavy hitters are now real score-selected UNPROTECTED tokens. Protected visual tokens
+    # must never be counted among them. Budget 4 minus recent 1 leaves 3 heavy hitters.
+    assert metrics["heavy_hitters"] == metrics["budget"] - metrics["recent_tokens"] == 3
     assert metrics["retained_tokens"] > metrics["heavy_hitters"]
+    assert int(kept.sum()) == metrics["protected_tokens"] + metrics["budget"]
     unprotected_retained = metrics["retained_tokens"] - metrics["protected_tokens"]
     assert unprotected_retained <= metrics["budget"], "budget caps unprotected retained tokens"
 
@@ -465,10 +467,13 @@ def test_h2o_heavy_hitters_report_only_actual_score_selected_candidates():
         0, np.arange(10, dtype=np.float32)[None, None, :]
     )
     kept, metrics = tracker.compute_eviction_plan(0, current_length=10)
-    # 5 total capacity: 2 sink + 1 recent + 2 score-selected heavy hitters.
-    assert metrics["retained_tokens"] == 5
-    assert metrics["heavy_hitters"] == 2
-    assert int(kept.sum()) == 5
+    # R4-1: 2 sinks outside the budget. Unprotected = 8, budget 4 = 1 recent + 3 score-selected.
+    # Highest scores among candidates 2..8 are 8, 7, 6; recent window is position 9.
+    assert metrics["retained_tokens"] == 6
+    assert metrics["heavy_hitters"] == 3
+    assert int(kept.sum()) == 6
+    assert kept[0] and kept[1] and kept[6] and kept[7] and kept[8] and kept[9]
+    assert not kept[2:6].any()
 
 
 # --- P7 engine regression tests (2026-11-09 audit, base cfccc4b) ---

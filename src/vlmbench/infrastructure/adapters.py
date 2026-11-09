@@ -376,8 +376,7 @@ class SevenArmEngine:
                 )
                 step_trace["h2o_retained_tokens"] = eviction_metrics["retained_tokens"]
                 step_trace["h2o_evicted_tokens"] = eviction_metrics["evicted_tokens"]
-                step_trace["h2o_retained_ratio"] = 1.0 - eviction_metrics["logical_selection_fraction"]
-                step_trace["h2o_logical_selection_fraction"] = eviction_metrics["logical_selection_fraction"]
+                step_trace["h2o_per_step_evicted_slot_rate"] = eviction_metrics["per_step_evicted_slot_rate"]
                 step_trace["h2o_kv_bytes"] = "NOT_MEASURED_LOGICAL_MASK_ONLY"
 
             # --- MTP Speculative Verification Simulation ---

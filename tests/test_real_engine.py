@@ -596,8 +596,13 @@ def test_p7_h2o_decode_mask_aligned_with_compacted_kv_official():
         return out
 
     engine.model.forward = _spy
-    res = engine.execute_request("p7_h2o_mask_align", max_new_tokens=5, image_present=True)
-    assert res.telemetry["h2o_logical_selection_accounting"]["evicted_token_slots"] > 0, (
+    # R4-1: protected image tokens sit outside the budget, so a short question would never
+    # compact (about 3 text tokens < budget 32). A long question makes unprotected text exceed
+    # the budget so compaction actually happens.
+    long_question = " ".join(["Describe every object in the living room, its colour and position."] * 12)
+    res = engine.execute_request("p7_h2o_mask_align", max_new_tokens=5, image_present=True,
+                                 question=long_question)
+    assert res.telemetry["h2o_logical_selection_accounting"]["cumulative_evicted_slots"] > 0, (
         "compaction must actually occur for this check to be meaningful")
     decode_steps = captured[1:]
     assert decode_steps

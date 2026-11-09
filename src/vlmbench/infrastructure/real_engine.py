@@ -935,7 +935,7 @@ class RealExecutionResult:
     tpot_ms: float
     physical_kv_bytes_allocated: int
     physical_kv_bytes_freed: int
-    logical_selection_fraction: float
+    per_step_evicted_slot_rate: float | None  # H2O: last decode step only; None if no H2O step ran
     attention_read_restriction_ratio: float
     grounded_citations: list[dict[str, Any]]
     mtp_acceptance_rate: float | None  # None = not verified (serving arm); see _speculative_mtp_greedy_k1
@@ -1415,9 +1415,11 @@ class RealSevenArmEngine:
 
         total_physical_freed = 0
         final_allocated_bytes = 0
-        final_logical_fraction = 0.0
-        h2o_last_step_evicted_slots = 0
-        h2o_last_step_total_slots = 0
+        # H2O telemetry: None until a measurement exists (never a literal zero).
+        h2o_per_step_rate: float | None = None
+        h2o_cumulative_evicted_slots = 0
+        h2o_slots_at_prefill: int | None = None
+        h2o_last_step_retained_slots: int | None = None
         final_da_restriction_ratio = 0.0
         final_da_causal_area_ratio = 0.0
         mtp_proposed_total = 0
@@ -1458,6 +1460,7 @@ class RealSevenArmEngine:
         if tracker is not None:
             for l_idx in self.config.full_attention_layers:
                 tracker.initialize_budget(l_idx, len(full_prompt))
+            h2o_slots_at_prefill = len(self.config.full_attention_layers) * len(full_prompt)
 
         # Feed prefill attention scores into H2O tracker
         if tracker is not None:
@@ -1518,8 +1521,9 @@ class RealSevenArmEngine:
             # 2. H2O physical eviction plans for full-attention layers coordinated with physical KV length
             h2o_eviction_plans: dict[int, torch.Tensor] = {}
             if tracker is not None:
-                h2o_last_step_evicted_slots = 0
-                h2o_last_step_total_slots = 0
+                step_evicted = 0
+                step_total = 0
+                step_retained = 0
                 for l_idx in self.config.full_attention_layers:
                     if self.is_official_hf_hooked and past_kv is not None:
                         k_phys_len = past_kv.layers[l_idx].keys.shape[2] + 1
@@ -1530,14 +1534,14 @@ class RealSevenArmEngine:
                     retained, metrics = tracker.compute_eviction_plan(l_idx, current_length=k_phys_len)
                     retained_indices = torch.where(torch.from_numpy(retained))[0].to(self.device)
                     h2o_eviction_plans[l_idx] = retained_indices
-                    h2o_last_step_evicted_slots += metrics["evicted_tokens"]
-                    h2o_last_step_total_slots += metrics["total_tokens"]
-                # Report the full-attention-layer token-slot fraction, NOT the
-                # last layer's ratio (layers may have different compacted lengths).
-                final_logical_fraction = (
-                    h2o_last_step_evicted_slots / h2o_last_step_total_slots
-                    if h2o_last_step_total_slots else 0.0
-                )
+                    step_evicted += metrics["evicted_tokens"]
+                    step_total += metrics["total_tokens"]
+                    step_retained += metrics["retained_tokens"]
+                # Per-step rate over full-attention layers (last step only), plus cumulative
+                # evicted slots over all steps. Layers may have different compacted lengths.
+                h2o_cumulative_evicted_slots += step_evicted
+                h2o_last_step_retained_slots = step_retained
+                h2o_per_step_rate = step_evicted / step_total if step_total else 0.0
 
             # Compute 3D RoPE position_ids for decode step when using official HF model
             step_pos_ids: torch.Tensor | None = None
@@ -1630,6 +1634,11 @@ class RealSevenArmEngine:
             )
 
         # Decode semantic text when official tokenizer is attached
+        h2o_final_retained_fraction = (
+            h2o_last_step_retained_slots / h2o_slots_at_prefill
+            if h2o_last_step_retained_slots is not None and h2o_slots_at_prefill
+            else None
+        )
         decoded_str = ""
         if self.tokenizer is not None and hasattr(self.tokenizer, "decode"):
             try:
@@ -1651,7 +1660,7 @@ class RealSevenArmEngine:
             tpot_ms=tpot_ms,
             physical_kv_bytes_allocated=final_allocated_bytes,
             physical_kv_bytes_freed=total_physical_freed,
-            logical_selection_fraction=final_logical_fraction,
+            per_step_evicted_slot_rate=h2o_per_step_rate,
             attention_read_restriction_ratio=final_da_restriction_ratio,
             attention_mask_restriction_ratio=final_da_restriction_ratio,
             grounded_citations=citations,
@@ -1679,10 +1688,12 @@ class RealSevenArmEngine:
                     "warning": "Each decode step's index_select size delta is added. The total is NOT a peak or allocated/reserved VRAM delta, and may count repeated reductions.",
                 },
                 "h2o_logical_selection_accounting": {
-                    "classification": "LAST_STEP_FULL_ATTENTION_LAYER_SLOT_WEIGHTED",
-                    "evicted_token_slots": h2o_last_step_evicted_slots,
-                    "total_token_slots": h2o_last_step_total_slots,
-                    "logical_selection_fraction": final_logical_fraction,
+                    "budget_basis": "unprotected_prefill_tokens_fixed_per_layer",
+                    "protected_outside_budget": True,
+                    "per_step_evicted_slot_rate": h2o_per_step_rate,  # last decode step only
+                    "cumulative_evicted_slots": h2o_cumulative_evicted_slots,  # all decode steps, full-attention layers
+                    "cumulative_total_slots_at_prefill": h2o_slots_at_prefill,  # full-attention layers x prompt length
+                    "final_retained_fraction": h2o_final_retained_fraction,  # retained after last step / prefill slots
                     "physical_vram_saving_claimed": False,
                     "protected_vision_tokens_in_prompt": int(
                         sum(1 for t in full_prompt if t in (
@@ -1691,15 +1702,13 @@ class RealSevenArmEngine:
                             self.config.vision_end_token_id,
                         ))
                     ),
-                    # Budget includes protected tokens (documented protocol). With a protected
-                    # vision block the budget is dominated by protected positions, so KV savings
-                    # are ~0 and these h2o arms are NOT multimodal KV-compression evidence.
+                    # R4-1: protected tokens sit OUTSIDE the budget. The budget caps text tokens only.
                     "multimodal_kv_compression_evidence": False if (
                         any(t == self.config.image_token_id for t in full_prompt)
                     ) else "NOT_APPLICABLE_NO_VISION_TOKENS",
                     "limitation": (
-                        "Protected vision block (sinks + visual tokens) counts inside the fixed budget; "
-                        "KV retention savings on VLM prompts are ~0 (see evicted_token_slots/total_token_slots). "
+                        "Protected sinks and visual tokens are never evicted and sit outside the fixed budget; "
+                        "the budget caps text tokens only. No physical VRAM saving was measured. "
                         "h2o_* arms are not evidence of multimodal KV compression."
                     ),
                     "unprotected_original_h2o_variant": "NOT_IMPLEMENTED_OWNER_DECISION",
@@ -1742,8 +1751,10 @@ class RealSevenArmEngine:
                     ),
                     "original_paper_protocol_qualified": False,
                     "physical_kv_bytes_freed": 0 if "da" in self.method_arm else total_physical_freed,
-                    "kv_residency_preserved_ratio": 1.0 if "da" in self.method_arm else round(1.0 - final_logical_fraction, 4),
-                    "kv_residency_preserved_pct": 100.0 if "da" in self.method_arm else round((1.0 - final_logical_fraction) * 100.0, 2),
+                    "kv_residency_preserved_ratio": 1.0 if "da" in self.method_arm else (
+                        round(h2o_final_retained_fraction, 4) if h2o_final_retained_fraction is not None else None),
+                    "kv_residency_preserved_pct": 100.0 if "da" in self.method_arm else (
+                        round(h2o_final_retained_fraction * 100.0, 2) if h2o_final_retained_fraction is not None else None),
                     "physical_kv_read_saving_claimed": False,
                     "hbm_traffic_reduction_claimed": False,
                     "accounting_note": (
