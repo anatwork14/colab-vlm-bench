@@ -216,3 +216,15 @@ def test_protected_keyword_is_evicted_without_protection_and_kept_with_it_on_the
         assert not protected_evicted, f"protected original positions were evicted under speculation: {protected_evicted}"
     finally:
         e.close()
+
+
+# --- light: comparison_validity must not call a run full-cache when something was evicted (addendum review) -------
+
+@pytest.mark.parametrize("fixed_budget_run", [True, False])
+def test_comparison_validity_never_calls_an_evicting_run_full_cache(fixed_budget_run):
+    # protection above the budget with evictions: the FULL_CACHE label is for evicted_total == 0 only.
+    from vlmbench.infrastructure.starlight import comparison_validity
+    verdict = comparison_validity(starlight_active=True, evicted_total=5, protected_at_prefill=200,
+                                  budget_total=192, fixed_budget_run=fixed_budget_run)
+    assert verdict["status"] != "STARLIGHT_FULL_CACHE_INFEASIBLE_NOT_COMPARABLE", verdict
+    assert verdict["comparable_to_matched_budget"] is fixed_budget_run

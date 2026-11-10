@@ -163,3 +163,56 @@ Severity: HIGH blocks a claim; MEDIUM is a validity gap in a claim or test; LOW 
 - My mutation driver's summary filter matched a traceback context line containing " failed", which briefly misreported `EN_spec_planner_grounding_dropped` as failing on its baseline. A manual run showed the real failure: `protected_evicted == {12}`. The kill is real; the reported line was not the failing assertion.
 - Two defects in my own new test file (missing import; a pool bound to the wrong request id) were fixed before the commit. The fixture error had been reported as an xfail at setup, which a strict xfail would hide; after the import fix, each xfail fails on its own assertion.
 - Scratch artefacts are outside the repo: `i3c_b/`, `i3c_m/`, `i3c_base/`, and `probe_*.py` under the session scratchpad.
+
+## Addendum: repairs (wF:p9 final inspection of p7's repairs)
+
+- **Reviewed SHA:** `1144291` (branch `i3d/p9`, integrated head incl. p7's repairs). Diff reviewed: `git diff adcf942..1144291 -- src scripts tests docs`.
+- **Scope:** only the materially changed code since `adcf942`: F-1 labelling (`comparison_validity`), F-6, F-7, F-8, F-9, F-10, F-11. No source edits by this reviewer.
+- **Tests added by this addendum:** one light test, `test_comparison_validity_never_calls_an_evicting_run_full_cache` (2 parametrised cases), in `tests/test_r4b_review_wF_p9.py`. It closes a surviving mutant (see N-0 below).
+- **Strict xfails:** the F-7 and F-8 xfails were removed by p7 once the defects were fixed. The test bodies are unchanged (checked against my commit `951fffd`). This is a promotion, not a weakening. The F-1 strict xfail (`test_starlight_s1_on_an_image_prompt_evicts_when_the_budget_is_feasible`) is still present and still fails at HEAD.
+
+### Repair verdicts
+
+| Item | p7 claim | Verdict | Evidence |
+|---|---|---|---|
+| F-1 labelling | Image full-cache runs labelled `STARLIGHT_FULL_CACHE_INFEASIBLE_NOT_COMPARABLE`; DA scope unchanged | **Closed as labelling** (scope still open, owner decision) | Heavy `test_f1_full_cache...` passes; baseline shows the label. Mutant `CV_never_set_on_starlight` killed; `PAP_da_spans_dropped` killed. Light parametrised cases pass. |
+| comparison_validity: no-eviction rule | Label only when `evicted_total == 0` and protection ≥ budget | **Correct** on every case tested | Mutant `CV_no_eviction_condition` survived the original light tests (no case had eviction with protection ≥ budget). Added test kills it. Mutant `CV_ge_to_gt` killed by the boundary case (protection == budget is labelled). |
+| F-6 visual | Independent check from the planner's returned slot map; eviction precondition | **Works as described, with a stated limit** (N-4) | Combined mutant (planner drops visual protection + telemetry = protected count): killed, telemetry 80 vs independent 64 on layer 7. Pure telemetry +1 lie: killed (81 vs 80). Inflated telemetry whose value equals the true retention survives, correctly (not a false claim). |
+| F-6 speculative | Independent check from the policy `next_orig`; eviction precondition | **Works as described** | Combined mutant (planner ignores grounding + telemetry = protected count): killed, telemetry 1 vs independent 0 on layer 23. |
+| F-7 sub-tolerance | `_cell_interval` snaps within EPS, keeps raw interval when the snap collapses | **Closed** | Live test passes. Mutants killed: `F7_old_formula` (old formula) and `F7_no_collapse_guard` (always snap). Proof of `r0 ≤ r1`: for a positive-width box, `ceil(s1) − 1 ≥ floor(s0)`. |
+| F-8 ablation | `_mtp_text_speculation_route` requires `_speculation_enabled` | **Closed** | Live test passes. Mutant `F8_ablation_ignored` killed (`speculation_executed` True with the flag off). |
+| F-9 partial cells | `cells = {full, partial}` in visual items | **Closed** | Light test passes (9 full, 7 partial on the 256-px geometry). Mutant `F9_partial_zeroed` killed. |
+| F-10 route label | Serving mtp text path carries `speculative_route` | **Closed** | Heavy test passes. Mutant `F10_label_removed` killed. |
+| F-11 labels | Control arm `NOT_APPLICABLE_CONTROL_ARM_*`; ablation `DISABLED_BY_ABLATION`; `DISABLED_ABLATION` removed | **Closed** | Light tests pass. Mutant `F11_control_as_ablation` killed. `DISABLED_ABLATION` no longer appears in `src`, `tests` or `scripts`. |
+
+### New findings (this addendum)
+
+- **N-0 MEDIUM, closed by test:** `comparison_validity` had no case with evictions and protection ≥ budget, so a mutant that labels such a run FULL_CACHE survived. Added test; killed.
+- **N-1 MEDIUM, open: the label does not reach any arm record.** `comparison_validity` is written to `result.telemetry` only. `scripts/run_progressive_qualification.py` copies `kv_memory_accounting` into each arm record (`:340`, `:480`) and not `comparison_validity`. No script in `scripts/` reads the label, and `bench.py` does not serialise engine telemetry. The record keeps `kv_memory_accounting.fixed_budget_status`, which is `NOT_A_SUCCESSFUL_FIXED_BUDGET_RUN` on the fixture image, so a reader can see the run was not a successful fixed-budget run, but not the "full cache, not comparable" reason. The oracle doc (`STARLIGHT_INVARIANTS_ORACLE.md` §5, rule 3) requires an infeasible arm to be reported as "not comparable", with the count. That rule is not met on the reporting path. Recommended: copy `comparison_validity` into `arm_info` and into the qualification record, and have the arm report read it.
+- **N-2 LOW, open: the speculative text routes carry no `comparison_validity`.** The key is absent, not `NOT_APPLICABLE`, so a reader cannot tell "not computed" from "not applicable". I did not observe a full-cache speculative run. Probe: `starlight_s1_mtp` text, 60 tokens, two keywords at the per-keyword cap (24 positions protected), budget 30: retained 27–30 per step over 42 samples, no step over budget, eviction happening. Full cache on this route would need protection above the budget. The keyword union cap is 0.5 × prompt length, which equals the budget at ratio 0.5, so the keyword channel alone cannot produce it. Severity therefore LOW until a full-cache speculative run is demonstrated.
+- **N-3 LOW, docs, open:** `STARLIGHT_STAGE1_DESIGN.md` §4.2 still says `h2o_shared_base` is "Comparable with … `starlight_s1`" with no F-1 qualification. On image prompts this is false for `starlight_s1` (see the control probe below). The §4.1 F-1 paragraph and §19 are correctly qualified.
+- **N-4 INFO, test design:** the F-6 checks fail when the reported count disagrees with the planner's slot map. They do not fail on an inflated value that happens to equal the true count (`F6_visual_inflated` and `F6_spec_telemetry_inflated` survived with the planner intact; the true retention is full in those runs). That is correct behaviour. The limit is that both sides come from the planner's own `next_orig` bookkeeping, so a bug in original-position tracking would appear in both and would not be caught.
+- **N-5 INFO, wording:** §4.1 says that whenever the visual token count "reaches" the budget every step is INFEASIBLE. The condition in the code is protection > budget (`starlight.py:218`). With protection == budget, a step can still evict. The label itself is correct because it requires `evicted_total == 0`.
+- **N-6 INFO, control arm on images:** the control probe on the same fixture image: `h2o_shared_base` evicts 792 entries with the budget met (`FIXED_BUDGET_MET`). So on image prompts `starlight_s1 − h2o_shared_base` measures eviction against no eviction, not protection. This is the F-1 consequence that N-3 should state.
+
+### Commands (addendum)
+
+| Command | Result |
+|---|---|
+| Light set: `test_i3c_p7_repair.py`, `test_i3b_s2_visual_mapping.py`, `test_i3b_s2_visual_protection.py`, `test_i3b_s2_speculative_route.py`, `test_r2_c5_visual_evidence.py`, `test_i3a_s1_evidence_dimensions.py`, `test_r4b_review_wF_p9.py` (heavy-marked excluded by `-k`) | **113 passed** (5 s) |
+| Heavy baseline under `flock heavy.lock timeout 520`: `test_r4b_review_wF_p9.py`, `test_i3c_p7_repair_heavy.py`, `test_i3b_s2_visual_engine.py` | **19 passed, 1 xfailed** (80 s). The xfail is the F-1 strict test. Waited about 20 min for the lead's suite to release the lock. |
+| Heavy mutants (same node set): `F8_ablation_ignored`, `F10_label_removed`, `F6_visual_inflated`, `F6_spec_telemetry_inflated`, `CV_never_set_on_starlight`, `PAP_da_spans_dropped` | killed: F8 (1 failed), F10 (1 failed), CV_never_set (1 failed), PAP (1 failed). Survived: F6_visual_inflated, F6_spec_telemetry_inflated (see N-4). |
+| Combined F-6 mutants (`mutD`): `F6_combined_visual`, `F6_combined_spec`, `F6_pure_telemetry_plus_one` | killed all three: 80 vs 64; 1 vs 0; 81 vs 80. |
+| Light mutants (`mutC`): `F7_old_formula`, `F7_no_collapse_guard`, `F9_partial_zeroed`, `F11_control_as_ablation`, `CV_no_eviction_condition` (before and after the added test), `CV_ge_to_gt` | killed (after the anchor fix; CV_no_eviction_condition survived before the added test and is killed after it). |
+| Speculative text probes (direct, `_speculative_policy_mtp_greedy`) | retained 27–30 against budget 30 over 42 samples; no full-cache run observed |
+
+Mutants were applied to `git archive 1144291` copies in scratch only. Afterwards the mutated sources were verified byte-identical to a fresh archive (`cmp`).
+
+### Closed and open after this addendum
+
+- **Closed:** F-6 (with the stated limit N-4), F-7, F-8, F-9, F-10, F-11, F-1 as labelling, N-0.
+- **Open:** F-1 owner decision on the FOCUS scope (still the blocker for any image STARLIGHT claim). N-1 (label not in arm records) MEDIUM. N-2 LOW. N-3 LOW (doc wording). N-4 to N-6 INFO. F-12 INFO (equivalent location gate, unchanged).
+
+### Verdict on the repairs
+
+The repairs do what they say, and the comparability label is correct on every case I could construct. The F-1 blocker is unchanged: image STARLIGHT is labelled, not fixed. The label is not carried into arm records, so the arm reports cannot yet apply it. Image `starlight_s1` results remain **BLOCKED** from any sparsity comparison, and `h2o_shared_base` comparisons on image prompts are confounded.
