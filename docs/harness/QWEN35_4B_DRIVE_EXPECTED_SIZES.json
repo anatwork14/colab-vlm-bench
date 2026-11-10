@@ -1,0 +1,21 @@
+{
+  "_source": "Drive metadata listing of drive: (rclone lsjson --fast-list --hash, 2026-11-10); sizes only; .cache excluded; NOT a pin, NOT SHA-256",
+  "_folder": "weights_system_one/public/qwen3.5-4b",
+  "sizes": {
+    ".gitattributes": 1570,
+    ".workspace-revision": 41,
+    "LICENSE": 11544,
+    "README.md": 77661,
+    "chat_template.jinja": 7756,
+    "config.json": 3161,
+    "merges.txt": 3353259,
+    "model.safetensors-00001-of-00002.safetensors": 5329398688,
+    "model.safetensors-00002-of-00002.safetensors": 3990429408,
+    "model.safetensors.index.json": 76196,
+    "preprocessor_config.json": 390,
+    "tokenizer.json": 12807982,
+    "tokenizer_config.json": 16710,
+    "video_preprocessor_config.json": 385,
+    "vocab.json": 6722759
+  }
+}
