@@ -528,6 +528,10 @@ KEYWORD_STOPWORDS = frozenset({
     "or", "that", "the", "this", "to", "was", "were", "with",
 })
 MAX_KEYWORD_PROMPT_FRACTION = 0.2
+# ITER3 R3 (N-R2-2, lead ruling): cap on the protected UNION of accepted keywords, as a fraction of prompt
+# positions. Owner-ratifiable named constant. Keywords are processed in DECLARED order; a keyword whose addition
+# would push the union over the cap is rejected and listed in rejected_union (later keywords still considered).
+MAX_UNION_PROMPT_FRACTION = 0.5
 
 
 def grounding_protection_with_report(
@@ -544,10 +548,13 @@ def grounding_protection_with_report(
     """
     report: dict[str, Any] = {
         "max_keyword_prompt_fraction": MAX_KEYWORD_PROMPT_FRACTION,
+        "max_union_prompt_fraction": MAX_UNION_PROMPT_FRACTION,
         "stopword_list": sorted(KEYWORD_STOPWORDS),
         "accepted_keywords": [],
         "rejected_stopword": [],
         "rejected_breadth": [],
+        "rejected_union": [],
+        "union_fraction": 0.0,
     }
     if pool is None:
         return {}, report
@@ -555,7 +562,8 @@ def grounding_protection_with_report(
     valid_ids = {eid for eid, (status, _) in verdicts.items() if status == "valid"}
     n_prompt = len(prompt_ids)
     protected: dict[int, set[str]] = {}
-    for keyword, evidence_ids in sorted(pool.keyword_index().items()):
+    # Declared order (the pool's insertion order), not alphabetical: the union cap is order-dependent by design.
+    for keyword, evidence_ids in pool.keyword_index().items():
         supporting = [eid for eid in evidence_ids if eid in valid_ids]
         if not supporting:
             continue
@@ -573,7 +581,13 @@ def grounding_protection_with_report(
         if fraction > MAX_KEYWORD_PROMPT_FRACTION:
             report["rejected_breadth"].append({"keyword": keyword, "protected_fraction": round(fraction, 6)})
             continue
+        new_positions = len(set(own) - set(protected))
+        union_if_added = ((len(protected) + new_positions) / n_prompt) if n_prompt else 0.0
+        if union_if_added > MAX_UNION_PROMPT_FRACTION:
+            report["rejected_union"].append({"keyword": keyword, "union_fraction_if_added": union_if_added})
+            continue
         report["accepted_keywords"].append(keyword)
         for pos, ids in own.items():
             protected.setdefault(pos, set()).update(ids)
+    report["union_fraction"] = (len(protected) / n_prompt) if n_prompt else 0.0
     return {pos: tuple(sorted(ids)) for pos, ids in sorted(protected.items())}, report

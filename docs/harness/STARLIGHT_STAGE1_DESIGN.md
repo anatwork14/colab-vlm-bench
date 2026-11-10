@@ -87,7 +87,11 @@ and the text-side budget shrinks by the same amount.
   `the`) are rejected before any position is protected. A keyword whose protected positions exceed
   `MAX_KEYWORD_PROMPT_FRACTION = 0.2` of the prompt is rejected. Both rejections are reported in
   `grounding_keyword_policy` (`accepted_keywords`, `rejected_stopword`, `rejected_breadth` with the fraction).
-  Accepted protection that still exceeds the budget keeps the INFEASIBLE semantics of section 3 (never silent).
+- **Union cap (ITER3 R3, N-R2-2, lead ruling).** The protected union of accepted keywords is bounded by
+  `MAX_UNION_PROMPT_FRACTION = 0.5` of prompt positions (owner-ratifiable). Keywords are processed in declared
+  order. A keyword whose addition would push the union over the cap is rejected and listed in `rejected_union`
+  (with the union fraction it would have produced); later keywords are still considered. `union_fraction` is
+  reported. Accepted protection that still exceeds the budget keeps the INFEASIBLE semantics of section 3 (never silent).
 
 ### 4.3 Evidence validity
 

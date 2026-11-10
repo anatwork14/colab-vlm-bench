@@ -84,7 +84,7 @@ Verdict: the cap bounds each keyword but not what the keywords protect together.
 | ID | Severity | Owner | Status | Finding |
 |---|---|---|---|---|
 | N-R2-1 | MEDIUM | wF:p8 / lead | OPEN | The owner-authorization anchor is an operator-chosen `--allowed-signers` file. Nothing in the repo or the record pins the owner key fingerprint, so a local operator can forge authorization (E1). READY still fails on this host. Fix: pin the owner key fingerprint (or a hash of the signer file) in a location the operator cannot edit alongside the record. |
-| N-R2-2 | MEDIUM | wF:p7 | OPEN (strict xfail added) | Keyword breadth: the cap is per keyword and the protected union is unbounded and unreported (0.4). |
+| N-R2-2 | MEDIUM | wF:p7 | **CLOSED** (ITER3 R3, lead ruling: union cap `MAX_UNION_PROMPT_FRACTION = 0.5`, declared-order greedy, `union_fraction` and `rejected_union` reported; the 0.5 value is owner-ratifiable) | Keyword breadth: the cap was per keyword and the protected union was unbounded and unreported (0.4). |
 | G-PATH | LOW | wF:p8 | OPEN | `probe_gpu` takes `nvidia-smi` from PATH, so the capability and memory gates can be shimmed (E3). Fix: fixed binary path, or read capability and memory in the child. |
 | F1-COV | LOW | wF:p9 | **CLOSED** (`4f52fc1`) | The F-1 scenario did not exercise the veto (F1b survived it). Three new tests now cover the veto, the mean aggregation and the union guard. |
 | C5-MOD | LOW | wF:p7 | **CLOSED** (`b39e081`) | Unknown modality labels were accepted and hid image evidence from the status. |
