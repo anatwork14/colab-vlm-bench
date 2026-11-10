@@ -74,8 +74,8 @@ and the text-side budget shrinks by the same amount.
 - **Coverage on image prompts (wF:p9 F-1; ITER3 closure, scope unchanged).** The scripted FOCUS span
   `focus:scripted_visual_segment` covers the WHOLE visual segment (`focus_end = sink_end + n_visual`,
   `real_engine.py`, the prefill DA block). On an image prompt the DA protection is therefore every visual token, not
-  only the evidence region. Protection at prefill is at least `n_visual`, so whenever the visual token count reaches the
-  budget, every step is INFEASIBLE and nothing is evicted. The review's fixture run (640x480, 300 visual tokens) measured
+  only the evidence region. Protection at prefill is at least `n_visual`, so whenever the protected count exceeds the
+  budget (code condition: protection > budget, `starlight.py:218`), every step is INFEASIBLE and nothing is evicted. The review's fixture run (640x480, 300 visual tokens) measured
   321 of 322 entries protected with no evidence declared, against a budget of 192. Image `starlight_s1` is therefore a
   FULL-CACHE run, not a sparse one, and it is not comparable to a matched-budget run. The run is labelled
   `comparison_validity = STARLIGHT_FULL_CACHE_INFEASIBLE_NOT_COMPARABLE` (§19). Narrowing the FOCUS scope is an owner
@@ -240,7 +240,7 @@ an H2O variant label is never attached to a STARLIGHT run.
   are INFEASIBLE by design and are reported (`infeasible_steps`), not hidden.
 - Protection costs budget, so STARLIGHT evicts more text tokens than H2O at the same ratio. This
   is a retention cost, not a quality result. Quality is not measured here.
-- Image prompts under `starlight_s1` are full-cache runs when the visual segment reaches the budget (§4.1, F-1). Their
+- Image prompts under `starlight_s1` are full-cache runs when the visual segment exceeds the budget (§4.1, F-1). Their
   retention numbers say nothing about sparsity. Read `telemetry["comparison_validity"]` before comparing any image
   STARLIGHT run to a matched-budget run.
 - `comparison_validity` is set on the non-speculative execution path only. The two speculative text routes return
@@ -425,7 +425,7 @@ configurable, versioned and ablatable, and were not tuned on confirmatory answer
   preservation (`perfect_preservation_claimed` is False when any capped occurrence was omitted). The default
   reproduces the previous behaviour. Tests: `tests/test_i3a_s4_cap_policy.py` (14).
 - **H2 confounder control `h2o_shared_base`.** Same shared mean-over-full-attention-layers selection as STARLIGHT,
-  with zero signals (`STARLIGHT_ARM_SIGNALS["h2o_shared_base"] == ()`), so no internal protection. Comparable with
+  with zero signals (`STARLIGHT_ARM_SIGNALS["h2o_shared_base"] == ()`), so no internal protection. Comparable (text-only prompts; NOT comparable with image-prompt `starlight_s1`, which is full-cache, see §4.1 and F-1) with
   `h2o_base`, `starlight_s1_no_da`, `starlight_s1_no_grounding` and `starlight_s1` on prompt, budget formula, layers,
   generation policy and model id. It reports actual retained counts, and an infeasible configuration for STARLIGHT
   shows up as `fixed_budget_run` False while the control stays within budget. Tests: `tests/test_i3a_h2_shared_base.py` (7).
