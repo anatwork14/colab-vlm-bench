@@ -224,8 +224,10 @@ def test_F1_protected_veto_that_differs_across_layers_completes(star_engine, pro
     # The earlier per-layer defect (veto on layer 3 only) can no longer occur; this test checks completion.
     real_new_state = star_engine._pol_new_state
 
-    def with_focus_span_on_16(kind, prompt_len):
-        st = real_new_state(kind, prompt_len)
+    # ITER3 Round B S2 added the `grounding` keyword to _pol_new_state. This double keeps the same behaviour
+    # (a DA focus span at 16) and forwards the new argument; no assertion below changed.
+    def with_focus_span_on_16(kind, prompt_len, grounding=None):
+        st = real_new_state(kind, prompt_len, grounding=grounding)
         st.da_spans = tuple(st.da_spans) + (("focus:mid", 16, 17),)
         return st
 

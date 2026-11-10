@@ -53,15 +53,31 @@ def _pool(request_id, *, sha=None):
     return pool
 
 
-def _engine(arm, *, accept_declared):
+def _image_pool(sha):
+    pool = EvidencePool("s2c_img")
+    pool.add_evidence(EvidenceItem(evidence_id="ev_region", modality="image_region", content="top-left quadrant",
+                                   source_sha256=sha, verified=True, bounding_box=(0.0, 0.0, 0.5, 0.5)))
+    return pool
+
+
+def _engine(arm, *, accept_declared, budget=16):
     return RealSevenArmEngine(method_arm=arm, device="cpu", checkpoint_dir=CKPT, stop_at_eos=False,
-                              h2o_min_budget=16, h2o_budget_ratio=0.5,
+                              h2o_min_budget=budget, h2o_budget_ratio=0.5,
                               evidence_policy=EvidencePolicy(accept_declared=accept_declared))
 
 
 @pytest.fixture(scope="module")
 def star_accept():
     e = _engine("starlight_s1_mtp", accept_declared=True)
+    yield e
+    e.close()
+
+
+@pytest.fixture(scope="module")
+def star_big():
+    # A larger budget keeps the first decode steps eviction-free, so verified 2-row blocks (accepts) occur
+    # before evictions begin. Without this the policy path only falls back and nothing can be rolled back.
+    e = _engine("starlight_s1_mtp", accept_declared=True, budget=40)
     yield e
     e.close()
 
@@ -86,10 +102,15 @@ def prompt(star_accept):
 
 
 def _normal(engine, prompt_ids, pool):
-    """Non-speculative reference of the SAME arm and evidence (the normal decode loop)."""
+    """Non-speculative reference of the SAME arm and evidence (the normal decode loop).
+
+    The request id must be the pool's own id: S1 source_identity binds the pool to its request, so a reference
+    run under another id would protect nothing and would not be a fair reference.
+    """
     engine._speculation_enabled = False
+    request_id = pool.request_id if pool is not None else "s2c_ref"
     try:
-        return list(engine.execute_request("s2c_ref", prompt_token_ids=prompt_ids, max_new_tokens=N,
+        return list(engine.execute_request(request_id, prompt_token_ids=prompt_ids, max_new_tokens=N,
                                            image_present=False, evidence_pool=pool).tokens_generated)
     finally:
         engine._speculation_enabled = True
@@ -143,7 +164,7 @@ def test_pinv_image_prompt_on_combined_method_is_unsupported_on_the_speculative_
     sha = hashlib.sha256(raw).hexdigest()
     res = star_accept.execute_request("s2c_img", image_present=True, image_path=FIXTURE,
                                       question="What is shown in this picture?", max_new_tokens=3,
-                                      evidence_pool=_pool("s2c_img", sha=sha))
+                                      evidence_pool=_image_pool(sha))
     assert res.telemetry["speculation_executed"] is False
     assert res.telemetry["speculative_route"]["status"] == ROUTE_UNSUPPORTED_IMAGE
     assert res.telemetry["speculative_route"]["reason"]
@@ -165,12 +186,12 @@ def test_da_mtp_is_explicitly_non_speculative_on_text():
 
 # --- rejection after acceptance, atomic rollback including policy state ---------------------------
 
-def test_pinv_rejection_after_acceptance_rolls_back_policy_state_and_original_positions(star_accept, prompt, monkeypatch):
+def test_pinv_rejection_after_acceptance_rolls_back_policy_state_and_original_positions(star_big, prompt, monkeypatch):
     pool = _pool("s2c_rb")
-    protected = _grounding(star_accept, prompt, pool, "s2c_rb")
+    protected = _grounding(star_big, prompt, pool, "s2c_rb")
     assert protected, "fixture must protect keyword spans"
-    ref = _normal(star_accept, prompt, pool)
-    vocab = star_accept.config.vocab_size
+    ref = _normal(star_big, prompt, pool)
+    vocab = star_big.config.vocab_size
     flip = {"i": 0}
 
     def alternate(draft, i, n_emitted):
@@ -178,17 +199,17 @@ def test_pinv_rejection_after_acceptance_rolls_back_policy_state_and_original_po
         return ref[n_emitted] if flip["i"] % 2 else (ref[n_emitted] + 1) % vocab
 
     restores = {"n": 0, "orig_mismatch": 0}
-    real_restore = star_accept._pol_restore
+    real_restore = star_big._pol_restore
 
     def spy_restore(st, snap):
         real_restore(st, snap)
         restores["n"] += 1
-        for l in st.full_layers:
-            if not np.array_equal(np.asarray(st.orig[l]), np.asarray(snap["orig"][l])):
+        for layer in st.full_layers:
+            if not np.array_equal(np.asarray(st.orig[layer]), np.asarray(snap["orig"][layer])):
                 restores["orig_mismatch"] += 1
 
-    monkeypatch.setattr(star_accept, "_pol_restore", spy_restore)
-    spec = star_accept._speculative_policy_mtp_greedy(
+    monkeypatch.setattr(star_big, "_pol_restore", spy_restore)
+    spec = star_big._speculative_policy_mtp_greedy(
         "starlight", prompt, N, draft_override=alternate, record_trace=True, grounding=protected)
     assert spec["accepted"] >= 1 and spec["rejected"] >= 1, "need acceptance before a rejection"
     assert restores["n"] >= 1
@@ -207,9 +228,9 @@ def test_pinv_protected_original_positions_stay_retained_at_every_speculative_st
 
     def spy_apply(st, plans, next_orig):
         real_apply(st, plans, next_orig)
-        for l in st.full_layers:
+        for layer in st.full_layers:
             checks["n"] += 1
-            if not wanted <= set(np.asarray(st.orig[l]).tolist()):
+            if not wanted <= set(np.asarray(st.orig[layer]).tolist()):
                 checks["missing"] += 1
 
     monkeypatch.setattr(star_accept, "_pol_apply", spy_apply)
