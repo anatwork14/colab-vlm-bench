@@ -12,6 +12,7 @@ import hashlib
 import numpy as np
 import pytest
 
+from vlmbench.infrastructure.evidence_verification import EvidencePolicy
 from vlmbench.infrastructure.grounding_evidence import EvidenceItem, EvidencePool
 from vlmbench.infrastructure.h2o import H2OCacheTracker, H2OConfig
 from vlmbench.infrastructure.model_config import Qwen35ModelConfig
@@ -57,11 +58,18 @@ def _pool(request_id, keywords, eid="ev_the"):
     return pool
 
 
-def _run(arm, pool=None, record=True, budget=16, ratio=0.2, new=10, request_id="oracle_run", prompt=None):
+# S1 (evidence policy): text-only fixtures with caller verified=True do not protect by default. Only the test that
+# checks grounding ACTIVATION opts in (accept_declared=True, reported and ablatable). Other callers keep the default.
+ACCEPT_DECLARED = EvidencePolicy(accept_declared=True)
+
+
+def _run(arm, pool=None, record=True, budget=16, ratio=0.2, new=10, request_id="oracle_run", prompt=None,
+         evidence_policy=None):
     torch_seed()
     engine = RealSevenArmEngine(
         method_arm=arm, device="cpu", config=_cfg(), stop_at_eos=False, h2o_min_budget=budget,
         h2o_budget_ratio=ratio, tokenizer=_WordTok(), starlight_record_decisions=record,
+        evidence_policy=evidence_policy,
     )
     try:
         return engine.execute_request(
@@ -309,7 +317,7 @@ def test_A_H2O_candidates_exist_on_the_long_context_fixture():
 
 def test_A_NOT_ACTIVATED_label_is_not_needed_for_grounding_arm_on_this_fixture():
     # The grounding keyword is present in PROMPT, so n_grounding must be > 0 on the pressure run.
-    recs = _records(_run("starlight_s1", pool=_pool("oracle_run", ["car"])))
+    recs = _records(_run("starlight_s1", pool=_pool("oracle_run", ["car"]), evidence_policy=ACCEPT_DECLARED))
     assert any(r["n_grounding"] > 0 for r in recs)
 
 

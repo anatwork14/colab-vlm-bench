@@ -103,9 +103,31 @@ and the text-side budget shrinks by the same amount.
 | `expired` | `pool_request_id_mismatch` (pool built for another request) | no |
 | `stale` | `source_sha256_mismatch` (image hash differs from the declared source) | no |
 | `valid` | `source_sha256_match` | yes |
-| `valid` | `source_unchecked_text_only` (no image; the gap is labelled) | yes |
+| `declared_unverified` | `no_source_bytes_checked` (text-only: there are no source bytes to compare) | no (default) |
+| `declared_unverified` | `accepted_by_policy_accept_declared` (text-only, explicit `EvidencePolicy(accept_declared=True)`) | yes, reported as such |
+| `uncertain` | `source_bytes_not_hashed` (image present, bytes unavailable) | no |
+
+Before ITER3 Round A the text-only row read `valid / source_unchecked_text_only`. That label let an unchecked item
+read as VALID, so it was changed (see §17, S1).
 
 `EvidenceItem` carries no timestamp, so "expired" means request-scoped, not time-scoped.
+
+**S1 (ITER3 Round A): tri-state verification dimensions.** The caller's `verified` flag is no longer a protection
+switch. `evidence_verification.assess_evidence` gives each item separate dimensions, each `VERIFIED`,
+`NOT_VERIFIED`, `UNCERTAIN` or `NOT_ASSESSED`: `source_identity` (bound to the request), `source_bytes_hash` (image
+bytes against the declared hash), `location_valid`, `relevance_to_question`, `claim_support`, plus `method` and
+`provenance`. The integrity dimensions are never reported as semantic verification. The controller never assesses
+relevance or claim support, so those are `NOT_ASSESSED`.
+
+Protection (`decide_protection`), in order: caller `verified=False` is refused; identity not bound is refused; a bytes
+mismatch is refused; bytes `UNCERTAIN` protect nothing; bytes `VERIFIED` protect. Otherwise (text-only, bytes
+`NOT_ASSESSED`) the item is `DECLARED_UNVERIFIED` and does not protect by default.
+
+**Fallback for incomplete evidence (A-5).** Missing or unassessed evidence is never fabricated. DA and structural
+signals still operate. A text-only declared item protects only under an explicit, reported, ablatable
+`EvidencePolicy(accept_declared=True)`, and the policy is in telemetry as `evidence_policy`. Rationale: a caller
+Boolean with no source check should not earn hard protection, because hard protection can make a step INFEASIBLE
+and keep the cache above budget (§3).
 
 If grounding is enabled and the request has an image but no image bytes or path, grounding is
 `NOT_PROTECTED_IMAGE_SOURCE_UNKNOWN` and protects nothing. A missing pool is
@@ -126,9 +148,11 @@ pinned config) are planned.
 | `starlight_s1` | DA + grounding | STARLIGHT Stage 1 on the non-speculative base |
 | `starlight_s1_no_da` | grounding only | H2O candidates + grounding |
 | `starlight_s1_no_grounding` | DA only | H2O candidates + DA |
+| `h2o_shared_base` | none (zero signals) | H2O confounder control (ITER3 Round A): the same shared selection with NO internal protection |
 
-The seven existing arm IDs are unchanged. `SUPPORTED_ARMS` now equals the seven plus these three
-(asserted by a test). `h2o_base` is unchanged and has no `starlight` telemetry key.
+The seven existing arm IDs are unchanged. `SUPPORTED_ARMS` now holds twelve arm IDs: the seven originals, the four
+STARLIGHT arms (`starlight_s1`, its two ablations, and `starlight_s1_mtp`) and the control `h2o_shared_base` (asserted
+by tests). `h2o_base` is unchanged and has no `starlight` telemetry key.
 
 ## 7. Telemetry (`telemetry["starlight"]`)
 
@@ -338,3 +362,36 @@ gather in the hooked attention, which is not implemented. Tracker level only.
 - Auditor confirmation of Q5 is pending (lead decision: confirm, do not change).
 - The DA sink is not capped (Q6): INFEASIBLE stays explicit.
 - Per-head selection is not wired into the engine (see §15c).
+
+## 17. ITER3 Round A (S1, S3, S4, H2)
+
+Provisional policy values (engineering hypotheses, not owner ratification). Caps and stopwords are provisional,
+configurable, versioned and ablatable, and were not tuned on confirmatory answers.
+
+- **S1 evidence dimensions.** See §4.3. Integrity (identity, bytes hash) is kept separate from semantic dimensions,
+  which stay `NOT_ASSESSED`. Default `EvidencePolicy(accept_declared=False)`: text-only declared evidence protects
+  nothing. Tests: `tests/test_i3a_s1_evidence_dimensions.py` (16). The expectations pinned to the old default were
+  re-derived with an explicit `ACCEPT_DECLARED` opt-in and a stated reason; no assertion was relaxed. The only
+  changed expectations are the two text-only status labels, which are now `declared_unverified`.
+- **S3 protected never silently evicted; the fixed-budget verdict.** An INFEASIBLE step evicts nothing, so it keeps
+  every entry (§3). The run is therefore NOT budget-bounded. `starlight.fixed_budget_verdict` reports a run as a
+  successful fixed-budget run only when no step is INFEASIBLE, no layer-step is a KV budget violation, and max
+  retained per layer-step does not exceed the budget. Telemetry: `starlight.fixed_budget_run`,
+  `fixed_budget_status` (`NOT_A_SUCCESSFUL_FIXED_BUDGET_RUN` when not met), `fixed_budget_verdict`, and
+  `kv_memory_accounting.fixed_budget_status`, `kv_retention_status`
+  (`NOT_BUDGET_BOUNDED_ENTRIES_ABOVE_BUDGET_RETAINED`) and `max_retained_over_budget_per_layer_step`. Non-STARLIGHT
+  arms report `NOT_APPLICABLE_NO_STARLIGHT_CONTROLLER`, not a claim. Tests: `tests/test_i3a_s3_protected_budget.py` (11).
+- **S4 versioned caps and stopwords.** `starlight.GroundingCapPolicy` holds `cap_policy_version` (default
+  `GROUNDING_CAP_V1_ITER3_R3`), the per-keyword and union fractions (`None` = uncapped), and the stopword set. A
+  changed threshold or stopword list under the default id is refused. The report carries `cap_policy`,
+  `stopword_set_sha256` and a `threshold_ledger` (per threshold: `limit`, retained, rejected, `omitted_positions`).
+  `omitted_positions_total` and `preservation_claim` are set so that a capped occurrence is never reported as perfect
+  preservation (`perfect_preservation_claimed` is False when any capped occurrence was omitted). The default
+  reproduces the previous behaviour. Tests: `tests/test_i3a_s4_cap_policy.py` (14).
+- **H2 confounder control `h2o_shared_base`.** Same shared mean-over-full-attention-layers selection as STARLIGHT,
+  with zero signals (`STARLIGHT_ARM_SIGNALS["h2o_shared_base"] == ()`), so no internal protection. Comparable with
+  `h2o_base`, `starlight_s1_no_da`, `starlight_s1_no_grounding` and `starlight_s1` on prompt, budget formula, layers,
+  generation policy and model id. It reports actual retained counts, and an infeasible configuration for STARLIGHT
+  shows up as `fixed_budget_run` False while the control stays within budget. Tests: `tests/test_i3a_h2_shared_base.py` (7).
+- Not done in Round A: S2 visual mapping (Round B). The `adapters.py` placeholder `source_sha256 = "a"*64`
+  (around line 487) is not changed here and is an open item.

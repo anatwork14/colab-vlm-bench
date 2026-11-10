@@ -22,6 +22,13 @@ Every result is labelled cpu_pytorch_reference_not_vllm. Nothing here is GPU or 
 
 from __future__ import annotations
 
+from .evidence_verification import (
+    EvidencePolicy, MODE_NO_PROTECTION_DECLARED, MODE_PROTECTED_BY_POLICY, MODE_PROTECTED_VERIFIED,
+    MODE_REJECTED_BYTES_MISMATCH, MODE_REJECTED_CALLER_FALSE, MODE_REJECTED_NOT_BOUND, MODE_UNCERTAIN,
+    assess_evidence, decide_protection,
+)
+
+import hashlib
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
@@ -30,6 +37,16 @@ MEASUREMENT_LABEL = "cpu_pytorch_reference_not_vllm"
 
 STATUS_OK = "OK"
 STATUS_INFEASIBLE = "INFEASIBLE_PROTECTED_EXCEEDS_BUDGET"
+
+# ITER3 Round A S3 (provisional policy A-2, engineering hypothesis): run-level fixed-budget verdict.
+# An INFEASIBLE step keeps every entry (it evicts nothing), so its KV is NOT budget-bounded. A run containing one
+# is reported as NOT a successful fixed-budget run. It is never reported as a budgeted run, and no full-cache
+# substitution is hidden behind a budget label.
+FIXED_BUDGET_MET = "FIXED_BUDGET_MET"
+FIXED_BUDGET_NOT_MET = "NOT_A_SUCCESSFUL_FIXED_BUDGET_RUN"
+FIXED_BUDGET_NOT_APPLICABLE = "NOT_APPLICABLE_NO_STARLIGHT_CONTROLLER"
+RETENTION_BUDGET_BOUNDED = "BUDGET_BOUNDED"
+RETENTION_AT_INFEASIBLE_STEPS = "NOT_BUDGET_BOUNDED_ENTRIES_ABOVE_BUDGET_RETAINED"
 
 DECISION_EVICT = "EVICT"
 DECISION_RETAIN_PROTECTED_VETOED = "RETAIN_PROTECTED_VETOED_H2O_CANDIDATE"
@@ -326,6 +343,29 @@ def summarize_plans(plans: Sequence[StarlightLayerPlan]) -> dict[str, Any]:
     }
 
 
+def fixed_budget_verdict(
+    summary: dict[str, Any], *, budget_total: int, max_retained_per_layer: int,
+) -> dict[str, Any]:
+    """Run-level verdict: is this a successful fixed-budget run?
+
+    Met only when no step is INFEASIBLE, no layer-step is recorded as a KV budget violation, and the largest
+    retained count of any layer-step does not exceed the budget. Any one of these makes the run NOT a successful
+    fixed-budget run, even when the other two look clean.
+    """
+    infeasible = int(summary["status_counts"].get(STATUS_INFEASIBLE, 0))
+    kv_violated = int(summary["kv_budget_violated_layers"])
+    over = max(0, int(max_retained_per_layer) - int(budget_total))
+    met = infeasible == 0 and kv_violated == 0 and over == 0
+    return {
+        "fixed_budget_run": met,
+        "status": FIXED_BUDGET_MET if met else FIXED_BUDGET_NOT_MET,
+        "budget_total": int(budget_total),
+        "infeasible_layer_steps": infeasible,
+        "kv_budget_violated_layers": kv_violated,
+        "max_retained_over_budget": over,
+    }
+
+
 def combine_summaries(summaries: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Sum per-step summaries (from summarize_plans) into one request-level record."""
     total: dict[str, Any] = {
@@ -421,30 +461,69 @@ def match_token_spans(prompt_ids: Sequence[int], needle_ids: Sequence[int]) -> l
     return [i for i in range(len(prompt) - n + 1) if prompt[i:i + n] == needle]
 
 
-def evidence_validity(pool: Any, current_request_id: str, image_sha256: str | None) -> dict[str, tuple[str, str]]:
-    """Per evidence id: (status, reason) with status in {valid, expired, stale, unverified}.
+_MODE_TO_STATUS: dict[str, tuple[str, str]] = {
+    MODE_REJECTED_CALLER_FALSE: ("unverified", "caller_declared_verified_false"),
+    MODE_REJECTED_NOT_BOUND: ("expired", "pool_request_id_mismatch"),
+    MODE_REJECTED_BYTES_MISMATCH: ("stale", "source_sha256_mismatch"),
+    MODE_UNCERTAIN: ("uncertain", "source_bytes_not_hashed"),
+    MODE_PROTECTED_VERIFIED: ("valid", "source_sha256_match"),
+    MODE_NO_PROTECTION_DECLARED: ("declared_unverified", "no_source_bytes_checked"),
+    MODE_PROTECTED_BY_POLICY: ("declared_unverified", "accepted_by_policy_accept_declared"),
+}
 
-    - expired: the pool was built for a different request id (it outlived its request).
-    - stale: the image source hash differs from the source the evidence was declared against.
-    - text-only requests have no image hash to check; they are valid with an explicit
-      `source_unchecked_text_only` reason, so the gap stays visible in telemetry.
+
+def evidence_assessments(
+    pool: Any,
+    current_request_id: str,
+    image_sha256: str | None,
+    *,
+    image_present: bool | None = None,
+    policy: EvidencePolicy | None = None,
+) -> dict[str, dict[str, Any]]:
+    """ITER3 R3 S1: per evidence id, the tri-state dimensions, the method and provenance, and the protection decision.
+
+    `image_present` None means: present iff an image hash was supplied (the old call convention).
+    The status vocabulary: valid (source bytes VERIFIED and bound), declared_unverified (text-only, no source
+    bytes checked: protects only under accept_declared), uncertain, stale, expired, unverified (caller false).
     """
-    verdicts: dict[str, tuple[str, str]] = {}
+    if image_present is None:
+        image_present = image_sha256 is not None
+    policy = policy or EvidencePolicy()
+    out: dict[str, dict[str, Any]] = {}
     if pool is None:
-        return verdicts
+        return out
     for item in pool.items():
-        if not item.verified:
-            # The flag is the caller's declaration; the controller does not verify content (C-3).
-            verdicts[item.evidence_id] = ("unverified", "caller_declared_verified_false")
-        elif pool.request_id != current_request_id:
-            verdicts[item.evidence_id] = ("expired", "pool_request_id_mismatch")
-        elif image_sha256 is None:
-            verdicts[item.evidence_id] = ("valid", "source_unchecked_text_only")
-        elif item.source_sha256.lower() != image_sha256.lower():
-            verdicts[item.evidence_id] = ("stale", "source_sha256_mismatch")
-        else:
-            verdicts[item.evidence_id] = ("valid", "source_sha256_match")
-    return verdicts
+        a = assess_evidence(item, request_id=current_request_id, pool_request_id=pool.request_id,
+                            image_sha256=image_sha256, image_present=bool(image_present))
+        d = decide_protection(a, policy, caller_verified=bool(item.verified))
+        status, status_reason = _MODE_TO_STATUS[d.mode]
+        out[item.evidence_id] = {
+            "dimensions": dict(a.dimensions),
+            "method": a.method,
+            "provenance": dict(a.provenance),
+            "protection_mode": d.mode,
+            "protects": bool(d.protects),
+            "decision_reason": d.reason,
+            "status": status,
+            "status_reason": status_reason,
+        }
+    return out
+
+
+def evidence_validity(
+    pool: Any,
+    current_request_id: str,
+    image_sha256: str | None,
+    *,
+    image_present: bool | None = None,
+    policy: EvidencePolicy | None = None,
+) -> dict[str, tuple[str, str]]:
+    """Per evidence id: (status, reason). Derived from evidence_assessments (single decision path)."""
+    return {
+        eid: (a["status"], a["status_reason"])
+        for eid, a in evidence_assessments(pool, current_request_id, image_sha256,
+                                           image_present=image_present, policy=policy).items()
+    }
 
 
 # ITER3 R2 C-3: provenance labels. The `verified` flag is never checked by this controller, so it is always
@@ -504,8 +583,12 @@ def grounding_protection_from_pool(
     encode: Any,
     current_request_id: str,
     image_sha256: str | None,
+    policy: EvidencePolicy | None = None,
+    *,
+    image_present: bool | None = None,
+    cap_policy: GroundingCapPolicy | None = None,
 ) -> dict[int, tuple[str, ...]]:
-    """Grounding-protected prompt positions: token spans of valid evidence keywords.
+    """Grounding-protected prompt positions: token spans of evidence keywords whose items PROTECT.
 
     Uses the same keyword index ECRD matches on. Each keyword is tokenized in the bare,
     space-prefixed and capitalised forms, and every contiguous occurrence in the prompt is
@@ -515,7 +598,8 @@ def grounding_protection_from_pool(
     missed (documented limitation).
     """
     protected, _report = grounding_protection_with_report(
-        pool, prompt_ids, encode, current_request_id, image_sha256)
+        pool, prompt_ids, encode, current_request_id, image_sha256, policy, image_present=image_present,
+        cap_policy=cap_policy)
     return protected
 
 
@@ -533,6 +617,54 @@ MAX_KEYWORD_PROMPT_FRACTION = 0.2
 # would push the union over the cap is rejected and listed in rejected_union (later keywords still considered).
 MAX_UNION_PROMPT_FRACTION = 0.5
 
+# ITER3 Round A S4 (provisional policy, engineering hypothesis, not owner ratification): the caps and the stopword
+# list are one VERSIONED object. A changed threshold or stopword list needs a NEW cap_policy_version, so telemetry
+# can never report a changed policy under the default id. A threshold of None means UNCAPPED for that threshold.
+DEFAULT_CAP_POLICY_VERSION = "GROUNDING_CAP_V1_ITER3_R3"
+
+
+@dataclass(frozen=True)
+class GroundingCapPolicy:
+    """Configurable, versioned caps and stopwords for grounding keyword protection (ablatable)."""
+
+    cap_policy_version: str
+    max_keyword_prompt_fraction: float | None
+    max_union_prompt_fraction: float | None
+    stopwords: frozenset[str]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cap_policy_version, str) or not self.cap_policy_version.strip():
+            raise ValueError("cap_policy_version must be a non-empty string")
+        for name, value in (("max_keyword_prompt_fraction", self.max_keyword_prompt_fraction),
+                            ("max_union_prompt_fraction", self.max_union_prompt_fraction)):
+            if value is not None and not (0.0 < float(value) <= 1.0):
+                raise ValueError(f"{name} must be None (uncapped) or in (0, 1], got {value!r}")
+        object.__setattr__(self, "stopwords", frozenset(str(w).strip().lower() for w in self.stopwords))
+        default_values = (MAX_KEYWORD_PROMPT_FRACTION, MAX_UNION_PROMPT_FRACTION, KEYWORD_STOPWORDS)
+        changed = (self.max_keyword_prompt_fraction, self.max_union_prompt_fraction, self.stopwords) != default_values
+        if self.cap_policy_version == DEFAULT_CAP_POLICY_VERSION and changed:
+            raise ValueError("a changed cap or stopword list needs a new cap_policy_version (the default id is taken)")
+
+    def stopword_set_sha256(self) -> str:
+        return hashlib.sha256("\n".join(sorted(self.stopwords)).encode("utf8")).hexdigest()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "cap_policy_version": self.cap_policy_version,
+            "max_keyword_prompt_fraction": self.max_keyword_prompt_fraction,
+            "max_union_prompt_fraction": self.max_union_prompt_fraction,
+            "stopword_count": len(self.stopwords),
+            "stopword_set_sha256": self.stopword_set_sha256(),
+        }
+
+
+DEFAULT_GROUNDING_CAP_POLICY = GroundingCapPolicy(
+    cap_policy_version=DEFAULT_CAP_POLICY_VERSION,
+    max_keyword_prompt_fraction=MAX_KEYWORD_PROMPT_FRACTION,
+    max_union_prompt_fraction=MAX_UNION_PROMPT_FRACTION,
+    stopwords=KEYWORD_STOPWORDS,
+)
+
 
 def grounding_protection_with_report(
     pool: Any,
@@ -540,35 +672,62 @@ def grounding_protection_with_report(
     encode: Any,
     current_request_id: str,
     image_sha256: str | None,
+    policy: EvidencePolicy | None = None,
+    *,
+    image_present: bool | None = None,
+    cap_policy: GroundingCapPolicy | None = None,
 ) -> tuple[dict[int, tuple[str, ...]], dict[str, Any]]:
     """Grounding-protected positions AND the keyword policy report (accepted and rejected keywords).
 
-    Same matching as grounding_protection_from_pool. Each keyword is checked against the breadth policy
+    Same matching as grounding_protection_from_pool. Only evidence items whose PROTECTION DECISION is positive
+    (evidence_verification.decide_protection) can protect. Each keyword is checked against the breadth policy
     before any of its positions is protected, so a rejected keyword protects nothing.
     """
+    policy = policy or EvidencePolicy()
+    caps = cap_policy or DEFAULT_GROUNDING_CAP_POLICY
+    kw_limit = caps.max_keyword_prompt_fraction
+    union_limit = caps.max_union_prompt_fraction
     report: dict[str, Any] = {
-        "max_keyword_prompt_fraction": MAX_KEYWORD_PROMPT_FRACTION,
-        "max_union_prompt_fraction": MAX_UNION_PROMPT_FRACTION,
-        "stopword_list": sorted(KEYWORD_STOPWORDS),
+        "cap_policy_version": caps.cap_policy_version,
+        "cap_policy": caps.as_dict(),
+        "max_keyword_prompt_fraction": kw_limit,
+        "max_union_prompt_fraction": union_limit,
+        "stopword_list": sorted(caps.stopwords),
         "accepted_keywords": [],
         "rejected_stopword": [],
         "rejected_breadth": [],
         "rejected_union": [],
         "union_fraction": 0.0,
+        # ITER3 Round A S4: for each threshold, what it retained, rejected and omitted. A positions count is the
+        # prompt positions of that threshold's rejected keywords that are NOT protected in the final set.
+        "threshold_ledger": {
+            "stopword": {"limit": None, "rejected": [], "omitted_positions": 0},
+            "per_keyword_fraction": {"limit": kw_limit, "retained": [], "rejected": [], "omitted_positions": 0},
+            "union_fraction": {"limit": union_limit, "retained": [], "rejected": [], "omitted_positions": 0,
+                               "retained_positions": 0},
+        },
+        "evidence_policy": policy.as_dict(),
+        "assessments": {},
+        "omitted_items": [],
     }
     if pool is None:
         return {}, report
-    verdicts = evidence_validity(pool, current_request_id, image_sha256)
-    valid_ids = {eid for eid, (status, _) in verdicts.items() if status == "valid"}
+    assessments = evidence_assessments(pool, current_request_id, image_sha256,
+                                       image_present=image_present, policy=policy)
+    report["assessments"] = assessments
+    report["omitted_items"] = [
+        {"evidence_id": eid, "reason": a["protection_mode"]}
+        for eid, a in assessments.items() if not a["protects"]
+    ]
+    valid_ids = {eid for eid, a in assessments.items() if a["protects"]}
     n_prompt = len(prompt_ids)
     protected: dict[int, set[str]] = {}
+    ledger = report["threshold_ledger"]
+    rejected_at: dict[str, set[int]] = {"stopword": set(), "per_keyword_fraction": set(), "union_fraction": set()}
     # Declared order (the pool's insertion order), not alphabetical: the union cap is order-dependent by design.
     for keyword, evidence_ids in pool.keyword_index().items():
         supporting = [eid for eid in evidence_ids if eid in valid_ids]
         if not supporting:
-            continue
-        if keyword.strip().lower() in KEYWORD_STOPWORDS:
-            report["rejected_stopword"].append(keyword)
             continue
         own: dict[int, set[str]] = {}
         variants = {keyword, f" {keyword}", keyword.capitalize(), f" {keyword.capitalize()}"}
@@ -577,17 +736,43 @@ def grounding_protection_with_report(
             for start in match_token_spans(prompt_ids, tokens):
                 for pos in range(start, start + len(tokens)):
                     own.setdefault(pos, set()).update(supporting)
-        fraction = (len(own) / n_prompt) if n_prompt else 0.0
-        if fraction > MAX_KEYWORD_PROMPT_FRACTION:
-            report["rejected_breadth"].append({"keyword": keyword, "protected_fraction": round(fraction, 6)})
+        if keyword.strip().lower() in caps.stopwords:
+            report["rejected_stopword"].append(keyword)
+            ledger["stopword"]["rejected"].append(keyword)
+            rejected_at["stopword"].update(own)
             continue
+        fraction = (len(own) / n_prompt) if n_prompt else 0.0
+        if kw_limit is not None and fraction > kw_limit:
+            report["rejected_breadth"].append({"keyword": keyword, "protected_fraction": round(fraction, 6)})
+            ledger["per_keyword_fraction"]["rejected"].append(
+                {"keyword": keyword, "protected_fraction": round(fraction, 6)})
+            rejected_at["per_keyword_fraction"].update(own)
+            continue
+        ledger["per_keyword_fraction"]["retained"].append(keyword)
         new_positions = len(set(own) - set(protected))
         union_if_added = ((len(protected) + new_positions) / n_prompt) if n_prompt else 0.0
-        if union_if_added > MAX_UNION_PROMPT_FRACTION:
+        if union_limit is not None and union_if_added > union_limit:
             report["rejected_union"].append({"keyword": keyword, "union_fraction_if_added": union_if_added})
+            ledger["union_fraction"]["rejected"].append(
+                {"keyword": keyword, "union_fraction_if_added": union_if_added})
+            rejected_at["union_fraction"].update(own)
             continue
         report["accepted_keywords"].append(keyword)
+        ledger["union_fraction"]["retained"].append(keyword)
         for pos, ids in own.items():
             protected.setdefault(pos, set()).update(ids)
-    report["union_fraction"] = (len(protected) / n_prompt) if n_prompt else 0.0
+    final = set(protected)
+    for threshold, positions in rejected_at.items():
+        ledger[threshold]["omitted_positions"] = len(positions - final)
+    ledger["union_fraction"]["retained_positions"] = len(final)
+    omitted_total = len(set().union(*rejected_at.values()) - final)
+    # Never claim perfect preservation while a capped occurrence was dropped (no silent truncation).
+    report["omitted_positions_total"] = omitted_total
+    report["perfect_preservation_claimed"] = omitted_total == 0
+    report["preservation_claim"] = (
+        "PERFECT_PRESERVATION_OF_KEYWORD_OCCURRENCES" if omitted_total == 0
+        else "NOT_PERFECT_PRESERVATION_CAPPED_OCCURRENCES_OMITTED"
+    )
+    report["preservation_scope"] = "CAP_OMISSIONS_ON_KEYWORD_OCCURRENCES_OF_VALID_EVIDENCE; evidence items are in omitted_items"
+    report["union_fraction"] = (len(final) / n_prompt) if n_prompt else 0.0
     return {pos: tuple(sorted(ids)) for pos, ids in sorted(protected.items())}, report

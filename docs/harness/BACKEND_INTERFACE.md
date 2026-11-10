@@ -26,9 +26,10 @@ Facts checked in this round:
 ## 2. Interface contract (engine level)
 
 - `RealSevenArmEngine(method_arm, device, config | checkpoint_dir, h2o_budget_ratio, h2o_min_budget, ...)`.
-  `SUPPORTED_ARMS` (`real_engine.py:1163`) lists the 11 arm IDs: the seven originals
-  (`base`, `h2o_base`, `da_base`, `ecrd_base`, `mtp`, `h2o_mtp`, `da_mtp`) and the four STARLIGHT arms
-  (`starlight_s1`, `starlight_s1_no_da`, `starlight_s1_no_grounding`, `starlight_s1_mtp`).
+  `SUPPORTED_ARMS` (`real_engine.py`, class `RealSevenArmEngine`) lists the 12 arm IDs: the seven originals
+  (`base`, `h2o_base`, `da_base`, `ecrd_base`, `mtp`, `h2o_mtp`, `da_mtp`), the four STARLIGHT arms
+  (`starlight_s1`, `starlight_s1_no_da`, `starlight_s1_no_grounding`, `starlight_s1_mtp`), and the H2O
+  confounder control `h2o_shared_base` (ITER3 Round A: the shared selection of STARLIGHT with no internal protection).
 - `execute_request(request_id, prompt_token_ids, max_new_tokens, image_present, evidence_pool=None)` returns
   `RealExecutionResult` with `tokens_generated`, `physical_kv_bytes_allocated`, `physical_kv_bytes_freed`
   (semantics in `MEMORY_FIELD_SCOPES`, `real_engine.py`), `mtp_acceptance_rate`, `gates`, `telemetry`.
@@ -63,6 +64,7 @@ backend ports) has not been met. No row claims speed.
 | starlight_s1 | supported (decision records per step and layer) | supported; F-1 closed in ITER3 R2 (one shared retained set across full-attention layers; labelled deviation from per-layer H2O) | none | `starlight` block, `decision_records`, invariant counters | BLOCKED | `test_starlight_*.py`, `test_iter3_b1_*.py` |
 | starlight_s1_no_da | supported (DA signal removed, grounding kept) | as starlight_s1 | none | as starlight_s1 | BLOCKED | `test_starlight_engine.py`, `test_starlight_policy.py` (ablation) |
 | starlight_s1_no_grounding | supported (grounding signal removed, DA kept) | as starlight_s1 | none | as starlight_s1 | BLOCKED | `test_starlight_engine.py`, `test_starlight_policy.py` (ablation) |
+| h2o_shared_base | supported (H2O confounder control: the STARLIGHT shared selection with zero signals, so no internal protection; one labelled deviation from per-layer H2O, as for STARLIGHT) | as starlight_s1 with `signals_enabled` = [] | none | `starlight` block (`method_variant` = `shared_h2o_control::no_internal_protection`), `kv_memory_accounting`, `retained_entries_per_layer` | BLOCKED | `test_i3a_h2_shared_base.py` |
 | starlight_s1_mtp | diagnostic | policy-state speculation on text-only, no-evidence requests; `degraded_to_h2o_plus_da` when declarations are missing (explicit, not silent) | yes (text-only, no evidence) | `starlight` block, `policy`, `speculation` | BLOCKED | `test_policy_mtp_speculative.py`, `test_iter3_b2_*` |
 
 Measured status of "logits after compaction equal the masked reference": **yes, on the official
@@ -85,7 +87,9 @@ checkpoint, 7 teacher-forced decode steps, max |logit diff| 8.1e-6, tolerance 1e
   protected slots differ across layers, so the defect cannot recur silently.
 - **LABELLED DEVIATION from per-layer H2O.** STARLIGHT candidate generation (`starlight_s1*`, `starlight_s1_mtp`)
   differs from `h2o_base` / `h2o_mtp`, which keep per-layer H2O. Ablations (`starlight_s1_no_da`,
-  `starlight_s1_no_grounding`) use the same shared rule, so they stay matched to each other. Documented in
+  `starlight_s1_no_grounding`) use the same shared rule, so they stay matched to each other. `h2o_shared_base`
+  is the confounder control: the same shared rule with NO internal protection, so STARLIGHT can be separated
+  from the shared-selection deviation. Documented in
   `STARLIGHT_STAGE1_DESIGN.md` and in the `candidate_basis` telemetry field.
 - Test status: `test_iter3_b2_mtp_rollback.py::test_F1_protected_veto_that_differs_across_layers_completes`
   was a **strict xfail** (`raises=ValueError`) in ITER3 B2. The xfail marker was removed in ITER3 R2: the test now

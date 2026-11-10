@@ -14,6 +14,7 @@ import hashlib
 import numpy as np
 import pytest
 
+from vlmbench.infrastructure.evidence_verification import EvidencePolicy
 from vlmbench.infrastructure.grounding_evidence import EvidenceItem, EvidencePool
 from vlmbench.infrastructure.h2o import H2OCacheTracker, H2OConfig
 from vlmbench.infrastructure.starlight import (
@@ -24,6 +25,11 @@ from vlmbench.infrastructure.starlight import (
     grounding_protection_with_report,
     match_token_spans,
 )
+
+# S1 (evidence policy): text-only fixtures with caller verified=True no longer protect by default. Tests that
+# check the keyword MECHANICS opt in explicitly with accept_declared=True (reported and ablatable). The default
+# gate is pinned in tests/test_i3a_s1_evidence_dimensions.py.
+ACCEPT_DECLARED = EvidencePolicy(accept_declared=True)
 
 SHA_A = hashlib.sha256(b"image-a").hexdigest()
 SHA_B = hashlib.sha256(b"image-b").hexdigest()
@@ -148,7 +154,7 @@ def test_grounding_protects_token_positions_of_keyword_spans_only():
     prompt_text = "the photo shows a red car near the gate and a red car again one two three four five six seven"
     prompt = tok.encode(prompt_text)
     prot = grounding_protection_from_pool(
-        pool, prompt, tok.encode, current_request_id="req-1", image_sha256=None,
+        pool, prompt, tok.encode, current_request_id="req-1", image_sha256=None, policy=ACCEPT_DECLARED,
     )
     # the(0) photo(1) shows(2) a(3) red(4) car(5) near(6) the(7) gate(8) and(9) a(10)
     # red(11) car(12) again(13): both "red car" spans, and nothing else.
@@ -164,13 +170,13 @@ def test_irrelevant_evidence_protection_is_measured_not_hidden():
     pool = EvidencePool("req-1")
     pool.add_evidence(_item("ev_the"), keywords=["the"])
     prot, report = grounding_protection_with_report(pool, prompt, tok.encode, current_request_id="req-1",
-                                                    image_sha256=None)
+                                                    image_sha256=None, policy=ACCEPT_DECLARED)
     assert prot == {}
     assert report["rejected_stopword"] == ["the"]
     pool2 = EvidencePool("req-1")
     pool2.add_evidence(_item("ev_mat"), keywords=["mat"])
     prot2 = grounding_protection_from_pool(pool2, prompt, tok.encode, current_request_id="req-1",
-                                           image_sha256=None)
+                                           image_sha256=None, policy=ACCEPT_DECLARED)
     assert prot2 == {5: ("ev_mat",)}
 
 
@@ -203,11 +209,23 @@ def test_expired_pool_from_another_request_is_excluded():
                                           current_request_id="req-now", image_sha256=None) == {}
 
 
-def test_text_only_request_is_accepted_with_explicit_unchecked_label():
+def test_text_only_request_is_declared_unverified_by_default_and_never_checked_as_valid():
+    # S1 RE-DERIVED: the old label ("valid", "source_unchecked_text_only") let an unchecked text-only item read
+    # as VALID. Source bytes were never checked, so the status is now DECLARED_UNVERIFIED. The item protects
+    # nothing under the default policy. No source bytes were checked, so this is not a semantic check either.
     pool = EvidencePool("req-1")
     pool.add_evidence(_item("ev_t"), keywords=["car"])
     assert evidence_validity(pool, current_request_id="req-1", image_sha256=None) == {
-        "ev_t": ("valid", "source_unchecked_text_only"),
+        "ev_t": ("declared_unverified", "no_source_bytes_checked"),
+    }
+
+
+def test_text_only_request_protects_only_under_the_explicit_accept_declared_policy():
+    pool = EvidencePool("req-1")
+    pool.add_evidence(_item("ev_t"), keywords=["car"])
+    assert evidence_validity(pool, current_request_id="req-1", image_sha256=None,
+                             policy=ACCEPT_DECLARED) == {
+        "ev_t": ("declared_unverified", "accepted_by_policy_accept_declared"),
     }
 
 

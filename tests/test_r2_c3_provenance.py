@@ -63,11 +63,13 @@ def test_verified_false_is_reported_as_a_caller_declaration_not_a_check():
         "ev_1": ("unverified", "caller_declared_verified_false")}
 
 
-def test_existing_status_values_are_unchanged():
-    # Only the provenance labels and the verified_false reason text change; statuses do not.
+def test_status_values_for_image_and_text_requests():
+    # S1 RE-DERIVED (was test_existing_status_values_are_unchanged). The image-bound statuses are unchanged.
+    # The text-only status changes by design: "valid / source_unchecked_text_only" read as VALID although no
+    # source bytes were checked, so it is now DECLARED_UNVERIFIED. Its protection is gated by the explicit policy.
     assert evidence_validity(_pool(), "req-1", SHA_A) == {"ev_1": ("valid", "source_sha256_match")}
     assert evidence_validity(_pool(), "req-1", SHA_B) == {"ev_1": ("stale", "source_sha256_mismatch")}
-    assert evidence_validity(_pool(), "req-1", None) == {"ev_1": ("valid", "source_unchecked_text_only")}
+    assert evidence_validity(_pool(), "req-1", None) == {"ev_1": ("declared_unverified", "no_source_bytes_checked")}
 
 
 def test_engine_telemetry_carries_the_provenance_labels_for_a_text_only_request():

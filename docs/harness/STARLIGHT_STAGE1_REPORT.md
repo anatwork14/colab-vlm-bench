@@ -37,6 +37,8 @@ Protection follows original token positions through compaction (`compact_orig_po
 
 ## Arms
 `starlight_s1` (DA+grounding), `starlight_s1_no_da` (grounding), `starlight_s1_no_grounding` (DA).
+ITER3 Round A adds the H2O confounder control `h2o_shared_base` (the shared selection with no internal protection;
+no signals). The arm count is now 12 (seven original, four STARLIGHT, one control).
 Seven original arms unchanged. One existing assertion updated (`test_r5_h2o_arm_reports_method_variant_and_keeps_arm_ids`):
 it compared `SUPPORTED_ARMS` to exactly the seven; it now checks the seven plus exactly the three new IDs.
 Two existing STARLIGHT-adjacent assertions changed by design: verdict lists now carry a reason code

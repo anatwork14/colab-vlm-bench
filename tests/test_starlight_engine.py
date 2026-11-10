@@ -14,10 +14,16 @@ import numpy as np
 import pytest
 import torch
 
+from vlmbench.infrastructure.evidence_verification import EvidencePolicy
 from vlmbench.infrastructure.grounding_evidence import EvidenceItem, EvidencePool
 from vlmbench.infrastructure.h2o import H2OCacheTracker, H2OConfig
 from vlmbench.infrastructure.model_config import Qwen35ModelConfig
 from vlmbench.infrastructure.real_engine import RealSevenArmEngine
+
+# S1 (evidence policy): text-only fixtures with caller verified=True do not protect by default. The tests below
+# that check grounding MECHANICS opt in explicitly (accept_declared=True, reported and ablatable). The default-off
+# gate is pinned in tests/test_i3a_s1_evidence_dimensions.py.
+ACCEPT_DECLARED = EvidencePolicy(accept_declared=True)
 from vlmbench.infrastructure.starlight import (
     STATUS_INFEASIBLE,
     STATUS_OK,
@@ -29,6 +35,8 @@ SEVEN_ARMS = frozenset(("base", "h2o_base", "da_base", "ecrd_base", "mtp", "h2o_
 STARLIGHT_ARMS = frozenset((
     "starlight_s1", "starlight_s1_no_da", "starlight_s1_no_grounding", "starlight_s1_mtp",
 ))  # Stage 2(b): + starlight_s1_mtp
+# ITER3 Round A H2 confounder control (no internal protection). A control, not a STARLIGHT arm.
+H2_CONTROL_ARMS = frozenset(("h2o_shared_base",))
 SHA = hashlib.sha256(b"no-image").hexdigest()
 
 
@@ -87,7 +95,8 @@ def _step(engine, tracker, length, budget, da_spans=(), grounding=None, enabled=
 # --- arm registry -------------------------------------------------------------------------
 
 def test_supported_arms_adds_four_starlight_arms_and_keeps_the_seven():
-    assert RealSevenArmEngine.SUPPORTED_ARMS == SEVEN_ARMS | STARLIGHT_ARMS
+    # Updated in ITER3 Round A: the set now also contains the H2 control arm (expectation extended, not relaxed).
+    assert RealSevenArmEngine.SUPPORTED_ARMS == SEVEN_ARMS | STARLIGHT_ARMS | H2_CONTROL_ARMS
 
 
 def test_existing_h2o_base_has_no_starlight_telemetry():
@@ -195,13 +204,15 @@ def test_irrelevant_evidence_protection_is_measured_per_evidence_id():
     # nothing, and the rejection is REPORTED (it is measured, not hidden). The per-evidence measurement is kept
     # with a content keyword: 'car' (token 8) occurs once in this 5-token prompt, fraction 1/5 = 0.2, at the cap.
     tok = _WordTok()
-    stop = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False).execute_request(
+    stop = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False,
+                   evidence_policy=ACCEPT_DECLARED).execute_request(
         request_id="req_irr", prompt_token_ids=[7, 9, 7, 8, 7], image_present=False,
         max_new_tokens=2, evidence_pool=_pool("req_irr", ["the"], eid="ev_the"))
     s_stop = stop.telemetry["starlight"]
     assert s_stop["grounding_protected_by_evidence"] == {}
     assert s_stop["grounding_keyword_policy"]["rejected_stopword"] == ["the"]
-    content = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False).execute_request(
+    content = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False,
+                      evidence_policy=ACCEPT_DECLARED).execute_request(
         request_id="req_irr2", prompt_token_ids=[7, 9, 7, 8, 7], image_present=False,
         max_new_tokens=2, evidence_pool=_pool("req_irr2", ["car"], eid="ev_car"))
     s = content.telemetry["starlight"]
@@ -234,7 +245,7 @@ def test_multi_request_isolation_second_request_is_unaffected_by_first():
     tok = _WordTok()
     prompt = [7, 9, 7, 8, 7, 9, 8, 7, 9, 9, 8, 7]
     engine = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False, h2o_min_budget=8,
-                     h2o_budget_ratio=0.5)
+                     h2o_budget_ratio=0.5, evidence_policy=ACCEPT_DECLARED)
     # ITER3 R2 C-4 RE-DERIVED: keyword 'the' -> 'car', prompt extended to 36 tokens so car (3 of 36) is under the cap.
     prompt = prompt + list(range(100, 124))
     first = engine.execute_request(request_id="iso_a", prompt_token_ids=prompt, image_present=False,
@@ -243,7 +254,7 @@ def test_multi_request_isolation_second_request_is_unaffected_by_first():
     second = engine.execute_request(request_id="iso_b", prompt_token_ids=prompt, image_present=False,
                                     max_new_tokens=4)
     fresh = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False, h2o_min_budget=8,
-                    h2o_budget_ratio=0.5).execute_request(
+                    h2o_budget_ratio=0.5, evidence_policy=ACCEPT_DECLARED).execute_request(
         request_id="iso_b", prompt_token_ids=prompt, image_present=False, max_new_tokens=4)
     assert second.tokens_generated == fresh.tokens_generated
     assert second.telemetry["starlight"]["protected_count_by_source"] == \
@@ -255,7 +266,7 @@ def test_multi_turn_continuity_same_request_id_matches_fresh_engine():
     tok = _WordTok()
     prompt = [7, 9, 7, 8, 7, 9, 8, 7, 9, 9, 8, 7]
     engine = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False, h2o_min_budget=8,
-                     h2o_budget_ratio=0.5)
+                     h2o_budget_ratio=0.5, evidence_policy=ACCEPT_DECLARED)
     # ITER3 R2 C-4 RE-DERIVED: keyword 'the' -> 'car' and prompt extended (car 3 of 36 is under the cap).
     prompt = prompt + list(range(100, 124))
     pool = _pool("turns", ["car"])
@@ -265,7 +276,7 @@ def test_multi_turn_continuity_same_request_id_matches_fresh_engine():
     turn2 = engine.execute_request(request_id="turns", prompt_token_ids=prompt, image_present=False,
                                    max_new_tokens=3, evidence_pool=pool)
     fresh = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False, h2o_min_budget=8,
-                    h2o_budget_ratio=0.5).execute_request(
+                    h2o_budget_ratio=0.5, evidence_policy=ACCEPT_DECLARED).execute_request(
         request_id="turns", prompt_token_ids=prompt, image_present=False, max_new_tokens=3,
         evidence_pool=pool)
     assert turn2.tokens_generated == fresh.tokens_generated == turn1.tokens_generated
@@ -279,10 +290,10 @@ def test_ablation_no_da_removes_only_the_da_signal_and_does_not_enable_da_maskin
         prompt[i] = 8
     pool = _pool("abl", ["car"])
     full = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False, h2o_min_budget=16,
-                   h2o_budget_ratio=0.2).execute_request(
+                   h2o_budget_ratio=0.2, evidence_policy=ACCEPT_DECLARED).execute_request(
         request_id="abl", prompt_token_ids=prompt, image_present=False, max_new_tokens=4, evidence_pool=pool)
     no_da = _engine("starlight_s1_no_da", tokenizer=tok, stop_at_eos=False, h2o_min_budget=16,
-                    h2o_budget_ratio=0.2).execute_request(
+                    h2o_budget_ratio=0.2, evidence_policy=ACCEPT_DECLARED).execute_request(
         request_id="abl", prompt_token_ids=prompt, image_present=False, max_new_tokens=4, evidence_pool=pool)
     assert no_da.telemetry["starlight"]["signals_enabled"] == ["grounding", "structural"]
     assert no_da.telemetry["starlight"]["protected_count_by_source"]["da"] == 0

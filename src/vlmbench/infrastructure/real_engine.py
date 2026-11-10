@@ -52,11 +52,13 @@ from .h2o import H2OConfig, H2OCacheTracker, H2OMTPTransaction
 from .declarative_attention import DAConfig, DAFSM, DAMaskGenerator, DATag, DATagType
 from .grounding_evidence import ECRDConfig, EvidencePool, EvidenceItem, ECRDLogitsProcessor
 from .starlight import (
-    STATUS_INFEASIBLE, StarlightLayerPlan, combine_summaries, compact_orig_positions,
+    DEFAULT_GROUNDING_CAP_POLICY, FIXED_BUDGET_NOT_APPLICABLE, GroundingCapPolicy,
+    RETENTION_AT_INFEASIBLE_STEPS, RETENTION_BUDGET_BOUNDED, STATUS_INFEASIBLE, StarlightLayerPlan, combine_summaries, compact_orig_positions,
     VISUAL_EVIDENCE_NOTE, da_protection_from_spans, evidence_provenance, evidence_validity,
-    grounding_protection_with_report, visual_evidence_protection_status,
-    plan_starlight_layer, summarize_plans,
+    evidence_assessments, fixed_budget_verdict, grounding_protection_with_report,
+    visual_evidence_protection_status, plan_starlight_layer, summarize_plans,
 )
+from .evidence_verification import EvidencePolicy
 from .adapters import HardwareGateError, check_vllm_hardware_compatibility
 
 
@@ -1020,6 +1022,9 @@ STARLIGHT_ARM_SIGNALS: dict[str, tuple[str, ...]] = {
     "starlight_s1_no_da": ("grounding", "structural"),
     "starlight_s1_no_grounding": ("da", "structural"),
     "starlight_s1_mtp": ("da", "grounding", "structural"),
+    # ITER3 Round A H2 confounder control: the same shared selection as STARLIGHT with NO internal protection.
+    # An empty tuple is a real arm (not "no arm"): the controller runs with zero signals.
+    "h2o_shared_base": (),
 }
 STARLIGHT_MEASUREMENT_LABEL = "cpu_pytorch_reference_not_vllm"
 # Arms that run the DA attention mask. Exact membership, never a substring test: the name
@@ -1031,6 +1036,9 @@ EVIDENCE_REASON_CODES: dict[str, str] = {
     "expired": "EXPIRED_EVIDENCE",
     "stale": "STALE_DECLARATION",
     "unverified": "UNVERIFIED_EVIDENCE",
+    # ITER3 R3 S1: text-only evidence is declared, not checked; uncertain means the image could not be hashed.
+    "declared_unverified": "DECLARED_UNVERIFIED_EVIDENCE",
+    "uncertain": "UNCERTAIN_EVIDENCE_SOURCE",
 }
 GDN_EXEMPT_LABEL = "GDN_EXEMPT_NOT_TOKEN_ADDRESSABLE"
 # Lead decision Q2: vision_start/vision_end are protected as an explicit structural source.
@@ -1173,6 +1181,7 @@ class RealSevenArmEngine:
         "starlight_s1_no_da",
         "starlight_s1_no_grounding",
         "starlight_s1_mtp",
+        "h2o_shared_base",
     ))
 
     def __init__(
@@ -1189,6 +1198,8 @@ class RealSevenArmEngine:
         checkpoint_dir: str | Path | None = None,
         starlight_record_decisions: bool = False,
         dtype_override: str | None = None,
+        evidence_policy: EvidencePolicy | None = None,
+        grounding_cap_policy: GroundingCapPolicy | None = None,
     ):
         if method_arm not in self.SUPPORTED_ARMS:
             raise ValueError(f"Unknown method arm: {method_arm}")
@@ -1249,6 +1260,10 @@ class RealSevenArmEngine:
         self.starlight_signals: tuple[str, ...] | None = STARLIGHT_ARM_SIGNALS.get(method_arm)
         # Opt-in per-entry decision records (auditor oracle I-10). Off by default: records are large.
         self.starlight_record_decisions = bool(starlight_record_decisions)
+        # ITER3 R3 S1: explicit evidence policy. Default accept_declared=False (declared text-only evidence does not protect).
+        self.evidence_policy = evidence_policy or EvidencePolicy()
+        # ITER3 Round A S4: versioned caps and stopwords; the version id is reported in telemetry.
+        self.grounding_cap_policy = grounding_cap_policy or DEFAULT_GROUNDING_CAP_POLICY
         self.da_fsm = DAFSM() if method_arm in DA_MASKING_ARMS else None
         self.da_mask_gen = DAMaskGenerator() if method_arm in DA_MASKING_ARMS else None
         self.ecrd_processors: dict[str, ECRDLogitsProcessor] = {}
@@ -1806,7 +1821,7 @@ class RealSevenArmEngine:
         full = tuple(self.config.full_attention_layers)
         if kind == "h2o":
             return _PolicyState(kind=kind, cache=cache, tracker=tracker, full_layers=full)
-        if not self.starlight_signals:
+        if self.starlight_signals is None:  # an empty signal set is a valid control arm (h2o_shared_base)
             raise ValueError("kind 'starlight' requires a starlight arm")
         budget_total = max(self.h2o_config.min_budget, int(prompt_len * self.h2o_config.budget_ratio))
         orig = {l: np.arange(prompt_len, dtype=np.int64) for l in full}
@@ -2386,7 +2401,14 @@ class RealSevenArmEngine:
         starlight_grounding_status = "NOT_STARTED" if "grounding" in starlight_enabled else "DISABLED_ABLATION"
         starlight_verdicts: dict[str, list[str]] = {}
         starlight_provenance: dict[str, dict[str, str]] = {}
-        starlight_keyword_report: dict[str, Any] = {}
+        # ITER3 Round A S4: the cap policy is traceable on EVERY starlight run, even when grounding does not run.
+        starlight_keyword_report: dict[str, Any] = {
+            "cap_policy_version": self.grounding_cap_policy.cap_policy_version,
+            "cap_policy": self.grounding_cap_policy.as_dict(),
+            "grounding_computed": False,
+            "reason": "NO_KEYWORD_MATCHING_THIS_REQUEST",
+        }
+        starlight_assessments: dict[str, dict[str, Any]] = {}
         starlight_summaries: list[dict[str, Any]] = []
         starlight_max_retained = 0
         starlight_text_fraction: float | None = None
@@ -2432,9 +2454,13 @@ class RealSevenArmEngine:
                 if evidence_pool is None:
                     starlight_grounding_status = "NO_EVIDENCE_DECLARED"
                 else:
+                    starlight_assessments = evidence_assessments(
+                        evidence_pool, request_id, image_sha, image_present=bool(image_present),
+                        policy=self.evidence_policy,
+                    )
                     starlight_verdicts = {
-                        eid: [status, reason, EVIDENCE_REASON_CODES[status]] for eid, (status, reason) in
-                        evidence_validity(evidence_pool, request_id, image_sha).items()
+                        eid: [a["status"], a["status_reason"], EVIDENCE_REASON_CODES[a["status"]]]
+                        for eid, a in starlight_assessments.items()
                     }
                     starlight_provenance = evidence_provenance(evidence_pool, image_sha)
                     if self.tokenizer is None:
@@ -2444,6 +2470,8 @@ class RealSevenArmEngine:
                     else:
                         starlight_grounding, starlight_keyword_report = grounding_protection_with_report(
                             evidence_pool, full_prompt, self.tokenizer.encode, request_id, image_sha,
+                            self.evidence_policy, image_present=bool(image_present),
+                            cap_policy=self.grounding_cap_policy,
                         )
                         starlight_grounding_status = "ACTIVE"
         tokens_generated: list[int] = []
@@ -2843,6 +2871,10 @@ class RealSevenArmEngine:
                     "peak_cuda_allocated_saving_bytes": None,
                     "peak_cuda_reserved_saving_bytes": None,
                     "device_hbm_reduction_measured": False,
+                    # ITER3 Round A S3: a non-STARLIGHT arm makes no fixed-budget claim. Set on STARLIGHT arms below.
+                    "fixed_budget_status": FIXED_BUDGET_NOT_APPLICABLE,
+                    "kv_retention_status": None,
+                    "max_retained_over_budget_per_layer_step": None,
                     "warning": "Each decode step's index_select size delta is added. The total is NOT a peak or allocated/reserved VRAM delta, and may count repeated reductions.",
                 },
                 "h2o_logical_selection_accounting": {
@@ -2969,13 +3001,28 @@ class RealSevenArmEngine:
             for labels in starlight_grounding.values():
                 for eid in labels:
                     grounding_by_evidence[eid] = grounding_by_evidence.get(eid, 0) + 1
+            # ITER3 Round A S3: run-level verdict. An INFEASIBLE step (or any retention above budget) is NOT a
+            # successful fixed-budget run, and the memory report must say so instead of implying a budget.
+            fixed_verdict = fixed_budget_verdict(
+                summary, budget_total=starlight_budget, max_retained_per_layer=starlight_max_retained,
+            )
+            result.telemetry["kv_memory_accounting"].update({
+                "fixed_budget_status": fixed_verdict["status"],
+                "kv_retention_status": (
+                    RETENTION_BUDGET_BOUNDED if fixed_verdict["fixed_budget_run"] else RETENTION_AT_INFEASIBLE_STEPS
+                ),
+                "max_retained_over_budget_per_layer_step": fixed_verdict["max_retained_over_budget"],
+            })
             result.telemetry["h2o_logical_selection_accounting"] = {
                 "method_variant": "NOT_APPLICABLE_STARLIGHT_ARM",
                 "note": "STARLIGHT arms report telemetry['starlight']; H2O budget fields are not used.",
             }
             result.telemetry["starlight"] = {
                 "measurement_label": STARLIGHT_MEASUREMENT_LABEL,
-                "method_variant": f"starlight_stage1::{'+'.join(starlight_enabled)}",
+                "method_variant": (
+                    f"starlight_stage1::{'+'.join(starlight_enabled)}" if starlight_enabled
+                    else "shared_h2o_control::no_internal_protection"
+                ),
                 "method_variant_is_upstream_h2o": False,
                 "signals_enabled": list(starlight_enabled),
                 "da_signal": (
@@ -2987,6 +3034,9 @@ class RealSevenArmEngine:
                 "grounding_evidence_verdicts": starlight_verdicts,
                 # ITER3 R2 C-3: `verified` is a caller declaration; source hash is checked only vs image bytes.
                 "grounding_evidence_provenance": starlight_provenance,
+                # ITER3 R3 S1: tri-state dimensions, method and protection decision per evidence item.
+                "grounding_evidence_assessments": starlight_assessments,
+                "evidence_policy": self.evidence_policy.as_dict(),
                 # ITER3 R2 C-5: image evidence protects no visual tokens. Stated, never silent.
                 # ITER3 R2 C-4: keyword breadth policy and what it rejected (never silent).
                 "grounding_keyword_policy": starlight_keyword_report,
@@ -3012,6 +3062,10 @@ class RealSevenArmEngine:
                 "kv_budget_violated": summary["kv_budget_violated_layers"] > 0,
                 "kv_budget_violated_layers": summary["kv_budget_violated_layers"],
                 "infeasible_steps": summary["status_counts"].get(STATUS_INFEASIBLE, 0),
+                # ITER3 Round A S3: NOT a successful fixed-budget run when any step is infeasible or over budget.
+                "fixed_budget_run": fixed_verdict["fixed_budget_run"],
+                "fixed_budget_status": fixed_verdict["status"],
+                "fixed_budget_verdict": fixed_verdict,
                 "evicted_total": summary["evicted_total"],
                 "retained_total": summary["retained_total"],
                 "max_retained_per_layer_step": starlight_max_retained,
