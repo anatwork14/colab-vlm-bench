@@ -39,6 +39,9 @@ class _CallableFalse(int):
         return False
 
 
+KNOWN_MODALITIES = frozenset({"image_region", "text_span", "table_cell"})
+
+
 @dataclass(frozen=True)
 class EvidenceItem:
     """A verified factual / visual evidence item with cryptographic provenance."""
@@ -81,6 +84,11 @@ class EvidencePool:
 
         Enforces provenance, verification, and gold-answer protection.
         """
+        if item.modality not in KNOWN_MODALITIES:
+            # ITER3 R2 round-2 (C-5): the visual-evidence status keys on the exact label; an unknown label
+            # would silently report 'no image evidence' while image evidence was declared.
+            raise ValueError(f"Evidence item '{item.evidence_id}' rejected: unknown modality "
+                             f"{item.modality!r}; expected one of {sorted(KNOWN_MODALITIES)}.")
         if not item.verified:
             raise ValueError(f"Evidence item '{item.evidence_id}' rejected: verified=False.")
         if not item.gold_answer_prohibited:
