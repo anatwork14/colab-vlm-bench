@@ -54,10 +54,12 @@ from .grounding_evidence import ECRDConfig, EvidencePool, EvidenceItem, ECRDLogi
 from .starlight import (
     DEFAULT_GROUNDING_CAP_POLICY, FIXED_BUDGET_NOT_APPLICABLE, GroundingCapPolicy,
     RETENTION_AT_INFEASIBLE_STEPS, RETENTION_BUDGET_BOUNDED, STATUS_INFEASIBLE, StarlightLayerPlan, combine_summaries, compact_orig_positions,
-    VISUAL_EVIDENCE_NOTE, da_protection_from_spans, evidence_provenance, evidence_validity,
+    da_protection_from_spans, evidence_provenance, evidence_validity,
     evidence_assessments, fixed_budget_verdict, grounding_protection_with_report,
-    visual_evidence_protection_status, plan_starlight_layer, summarize_plans,
+    plan_starlight_layer, summarize_plans,
 )
+from .visual_mapping import VISUAL_EVIDENCE_NOTE, visual_evidence_report, visual_geometry_inputs
+from .speculative_route import speculative_route
 from .evidence_verification import EvidencePolicy
 from .adapters import HardwareGateError, check_vllm_hardware_compatibility
 
@@ -1098,6 +1100,8 @@ class _PolicyState:
     budget_total: int = 0
     enabled: tuple[str, ...] = ()
     da_spans: tuple[tuple[str, int, int], ...] = ()  # scripted DA spans, fixed at the prefill
+    # ITER3 Round B S2: grounding protection keyed by ORIGINAL prompt position (fixed at the prefill). Empty = none.
+    grounding: dict[int, tuple[str, ...]] | None = None
 
 
 def _retained_entries_summary(samples: Sequence[int], *, unit: str, n_layers: int) -> dict[str, Any]:
@@ -1451,6 +1455,9 @@ class RealSevenArmEngine:
             "invoked": True,
             "image_path": resolved_path,
             "image_sha256": img_sha256,
+            # ITER3 Round B S2: source size of the decoded image (the resize input for the visual geometry).
+            "source_height": int(img.height),
+            "source_width": int(img.width),
             "pixel_values_shape": list(pixel_values.shape),
             "image_grid_thw": image_grid_thw.detach().cpu().tolist(),
             "visual_token_embeddings_count": num_vis_tokens,
@@ -1600,22 +1607,41 @@ class RealSevenArmEngine:
 
     MTP_TEXT_SPECULATION_GATE = "CPU_REFERENCE_SPECULATION_EXECUTED_NOT_VLLM"
 
-    def _policy_text_speculation_route(self, image_present: bool, evidence_pool: Any) -> bool:
+    def _policy_text_speculation_route(self, image_present: bool) -> bool:
+        # ITER3 Round B S2: evidence does NOT decide the route. It decides protection (see the execution method).
+        # Image prompts are UNSUPPORTED on this path (speculative_route), so they never take it.
         return (
             self.method_arm in ("h2o_mtp", "starlight_s1_mtp")
             and self._speculation_enabled
             and self.is_official_hf_hooked
             and not image_present
-            and evidence_pool is None
             and getattr(self.model, "mtp_module", None) is not None
         )
 
+    def _speculative_route_telemetry(self, image_present: bool) -> dict[str, Any]:
+        """ITER3 Round B S2: the labelled speculative route for this request (status and reason)."""
+        status, reason = speculative_route(
+            self.method_arm, image_present=bool(image_present), speculation_enabled=self._speculation_enabled,
+            official=self.is_official_hf_hooked, mtp_present=getattr(self.model, "mtp_module", None) is not None,
+        )
+        return {"status": status, "reason": reason}
+
     def _execute_policy_mtp_speculative_text(
         self, *, request_id: str, full_prompt: list[int], max_new_tokens: int, t0: float,
-        arch_status: str, gates: dict[str, str],
+        arch_status: str, gates: dict[str, str], evidence_pool: Any = None,
     ) -> "RealExecutionResult":
         kind = "h2o" if self.method_arm == "h2o_mtp" else "starlight"
-        spec = self._speculative_policy_mtp_greedy(kind, full_prompt, max_new_tokens, t0=t0)
+        # ITER3 Round B S2: STARLIGHT text-only evidence protects keyword spans on this path too. A text-only item
+        # has no source bytes to hash, so it protects only under the explicit accept_declared policy (reported).
+        grounding: dict[int, tuple[str, ...]] = {}
+        grounding_report: dict[str, Any] | None = None
+        if kind == "starlight" and evidence_pool is not None and self.tokenizer is not None:
+            grounding, grounding_report = grounding_protection_with_report(
+                evidence_pool, full_prompt, self.tokenizer.encode, request_id, None, self.evidence_policy,
+                image_present=False, cap_policy=self.grounding_cap_policy,
+            )
+        spec = self._speculative_policy_mtp_greedy(
+            kind, full_prompt, max_new_tokens, t0=t0, grounding=grounding)
         tokens = list(spec["tokens"])
         total_ms = (time.perf_counter() - t0) * 1000.0
         ttft_ms = spec["first_commit_ms"] if spec["first_commit_ms"] is not None else total_ms
@@ -1657,6 +1683,7 @@ class RealSevenArmEngine:
                 "is_official_hf_hooked": self.is_official_hf_hooked,
                 "measurement_label": "cpu_pytorch_reference_not_vllm",
                 "speculation_executed": True,
+                "speculative_route": self._speculative_route_telemetry(False),
                 "arm_label": f"{self.method_arm}_cpu_policy_speculative_reference_text_only_not_vllm",
                 "speculation": {
                     "label": spec["label"],
@@ -1670,7 +1697,24 @@ class RealSevenArmEngine:
                     "stop_reason": spec["stop_reason"],
                     "acceptance_rate": spec["acceptance_rate"],
                     "speed_claim": None,
+                    # ITER3 Round B S2: protection under speculation (original positions, final retention).
+                    "evidence_protection": spec["evidence_protection"],
+                    "grounding_protected_positions": spec["grounding_protected_positions"],
+                    "grounding_protected_retained_final_by_layer": spec["grounding_protected_retained_final_by_layer"],
                 },
+                # ITER3 Round B S2: the S1 assessments and keyword policy of the evidence used on this path (if any).
+                **({
+                    "starlight": {
+                        "grounding_evidence_assessments": grounding_report["assessments"],
+                        "grounding_keyword_policy": {
+                            k: grounding_report[k] for k in (
+                                "accepted_keywords", "rejected_stopword", "rejected_breadth", "rejected_union",
+                                "omitted_positions_total", "preservation_claim",
+                            )
+                        },
+                        "evidence_policy": self.evidence_policy.as_dict(),
+                    }
+                } if grounding_report is not None else {}),
                 "policy": {
                     "kind": kind,
                     "budget_total": spec["budget_total"] if starlight else None,
@@ -1805,8 +1849,12 @@ class RealSevenArmEngine:
             },
         )
 
-    def _pol_new_state(self, kind: str, prompt_len: int) -> "_PolicyState":
-        """Fresh policy state for one request, built the way the normal decode loop builds it."""
+    def _pol_new_state(self, kind: str, prompt_len: int, grounding: dict | None = None) -> "_PolicyState":
+        """Fresh policy state for one request, built the way the normal decode loop builds it.
+
+        `grounding` (STARLIGHT only) maps ORIGINAL prompt positions to the evidence labels that protect them. H2O
+        has no grounding signal, so its state never carries one.
+        """
         if kind not in ("h2o", "starlight"):
             raise ValueError("kind must be 'h2o' or 'starlight'")
         from transformers.models.qwen3_5 import modeling_qwen3_5
@@ -1844,6 +1892,7 @@ class RealSevenArmEngine:
         return _PolicyState(
             kind=kind, cache=cache, tracker=tracker, full_layers=full, P=0, orig=orig,
             budget_total=budget_total, enabled=enabled, da_spans=tuple(da_spans),
+            grounding={int(p): tuple(labels) for p, labels in (grounding or {}).items()},
         )
 
     def _pol_phys(self, st: "_PolicyState", l_idx: int) -> int:
@@ -1880,7 +1929,7 @@ class RealSevenArmEngine:
             return plans, None
         plans_t, next_orig, _steps = self._starlight_build_step_plans(
             st.tracker, {l: int(k_lens[l]) for l in st.full_layers}, st.orig, row_pos, st.budget_total,
-            list(st.da_spans), {}, st.enabled, structural=None,
+            list(st.da_spans), st.grounding or {}, st.enabled, structural=None,
         )
         plans = {l: plans_t[l].cpu().numpy().astype(np.int64) for l in st.full_layers}
         return plans, next_orig
@@ -2001,8 +2050,11 @@ class RealSevenArmEngine:
         draft_override: Any = None,
         record_trace: bool = False,
         t0: float | None = None,
+        grounding: dict | None = None,
     ) -> dict[str, Any]:
         """Verifier-backed CPU speculation with policy state (H2O tracker or STARLIGHT controller).
+
+        `grounding` (STARLIGHT only): original prompt position -> evidence labels that protect it (ITER3 Round B S2).
 
         Each committed token is fed exactly once; drafts are verified by a 2-row block ONLY on
         eviction-free steps. Otherwise the pending token is fed alone and counted as fallback_steps.
@@ -2020,7 +2072,7 @@ class RealSevenArmEngine:
         stops: set[int] = set(self.eos_token_ids) if self.stop_at_eos else set()
         t_start = time.perf_counter() if t0 is None else t0
         first_commit_ms: float | None = None
-        st = self._pol_new_state(kind, len(ids))
+        st = self._pol_new_state(kind, len(ids), grounding=grounding if kind == "starlight" else None)
         trace: list[dict[str, Any]] = []
         samples: list[int] = []
         counters = {"proposed": 0, "accepted": 0, "rejected": 0, "verifier_calls": 0, "fallback_steps": 0}
@@ -2117,6 +2169,19 @@ class RealSevenArmEngine:
             "retained_samples": samples,
             "trace": trace if record_trace else None,
             "speed_claim": None,
+            # ITER3 Round B S2: protection under speculation. Original positions, retained at the end of the request.
+            "grounding_protected_positions": len(st.grounding or {}),
+            "evidence_protection": (
+                "NOT_APPLICABLE_H2O_ARM" if kind == "h2o"
+                else ("PROTECTING" if st.grounding else "NO_PROTECTED_SPANS")
+            ),
+            "grounding_protected_retained_final_by_layer": (
+                {
+                    str(l_idx): len(set(st.grounding) & set(np.asarray(st.orig[l_idx]).tolist()))
+                    for l_idx in st.full_layers
+                }
+                if st.grounding else {}
+            ),
         }
 
     def _starlight_build_step_plans(
@@ -2355,10 +2420,10 @@ class RealSevenArmEngine:
             )
         # ITER2 Stage 2(b): h2o_mtp / starlight_s1_mtp on text-only official requests run policy-state
         # speculation (eviction-free blocks only). Image or evidence-pool requests keep the diagnostic path.
-        if self._policy_text_speculation_route(image_present, evidence_pool):
+        if self._policy_text_speculation_route(image_present):
             return self._execute_policy_mtp_speculative_text(
                 request_id=request_id, full_prompt=full_prompt, max_new_tokens=max_new_tokens,
-                t0=t0, arch_status=arch_status, gates=gates,
+                t0=t0, arch_status=arch_status, gates=gates, evidence_pool=evidence_pool,
             )
 
         starlight_active = self.starlight_signals is not None
@@ -2419,6 +2484,12 @@ class RealSevenArmEngine:
         starlight_structural_labels: dict[int, tuple[str, ...]] = {}
         starlight_structural_evicted = 0
         starlight_cache_mismatch_steps = 0
+        # ITER3 Round B S2: visual evidence status for this request (replaced by the grounding branch below).
+        starlight_visual: dict[str, Any] = {
+            "status": "DISABLED_ABLATION", "unsupported_reason": None, "items": {},
+            "visual_positions_protected": 0, "visual_protected_positions": [], "geometry": None, "span": None,
+            "note": VISUAL_EVIDENCE_NOTE,
+        }
         if starlight_active:
             # Total budget per full-attention layer, fixed from the prefill length (as H2O does).
             starlight_budget = max(self.h2o_config.min_budget, int(len(full_prompt) * self.h2o_config.budget_ratio))
@@ -2451,6 +2522,16 @@ class RealSevenArmEngine:
                     starlight_da_spans.append((label, tag.start_idx, tag.end_idx))
             if "grounding" in starlight_enabled:
                 image_sha = _image_sha256(image_bytes, image_path) if image_present else None
+                # ITER3 Round B S2: geometry from the real processor (grid_thw, patch/merge, pixel bounds) and the
+                # single image token run in the prompt. Any missing piece is UNSUPPORTED with a reason, never a guess.
+                vis_geom, vis_geom_reason, vis_span, vis_span_reason = visual_geometry_inputs(
+                    self.processor.image_processor if self.processor is not None else None, vis_trace, full_prompt,
+                    image_token_id=self.config.image_token_id,
+                )
+                starlight_visual = visual_evidence_report(
+                    evidence_pool, request_id=request_id, image_sha256=image_sha, image_present=bool(image_present),
+                    geometry=vis_geom, geometry_reason=vis_geom_reason, span=vis_span, span_reason=vis_span_reason,
+                )
                 if evidence_pool is None:
                     starlight_grounding_status = "NO_EVIDENCE_DECLARED"
                 else:
@@ -2474,6 +2555,11 @@ class RealSevenArmEngine:
                             cap_policy=self.grounding_cap_policy,
                         )
                         starlight_grounding_status = "ACTIVE"
+                # ITER3 Round B S2: S1-gated, mapping-supported visual positions join the grounding protection, keyed
+                # by ORIGINAL prompt position (the planner follows each token through compaction). They are a separate
+                # channel: the keyword caps do not count them.
+                for vis_pos, vis_ids in starlight_visual["positions"].items():
+                    starlight_grounding[vis_pos] = tuple(sorted(set(starlight_grounding.get(vis_pos, ())) | set(vis_ids)))
         tokens_generated: list[int] = []
         step_latencies: list[float] = []
         ttft_ms = 0.0
@@ -2841,6 +2927,8 @@ class RealSevenArmEngine:
                 ),
                 # R5-5: serving-style arms never speculate. The verifier-backed reference is a separate helper.
                 "speculation_executed": False,
+                # ITER3 Round B S2: the labelled route for this request (image prompts are UNSUPPORTED here).
+                "speculative_route": self._speculative_route_telemetry(image_present),
                 "arm_label": (
                     "mtp_serving_arm_diagnostic_no_speculation" if "mtp" in self.method_arm
                     else "non_speculative_arm"
@@ -3040,7 +3128,27 @@ class RealSevenArmEngine:
                 # ITER3 R2 C-5: image evidence protects no visual tokens. Stated, never silent.
                 # ITER3 R2 C-4: keyword breadth policy and what it rejected (never silent).
                 "grounding_keyword_policy": starlight_keyword_report,
-                "visual_evidence_protection": visual_evidence_protection_status(evidence_pool),
+                # ITER3 Round B S2: SUPPORTED (mapping established) or UNSUPPORTED with a reason. Protection is per
+                # item (S1 + location + mapping). Preserving a visual span does NOT prove the model used it.
+                "visual_evidence_protection": starlight_visual["status"],
+                "visual_evidence_protection_reason": starlight_visual["unsupported_reason"],
+                "visual_evidence_items": starlight_visual["items"],
+                "visual_positions_protected": starlight_visual["visual_positions_protected"],
+                "visual_protected_positions": starlight_visual["visual_protected_positions"],
+                "visual_geometry": starlight_visual["geometry"],
+                "visual_span": starlight_visual["span"],
+                # Protected visual positions still present in each full-attention layer at the END of the request
+                # (original positions tracked through compaction). Empty when nothing is protected.
+                "visual_protected_retained_final_by_layer": (
+                    {
+                        str(l_idx): len(
+                            set(starlight_visual["visual_protected_positions"])
+                            & set(np.asarray(starlight_orig[l_idx]).tolist())
+                        )
+                        for l_idx in self.config.full_attention_layers
+                    }
+                    if starlight_visual["visual_protected_positions"] else {}
+                ),
                 "visual_evidence_protection_note": VISUAL_EVIDENCE_NOTE,
                 "grounding_protected_by_evidence": grounding_by_evidence,
                 "candidate_basis": (

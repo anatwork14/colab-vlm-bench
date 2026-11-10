@@ -34,11 +34,19 @@ Facts checked in this round:
   `RealExecutionResult` with `tokens_generated`, `physical_kv_bytes_allocated`, `physical_kv_bytes_freed`
   (semantics in `MEMORY_FIELD_SCOPES`, `real_engine.py`), `mtp_acceptance_rate`, `gates`, `telemetry`.
 - Route predicates decide which path runs (these are the only places speculation is enabled):
-  - `_mtp_text_speculation_route` (`real_engine.py:1690`): `mtp`, official, text-only, MTP head present.
-  - `_policy_text_speculation_route` (`real_engine.py:1587`): `h2o_mtp` or `starlight_s1_mtp`, official,
-    text-only, **no evidence pool**, MTP head present, and `_speculation_enabled`.
-  - Every other request uses the diagnostic/normal path. The telemetry field `arm_label` then reads
-    `mtp_serving_arm_diagnostic_no_speculation` for the MTP arms, and `speculation_executed` is False.
+  - `_mtp_text_speculation_route`: `mtp`, official, text-only, MTP head present.
+  - `_policy_text_speculation_route`: `h2o_mtp` or `starlight_s1_mtp`, official, text-only, MTP head present,
+    and `_speculation_enabled`. **ITER3 Round B (S2):** evidence no longer changes the route. Evidence changes
+    protection: text-only evidence protects keyword spans on this path only under `accept_declared` (see §3 notes).
+  - The labelled status of every request is `speculative_route` (`speculative_route.py`, telemetry
+    `speculative_route.status` and `reason`). Statuses: `POLICY_EVICTION_FREE_TEXT`, `MTP_VERIFIER_TEXT`,
+    `UNSUPPORTED_IMAGE_PROMPT` (a combined or serving MTP arm with an image; **not supported on the speculative
+    path**), `NOT_SPECULATIVE_DA_MTP` (`da_mtp` is explicitly non-speculative), `NOT_APPLICABLE_METHOD`,
+    `SPECULATION_DISABLED`, `UNSUPPORTED_NOT_OFFICIAL_CHECKPOINT`, `UNSUPPORTED_NO_MTP_MODULE`.
+  - Every request that does not take a speculative route uses the diagnostic/normal path. The telemetry field
+    `arm_label` then reads `mtp_serving_arm_diagnostic_no_speculation` for the MTP arms, and `speculation_executed`
+    is False.
+  - The MTP text paths are CPU verifier references (`cpu_pytorch_reference_not_vllm`). They are not native vLLM MTP.
 - Plan contract for physical compaction: a plan is a sorted, unique array of physical indices over the
   current KV length **including** the row being decoded (`compact_orig_positions`, `starlight.py:393`).
 - Policy state (`_PolicyState`, `real_engine.py:1080`): cache, tracker, full-attention layers, `P`
@@ -58,14 +66,14 @@ backend ports) has not been met. No row claims speed.
 | h2o_base | supported (eviction via `h2o_eviction_plans`) | supported (compaction; RoPE keys bit-identical at layer 3; logits match masked reference, max diff 8.1e-6) | none | `h2o_logical_selection_accounting`, `kv_memory_accounting` | BLOCKED; GPU probe piecewise, no receipt | `test_iter3_b1_official_oracle.py` |
 | da_base | supported (DA `da_masks`, logical masking only) | supported as masking; `kv_residency_preserved_ratio` = 1.0 (no KV saving claimed) | none | `da_cost_accounting` | BLOCKED; not qualified (scripted DA geometry, `original_paper_protocol_qualified` False) | `test_starlight_oracle.py` (A_MASK) |
 | ecrd_base | supported as logits reweighting (`ECRDLogitsProcessor`, normal path) | supported on the normal path; **not KV** | none | `ecrd_reweight` | BLOCKED; not qualified (no verified backend port) | `test_real_engine.py`, `test_seven_methods.py` (ECRD) |
-| mtp | diagnostic only (no MTP head) | **verifier-backed k=1 speculation** on text-only requests, label `cpu_greedy_k1_reference_not_vllm_mtp`; image or evidence requests use the diagnostic path | yes (text-only) | `speculation` block (`proposed`, `accepted`, `rejected`, `verifier_calls`), `memory_field_scopes` | BLOCKED | `test_mtp_speculative_serving.py`, `test_mtp_speculative_official.py` |
-| h2o_mtp | diagnostic: H2O active, speculation **not** executed (`arm_label` says so) | policy-state speculation on text-only, no-evidence requests (eviction-free 2-row blocks only; rejects roll back KV, GDN and tracker); otherwise H2O stays active on the diagnostic path | yes (text-only, no evidence) | `policy` block (`kind`, `budget_total`), `speculation`, `memory_field_scopes` | BLOCKED | `test_policy_mtp_speculative.py`, `test_iter3_b2_*`, `test_iter3_b1_policy_invariants.py` |
-| da_mtp | DA masks active, speculation **not** executed | never speculative (no route); DA accounting reported | none | `da_cost_accounting`, `arm_label` | BLOCKED | `test_iter3_b1_policy_invariants.py` |
+| mtp | diagnostic only (no MTP head) | **verifier-backed k=1 speculation** on text-only requests, label `cpu_greedy_k1_reference_not_vllm_mtp`; image requests are `UNSUPPORTED_IMAGE_PROMPT` on this path and use the diagnostic path | yes (text-only) | `speculation` block (`proposed`, `accepted`, `rejected`, `verifier_calls`), `speculative_route`, `memory_field_scopes` | BLOCKED | `test_mtp_speculative_serving.py`, `test_mtp_speculative_official.py`, `test_i3b_s2_speculative_route.py` |
+| h2o_mtp | diagnostic: H2O active, speculation **not** executed (`arm_label` says so) | policy-state speculation on text-only requests, with or without evidence (eviction-free 2-row blocks only; rejects roll back KV, GDN, tracker and the position map); evidence is `NOT_APPLICABLE_H2O_ARM` (no grounding signal); image requests are `UNSUPPORTED_IMAGE_PROMPT` and stay on the diagnostic path | yes (text-only) | `policy` block (`kind`, `budget_total`), `speculation` (`evidence_protection`, `grounding_protected_positions`), `speculative_route`, `memory_field_scopes` | BLOCKED | `test_policy_mtp_speculative.py`, `test_iter3_b2_*`, `test_iter3_b1_policy_invariants.py`, `test_i3b_s2_combined_speculation.py`, `test_i3b_s2_speculative_route.py` |
+| da_mtp | DA masks active, speculation **not** executed | **explicitly non-speculative** (`NOT_SPECULATIVE_DA_MTP`, text and image): no route, no 2-row DA mask path; DA accounting reported | none | `da_cost_accounting`, `arm_label`, `speculative_route` | BLOCKED | `test_iter3_b1_policy_invariants.py`, `test_i3b_s2_combined_speculation.py` |
 | starlight_s1 | supported (decision records per step and layer) | supported; F-1 closed in ITER3 R2 (one shared retained set across full-attention layers; labelled deviation from per-layer H2O) | none | `starlight` block, `decision_records`, invariant counters | BLOCKED | `test_starlight_*.py`, `test_iter3_b1_*.py` |
 | starlight_s1_no_da | supported (DA signal removed, grounding kept) | as starlight_s1 | none | as starlight_s1 | BLOCKED | `test_starlight_engine.py`, `test_starlight_policy.py` (ablation) |
 | starlight_s1_no_grounding | supported (grounding signal removed, DA kept) | as starlight_s1 | none | as starlight_s1 | BLOCKED | `test_starlight_engine.py`, `test_starlight_policy.py` (ablation) |
 | h2o_shared_base | supported (H2O confounder control: the STARLIGHT shared selection with zero signals, so no internal protection; one labelled deviation from per-layer H2O, as for STARLIGHT) | as starlight_s1 with `signals_enabled` = [] | none | `starlight` block (`method_variant` = `shared_h2o_control::no_internal_protection`), `kv_memory_accounting`, `retained_entries_per_layer` | BLOCKED | `test_i3a_h2_shared_base.py` |
-| starlight_s1_mtp | diagnostic | policy-state speculation on text-only, no-evidence requests; `degraded_to_h2o_plus_da` when declarations are missing (explicit, not silent) | yes (text-only, no evidence) | `starlight` block, `policy`, `speculation` | BLOCKED | `test_policy_mtp_speculative.py`, `test_iter3_b2_*` |
+| starlight_s1_mtp | diagnostic | policy-state speculation on text-only requests. Text evidence keyword spans stay protected under speculation (original positions, retained at every step) **only under `accept_declared`**, because text-only evidence has no source bytes to verify. Image requests are `UNSUPPORTED_IMAGE_PROMPT` and run the diagnostic path with S1-gated visual protection. `degraded_to_h2o_plus_da` when declarations are missing (explicit, not silent) | yes (text-only) | `starlight` block, `policy`, `speculation` (`grounding_protected_positions`, `grounding_protected_retained_final_by_layer`), `speculative_route` | BLOCKED | `test_policy_mtp_speculative.py`, `test_iter3_b2_*`, `test_i3b_s2_combined_speculation.py`, `test_i3b_s2_speculative_route.py` |
 
 Measured status of "logits after compaction equal the masked reference": **yes, on the official
 checkpoint, 7 teacher-forced decode steps, max |logit diff| 8.1e-6, tolerance 1e-4** (test output of
@@ -120,6 +128,30 @@ checkpoint, 7 teacher-forced decode steps, max |logit diff| 8.1e-6, tolerance 1e
 
 **Not measured in this round:** how often the MTP head's natural drafts are right (the tests use forced
 drafts), and any throughput, latency or memory saving.
+
+### Visual evidence (ITER3 Round B, S2; CPU reference, official checkpoint)
+
+- **Mapping.** `visual_mapping.py` maps a normalised `image_region` box `(ymin, xmin, ymax, xmax)` to the Qwen3.5
+  visual token positions of the prompt. Geometry is the processor's: smart resize (factor 32, pixel bounds from the
+  processor), `image_grid_thw = (1, H/16, W/16)` verified against the resize arithmetic, and one token per 2x2 merged
+  cell in row-major order. The single image token run in the prompt must have exactly `grid_h * grid_w / 4` tokens.
+  A box covers every merged cell it overlaps with positive area (a superset; partially covered cells are counted).
+- **Status (telemetry `visual_evidence_protection`).** `SUPPORTED` when the mapping is established for this request.
+  `UNSUPPORTED` with `visual_evidence_protection_reason` otherwise: `NO_IMAGE_IN_REQUEST`, `IMAGE_SOURCE_UNKNOWN`,
+  `MISSING_GRID`, `GRID_ARITHMETIC_MISMATCH`, `TILED_OR_TEMPORAL_GRID`, `MULTI_IMAGE`, `TOKEN_RUN_MISMATCH`,
+  `NO_PROCESSOR_GEOMETRY` (for example the non-official path, which inserts a placeholder vision block). `NO_EVIDENCE_DECLARED`
+  and `NO_IMAGE_EVIDENCE_DECLARED` are the no-evidence cases. Nothing is guessed: an unmapped region protects nothing.
+- **Protection.** A visual span is protected only when the item passes S1 (source bytes VERIFIED and bound to the
+  request), its `location_valid` is VERIFIED, and the region maps. Protected positions are ORIGINAL prompt positions and
+  join the grounding protection (a separate channel: the keyword caps do not count them). Telemetry:
+  `visual_positions_protected`, `visual_protected_positions`, `visual_span`, `visual_geometry`,
+  `visual_protected_retained_final_by_layer` (measured at the end of the request), `visual_evidence_items`.
+- **What this does not show.** Preserving a visual span does NOT prove the model used it. It shows the cache kept those
+  positions. It says nothing about whether any answer depends on them, so it is not a quality or grounding result.
+- **Speculative path.** An image prompt on `h2o_mtp`, `starlight_s1_mtp` or `mtp` is `UNSUPPORTED_IMAGE_PROMPT`. Visual
+  protection still applies on the diagnostic path. Tests: `test_i3b_s2_visual_mapping.py` (mapping against the real
+  processor, token order checked on real `pixel_values`), `test_i3b_s2_visual_protection.py`,
+  `test_i3b_s2_visual_engine.py` (heavy: the repo fixture through the official checkpoint).
 
 ## 5. vLLM status
 
