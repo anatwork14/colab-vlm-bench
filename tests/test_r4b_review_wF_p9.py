@@ -78,9 +78,6 @@ def test_processor_parameters_are_read_from_the_real_processor():
     assert params == {"patch_size": 16, "merge_size": 2, "min_pixels": 65536, "max_pixels": 16777216}
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "wF:p9 R-B-LOW-1: a positive-area box whose overlap with every cell is below the 1e-9-cell tolerance "
-    "maps to NO cell (r0 > r1), contrary to the module's positive-overlap superset contract."))
 def test_sub_tolerance_box_straddling_a_cell_boundary_keeps_its_positive_overlap(geom256):
     e = 1e-10  # pixels: a positive-area box, far below one pixel, straddling the boundary at 32 px
     ymin, ymax = (32 - e) / 256, (32 + e) / 256
@@ -156,9 +153,6 @@ def test_starlight_s1_on_an_image_prompt_evicts_when_the_budget_is_feasible(star
 
 
 @_HEAVY
-@pytest.mark.xfail(strict=True, reason=(
-    "wF:p9 R-B-LOW-2: _mtp_text_speculation_route ignores _speculation_enabled, so the serving mtp arm still "
-    "speculates when the ablation flag is off. The flag is never set by production code (test-only switch)."))
 def test_speculation_ablation_is_honoured_on_the_serving_mtp_arm():
     e = RealSevenArmEngine(method_arm="mtp", device="cpu", checkpoint_dir=CKPT, stop_at_eos=False)
     try:
