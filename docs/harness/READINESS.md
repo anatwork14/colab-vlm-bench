@@ -106,6 +106,35 @@ Stronger evidence would need an external anchor that this host cannot write to: 
 service, a signed log written off-host, or the owner re-running the probe on a machine they control.
 None of those exist in this repository. This is a documented gap, not a solved problem.
 
+### 4a. Known gap (N-R2-1, OPEN): the authorization anchor is operator-supplied
+
+- The signature check verifies against the `--allowed-signers` file that the person running the inventory
+  passes. That file lives outside the repository, but the person running the command chooses it. An operator
+  who writes their own signer file and signs their own record is authorized. This is ADVERSARIAL_CLOSURE_ITER2
+  E1. The test `test_N_R2_1_gap_documented_while_unpinned_the_operator_chosen_signer_file_is_the_anchor` keeps
+  this behaviour visible.
+- While `OWNER_KEY_FINGERPRINT` in `scripts/harness_inventory.py` is `None` (it is), every report says
+  **`Authorization anchor: operator-supplied`**.
+- A pin mechanism exists (round 3). When `OWNER_KEY_FINGERPRINT` is set to the owner's `ssh-keygen -lf`
+  SHA256 fingerprint, the check uses only the key with that fingerprint. Other keys in the signer file are
+  dropped, so a key listed under the owner principal does not authorise. Tests: `test_N_R2_1_*` in
+  `tests/test_harness_r3_regressions.py`.
+- **The pin is not active because no owner public key exists in this repository, and none was supplied.**
+  The fingerprint is public, not a secret, but it must come from the owner. It was not invented here.
+- **Even when pinned, the anchor is still weak.** The constant is in the repository, so anyone with write
+  access can edit it, and the only check on that is code review of a tracked line. The pin raises the
+  forgery from "choose any signer file" to "change a reviewed line of code". A real anchor needs the
+  owner's key or fingerprint held off this host, checked out of band.
+- To close the pin part: the owner runs `ssh-keygen -lf <owner.pub>` and sends the `SHA256:...` value out of
+  band. The lead commits it to `OWNER_KEY_FINGERPRINT` and regenerates `PILOT_INVENTORY`.
+
+## 4b. Other host tools are fixed-path (G-PATH)
+
+`probe_gpu` and the owner-signature check run `nvidia-smi` and `ssh-keygen` only from `/usr/bin` or
+`/usr/local/bin` (`TRUSTED_BIN_DIRS`), never through `PATH`. A PATH shim with either name is not used.
+The live probe already used fixed paths. `src/vlmbench/engine.py` still calls bare `nvidia-smi`. It is
+outside the harness and is not covered by this change.
+
 ## 5. Adversarial cases covered by tests
 
 | Forgery | Result | Test |
@@ -118,6 +147,10 @@ None of those exist in this repository. This is a documented gap, not a solved p
 | GPU with the planned name but another uuid | `gpu_identity` FAIL | `test_a_gpu_with_the_planned_name_but_another_uuid_fails_the_identity_check` |
 | GPU that self-reports the right name with no signed pin | `gpu_identity` FAIL | `test_a_self_reported_gpu_with_the_right_name_and_no_signed_pin_fails_identity` |
 | stub vLLM package | not verified | `test_stub_vllm_package_is_not_verified` |
+| PATH shim `nvidia-smi` (G-PATH) | not used; fixed-path binary only | `test_G_PATH_probe_gpu_ignores_a_path_shim_nvidia_smi`, `test_G_PATH_with_only_a_path_shim_probe_gpu_finds_nothing` |
+| PATH shim `ssh-keygen` that always exits 0 (G-PATH) | not used; forged record refused; genuine signature still verifies | `test_G_PATH_a_path_shim_ssh_keygen_cannot_authorise_a_forged_record`, `test_G_PATH_positive_control_a_genuine_signature_verifies_with_a_path_shim_present` |
+| attacker key listed under the owner principal, owner key pinned (N-R2-1) | refused | `test_N_R2_1_pinned_refuses_an_attacker_key_listed_under_the_owner_principal`, `test_N_R2_1_pinned_refuses_an_attacker_signature_even_when_the_owner_key_is_also_listed` |
+| attacker key in the signer file, no pin (N-R2-1, OPEN) | authorises; reported as `operator-supplied` | `test_N_R2_1_gap_documented_while_unpinned_the_operator_chosen_signer_file_is_the_anchor` (documents the gap; not a fix) |
 | manifest listing only `config.json`, directory with no shard | `weights_present` FAIL, not verified | `test_R1_a_manifest_listing_only_the_config_does_not_verify_a_weightless_directory` |
 | zero-byte shard under a pinned manifest | not weights | `test_R1_a_zero_byte_shard_with_a_pinned_manifest_is_not_weights` |
 | weightless model with a signed manifest pin, end to end | never READY (positive control: real shard verifies) | `test_R1_end_to_end_a_weightless_model_with_a_signed_manifest_pin_is_never_ready`, `test_R1_a_real_shard_with_a_pinned_manifest_is_verified_positive_control` |
@@ -138,7 +171,7 @@ refusing everything.
 - **Sentinel-file checks on vLLM.** The brief asked for RECORD and sentinel-file mismatch. The RECORD
   hash is implemented. A sentinel file (for example a hash of `vllm/_C*.so`) would need its own
   signed pin, and none is defined. Not implemented.
-- **External anchor.** See §4. Not available in this repository.
+- **External anchor.** See §4 and §4a. Not available in this repository. The owner key fingerprint pin (§4a) is implemented but not active, because the owner has not supplied the fingerprint. The authorization anchor is operator-supplied until then (N-R2-1, OPEN).
 - **Owner signature itself.** The inventory verifies the signature. It cannot check that the owner
   made the decision the record describes.
 - **Pilot GPU run.** No cell is READY and none has a smoke receipt. The GPU run is still unexecuted
