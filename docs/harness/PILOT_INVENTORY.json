@@ -177897,7 +177897,8 @@
   "schema": "dataset_feasibility/1"
  },
  "environment": {
-  "authorization_file": "/mnt/ssd/genos2/research_workspace/wt/it3r2-p8/docs/harness/OWNER_AUTHORIZATION.json",
+  "authorization_anchor": "operator-supplied",
+  "authorization_file": "/mnt/ssd/genos2/research_workspace/wt/it3r3-p8/docs/harness/OWNER_AUTHORIZATION.json",
   "authorization_ok": {
    "full": false,
    "pilot": false
@@ -177932,7 +177933,7 @@
     "present": false
    }
   },
-  "disk_free_gib": 14.283,
+  "disk_free_gib": 13.619,
   "gpu": {
    "compute_cap": 6.1,
    "memory_total_mib": 11264,
@@ -177977,7 +177978,7 @@
   },
   "weights_hashed": true
  },
- "head": "c43d526d4867d1fc97a8d218328f2a2a6f7dfb04",
+ "head": "1dde7cdd354bd364265e1bb63a9bcb8a8d5c8516",
  "ladder": [
   "NONE",
   "PLAN_AUTHORIZED",
@@ -178091,7 +178092,7 @@
   "required_vram_mib": 39000
  },
  "schema": "harness_inventory/2",
- "script_sha256": "66825a1806275880b8ed1c3acb9b60b4b5246a34bf5b9fb9d8f070d2182ea486",
+ "script_sha256": "3d36034d7293b439040522eecefbd8d66b1cdd833fe28dcc399bd3365e21d622",
  "status_vocabulary": [
   "READY",
   "UNSUPPORTED",
