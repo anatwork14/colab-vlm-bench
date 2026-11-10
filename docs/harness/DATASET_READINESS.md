@@ -228,3 +228,10 @@ Implemented in `src/vlmbench/datasets/native_records.py`, used by `normalize_mem
 Open (not closed by D2): the prompt text is still the adapter's own, so official prompt parity is pending. Upstream prompts are
 not on this host and were not fetched. MMLongBench-Doc rendering is tested with an injected renderer, because PyMuPDF
 is not installed in the test environment. No real PDF was rendered.
+
+**Round B follow-up (2026-11-10): real local data for the transformation tests — none.** A read-only search of `/mnt/ssd`,
+`/mnt/hdd`, `/home`, `/tmp`, `/var/tmp`, `/opt`, `/srv` and `/data` found no MemLens or MMLongBench-Doc data file. No `.pdf` in any
+dataset-named path. The only name matches are code, `.pyc` files, and config references to `REPLACE_DRIVE_PATH/*.jsonl`. Two
+`tests/fixtures/bench/{memlens,mmlongbench-doc}.json` files exist in other STARLIGHT worktrees (one record each, ~400 bytes). Their
+`fixture_label` is `SYNTHETIC FORMAT FIXTURE, NOT BENCHMARK DATA`, so they were **not** used. The transformation tests were not run
+on real small files, because there are none. The synthetic-data tests in `tests/test_native_records.py` are the only ones run.

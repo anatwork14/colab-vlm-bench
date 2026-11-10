@@ -53,8 +53,15 @@ What was done:
 What was **not** done, and why:
 - **The upstream file was not executed.** Upstream `eval_score.py` calls `eval()` on dataset and model strings (lines 138, 142, 178, 179),
   and `show_results` writes to a caller-given path. Executing it on model-produced text runs whatever code those strings contain. The brief
-  allows differential execution only in a safe, isolated, no-network scratch, and this host does not provide one. The differential therefore
-  stays at code reading and the transcription.
+  allows differential execution only in a safe, isolated, no-network scratch, after the owner reviews the upstream code, and only on inputs the
+  owner approves. The differential therefore stays at code reading and the transcription.
+
+**Round B update (2026-11-10, C-11):** the three upstream copies in the session scratch folders still match the pins (SHA-256 re-checked:
+`eval_score.py` `cafa2683…`, `extract_answer.py` `fa6a747b…`, `prompt_for_answer_extraction.md` `96a22c30…`). **Correction to the line
+above:** an isolated no-network namespace **is** available on this host (`unshare -rn` runs, with loopback only). The sandbox is not the
+blocker. The execution gates that are still unmet are (1) the owner's review of the upstream code and (2) the owner's approval of the
+inputs. Until both are recorded, the upstream file is not executed. The differential is therefore **not completed**; the status stays at
+code reading, the transcription fuzz and the hand-checked cases.
 
 Documented deviations of the port from upstream (all in the port's header and the transcription's header):
 
