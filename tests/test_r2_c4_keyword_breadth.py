@@ -7,6 +7,8 @@ Policy (reported explicitly in telemetry):
     (protected entries are retained, the overflow is reported, nothing is silently dropped).
 cpu_pytorch_reference_not_vllm.
 """
+import pytest
+
 from vlmbench.infrastructure.grounding_evidence import EvidenceItem, EvidencePool
 from vlmbench.infrastructure.real_engine import RealSevenArmEngine
 from vlmbench.infrastructure.starlight import (
@@ -118,3 +120,29 @@ def test_engine_telemetry_reports_the_keyword_policy_and_the_rejected_stopword()
     assert policy["max_keyword_prompt_fraction"] == MAX_KEYWORD_PROMPT_FRACTION
     assert policy["rejected_stopword"] == ["the"]
     assert res.telemetry["starlight"]["grounding_protected_by_evidence"] == {}
+
+
+# ITER3 R2 round-2 review (auditor wF:p9), OPEN: the 0.2 cap is per keyword. Six accepted keywords, each at 7/40
+# (0.175, under the cap), protect all 40 prompt positions together and nothing bounds that union or reports it.
+# Strict xfail: a bound on the union is an owner policy decision; when one lands this must be updated.
+@pytest.mark.xfail(strict=True, reason="ITER3 R2 round-2 C-4 OPEN: the breadth cap applies per keyword, not to the union")
+def test_the_union_of_accepted_keywords_is_bounded_by_the_policy():
+    words = ["which", "these", "their", "not", "they", "she"]
+    vocab = {"which": 21, "these": 22, "their": 23, "not": 24, "they": 25, "she": 26}
+    n = 40
+    prompt = [FILLER] * n
+    blocks = [(0, 7), (7, 14), (14, 21), (21, 28), (28, 35), (35, 40)]
+    for (a, b), w in zip(blocks, words):
+        for pos in range(a, b):
+            prompt[pos] = vocab[w]
+    pool = EvidencePool("c4u")
+    pool.add_evidence(EvidenceItem(evidence_id="ev_u", modality="text_span", content=" ".join(words),
+                                   source_sha256=SHA, verified=True), keywords=words)
+
+    class _V:
+        def encode(self, text):
+            return [vocab[w] for w in text.lower().split() if w in vocab]
+
+    protected, report = grounding_protection_with_report(pool, prompt, _V().encode, "c4u", None)
+    assert len(report["accepted_keywords"]) == len(words)  # every keyword is under the per-keyword cap
+    assert len(protected) / n <= MAX_KEYWORD_PROMPT_FRACTION, len(protected) / n
