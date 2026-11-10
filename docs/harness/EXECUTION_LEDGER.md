@@ -48,3 +48,14 @@ Agents (observed banners): p5 Sonnet 5.5 (lead); p7, p8, p9 Haiku 5.5. No Opus r
 | B-JUDGE | LLM judge/extractor for MMLongBench-Doc stage 2 | BLOCKED_NO_JUDGE |
 | B-DISK | Free space or writable large volume | OPEN |
 Next executable action once authorized: run `scripts/harness_inventory.py` live probes on the A100 host, then pilot Base/MTP cells.
+
+## Iteration 2 (owner directive "ITERATION 2+")
+- Start SHA d8ebc16 (verified: local = origin/feat/qwen35-pretrained-validation = PR #20 head). Agents (observed): p5 Sonnet 5.5; p7, p8, p9 Haiku 5.5. No Opus review.
+- Round 1: p9 closure matrix + protection-signal audit (`ADVERSARIAL_CLOSURE_ITER2.md`); p7 B1/B2/B3 tests + `BACKEND_INTERFACE.md` (found defect F-1); p8 readiness ladder, signed pins, scorer provenance, `READINESS.md`, `DATASET_READINESS.md`, `QWEN35_4B_STAGING_PLAN.md`, `GPU_RUNBOOK.md` (all unexecuted/planning).
+- Round 2: F-1 fixed (shared retained set across full-attention layers; labelled deviation from per-layer H2O, STARLIGHT-vs-H2O now also measures it); C-3/C-5 labels (evidence `CALLER_DECLARED_NOT_VERIFIED`, `visual_evidence_protection: NOT_IMPLEMENTED`); C-4 per-keyword cap; C-1 R1 weightless pin, C-2 isolated vLLM check, C-9 receipt order; p9 re-review added F-1 coverage tests (7 mutants, all caught) and refused unknown modalities.
+- Round 3: union cap on protected keywords (0.5, owner-ratifiable); fixed host tool paths (G-PATH); owner-key fingerprint pin mechanism present but UNSET (needs owner fingerprint).
+- Lead fixes: stale fixtures (modality `text`->`text_span`), retired-label literal, seeded one random-init test.
+- Tests: first full run at c8a352e had 14 failures (fixtures, not product); fixed; single rerun at ea8cfae: **890 passed, 10 skipped, 0 failed** (iteration 1: 744). Stage 2 files run alone earlier: 31 passed, 1 xfail (F-1, since fixed).
+- Real execution: none. 0 GPU receipts, 0 benchmark cells, vLLM not run. Pilot inventory READY = 0.
+- Open (not fixed): N-R2-1 operator-supplied signer anchor (no external trust anchor); C-3 `verified` still honoured for protection; C-5 no visual-token protection; A-2/A-4/A-5 owner rulings; S-9 DA scripted; HC-5 NOT_MEASURED; C-11 not re-checked; round-3 changes not independently re-reviewed; `engine.py` bare nvidia-smi; stopword list and caps are lead/p7 values awaiting owner ratification.
+- Blockers unchanged: B-GPU-AUTH, B-VLLM, B-4B-WEIGHTS, B-DATA(-PINS), B-JUDGE, B-DISK, plus B-OWNER-KEY (owner key fingerprint). Next executable action once authorized: `GPU_RUNBOOK.md`.
