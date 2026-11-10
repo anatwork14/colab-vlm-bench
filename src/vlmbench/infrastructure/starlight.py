@@ -366,6 +366,51 @@ def fixed_budget_verdict(
     }
 
 
+COMPARISON_NOT_APPLICABLE = "NOT_APPLICABLE_NO_STARLIGHT_CONTROLLER"
+COMPARISON_FULL_CACHE_INFEASIBLE = "STARLIGHT_FULL_CACHE_INFEASIBLE_NOT_COMPARABLE"
+COMPARISON_BUDGET_MET = "FIXED_BUDGET_RUN_MET"
+COMPARISON_NOT_SUCCESSFUL = "NOT_A_SUCCESSFUL_FIXED_BUDGET_RUN"
+
+
+def protected_positions_at_prefill(
+    prefill_len: int, da_spans: Sequence[tuple[str, int, int]], grounding_positions: Iterable[int],
+    structural_positions: Iterable[int],
+) -> int:
+    """Distinct prompt positions the controller protects at prefill: DA GLOBAL/FOCUS spans, grounding, structural."""
+    positions: set[int] = set()
+    for _label, start, end in da_spans:
+        positions.update(range(max(0, int(start)), min(int(prefill_len), int(end))))
+    positions.update(int(p) for p in grounding_positions if 0 <= int(p) < prefill_len)
+    positions.update(int(p) for p in structural_positions if 0 <= int(p) < prefill_len)
+    return len(positions)
+
+
+def comparison_validity(
+    *, starlight_active: bool, evicted_total: int, protected_at_prefill: int, budget_total: int,
+    fixed_budget_run: bool,
+) -> dict[str, Any]:
+    """ITER3 closure F-1: is this run comparable to a matched-budget sparse run?
+
+    A STARLIGHT run in which nothing was evicted and the protection at prefill reaches the budget is a FULL-CACHE run:
+    every step is INFEASIBLE, so it measures the unevicted cache, not a sparse policy. It is labelled, not fixed.
+    This does not change the DA scope (an owner research decision).
+    """
+    if not starlight_active:
+        return {"status": COMPARISON_NOT_APPLICABLE, "comparable_to_matched_budget": False,
+                "reason": "no STARLIGHT controller on this arm", "protected_at_prefill": 0,
+                "budget_total": int(budget_total)}
+    base = {"protected_at_prefill": int(protected_at_prefill), "budget_total": int(budget_total)}
+    if int(evicted_total) == 0 and int(protected_at_prefill) >= int(budget_total):
+        return {**base, "status": COMPARISON_FULL_CACHE_INFEASIBLE, "comparable_to_matched_budget": False,
+                "reason": (f"protection at prefill ({protected_at_prefill}) reaches the budget ({budget_total}); "
+                           "nothing was evicted, so this is a full-cache run, not a matched-budget sparse run")}
+    if fixed_budget_run:
+        return {**base, "status": COMPARISON_BUDGET_MET, "comparable_to_matched_budget": True,
+                "reason": "no step was infeasible and the retained count stayed within the budget"}
+    return {**base, "status": COMPARISON_NOT_SUCCESSFUL, "comparable_to_matched_budget": False,
+            "reason": "at least one step was infeasible or over budget"}
+
+
 def combine_summaries(summaries: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Sum per-step summaries (from summarize_plans) into one request-level record."""
     total: dict[str, Any] = {
