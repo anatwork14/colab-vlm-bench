@@ -93,6 +93,8 @@ def test_verified_image_region_is_supported_and_protects_its_merged_cells(eng, i
 def test_protected_visual_positions_are_retained_in_every_full_attention_layer_at_the_end(eng, image_bytes, sha):
     res = _run(eng, "s2_retained", pool=_pool("s2_retained", sha), image_bytes=image_bytes)
     block = res.telemetry["starlight"]
+    # ITER3 closure repair (F-6, wF:p9 F-2): without eviction "retained" says nothing about protection.
+    assert block["evicted_total"] > 0, "no eviction happened: the retention check would be vacuous"
     protected = len(block["visual_protected_positions"])
     retained = block["visual_protected_retained_final_by_layer"]
     assert retained, "the per-layer final retention must be reported"
