@@ -264,6 +264,47 @@ def geometry_from_grid_list(
                           merge_size=merge_size, min_pixels=min_pixels, max_pixels=max_pixels)
 
 
+def processor_params(image_processor: Any) -> tuple[dict[str, int] | None, str | None]:
+    """patch/merge size and pixel bounds from the processor object (SizeDict or dict). Missing -> reason."""
+    size = getattr(image_processor, "size", None)
+
+    def _field(name: str):
+        if isinstance(size, dict):
+            return size.get(name)
+        return getattr(size, name, None)
+
+    params = {
+        "patch_size": getattr(image_processor, "patch_size", None),
+        "merge_size": getattr(image_processor, "merge_size", None),
+        "min_pixels": _field("shortest_edge"),
+        "max_pixels": _field("longest_edge"),
+    }
+    if not all(isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in params.values()):
+        return None, "PROCESSOR_GEOMETRY_UNKNOWN"
+    return params, None
+
+
+def visual_geometry_inputs(
+    image_processor: Any, vis_trace: dict[str, Any], full_prompt, *, image_token_id: int
+) -> tuple[Any, ...]:
+    """(geometry, geometry_reason, span, span_reason) for one request, from the processor and the prompt tokens."""
+    if not vis_trace.get("invoked"):
+        return None, "NO_PROCESSOR_GEOMETRY", None, None
+    params, reason = processor_params(image_processor)
+    if params is None:
+        return None, reason, None, None
+    geom, reason = geometry_from_grid_list(
+        vis_trace.get("source_height"), vis_trace.get("source_width"), vis_trace.get("image_grid_thw"),
+        patch_size=params["patch_size"], merge_size=params["merge_size"],
+        min_pixels=params["min_pixels"], max_pixels=params["max_pixels"],
+    )
+    if geom is None:
+        return None, reason, None, None
+    span, span_reason = find_image_span(full_prompt, image_token_id=image_token_id,
+                                        expected_tokens=geom.n_tokens)
+    return geom, None, span, span_reason
+
+
 def visual_evidence_report(
     pool: Any,
     *,
@@ -292,6 +333,7 @@ def visual_evidence_report(
         "visual_positions_protected": 0,
         "visual_protected_positions": [],
         "geometry": geometry.as_dict() if geometry is not None else None,
+        "span": list(span) if span is not None else None,
         "note": VISUAL_EVIDENCE_NOTE,
     }
     if pool is None:

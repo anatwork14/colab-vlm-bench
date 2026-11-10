@@ -58,7 +58,7 @@ from .starlight import (
     evidence_assessments, fixed_budget_verdict, grounding_protection_with_report,
     plan_starlight_layer, summarize_plans,
 )
-from .visual_mapping import VISUAL_EVIDENCE_NOTE, visual_evidence_report
+from .visual_mapping import VISUAL_EVIDENCE_NOTE, visual_evidence_report, visual_geometry_inputs
 from .evidence_verification import EvidencePolicy
 from .adapters import HardwareGateError, check_vllm_hardware_compatibility
 
@@ -1452,6 +1452,9 @@ class RealSevenArmEngine:
             "invoked": True,
             "image_path": resolved_path,
             "image_sha256": img_sha256,
+            # ITER3 Round B S2: source size of the decoded image (the resize input for the visual geometry).
+            "source_height": int(img.height),
+            "source_width": int(img.width),
             "pixel_values_shape": list(pixel_values.shape),
             "image_grid_thw": image_grid_thw.detach().cpu().tolist(),
             "visual_token_embeddings_count": num_vis_tokens,
@@ -2423,7 +2426,7 @@ class RealSevenArmEngine:
         # ITER3 Round B S2: visual evidence status for this request (replaced by the grounding branch below).
         starlight_visual: dict[str, Any] = {
             "status": "DISABLED_ABLATION", "unsupported_reason": None, "items": {},
-            "visual_positions_protected": 0, "visual_protected_positions": [], "geometry": None,
+            "visual_positions_protected": 0, "visual_protected_positions": [], "geometry": None, "span": None,
             "note": VISUAL_EVIDENCE_NOTE,
         }
         if starlight_active:
@@ -2458,11 +2461,15 @@ class RealSevenArmEngine:
                     starlight_da_spans.append((label, tag.start_idx, tag.end_idx))
             if "grounding" in starlight_enabled:
                 image_sha = _image_sha256(image_bytes, image_path) if image_present else None
-                # ITER3 Round B S2: geometry is not derived from the processor yet (wired in the next commit), so an
-                # image request is UNSUPPORTED with an explicit reason, never a guessed mapping.
+                # ITER3 Round B S2: geometry from the real processor (grid_thw, patch/merge, pixel bounds) and the
+                # single image token run in the prompt. Any missing piece is UNSUPPORTED with a reason, never a guess.
+                vis_geom, vis_geom_reason, vis_span, vis_span_reason = visual_geometry_inputs(
+                    self.processor.image_processor if self.processor is not None else None, vis_trace, full_prompt,
+                    image_token_id=self.config.image_token_id,
+                )
                 starlight_visual = visual_evidence_report(
                     evidence_pool, request_id=request_id, image_sha256=image_sha, image_present=bool(image_present),
-                    geometry=None, geometry_reason="GEOMETRY_NOT_WIRED", span=None, span_reason=None,
+                    geometry=vis_geom, geometry_reason=vis_geom_reason, span=vis_span, span_reason=vis_span_reason,
                 )
                 if evidence_pool is None:
                     starlight_grounding_status = "NO_EVIDENCE_DECLARED"
@@ -2487,6 +2494,11 @@ class RealSevenArmEngine:
                             cap_policy=self.grounding_cap_policy,
                         )
                         starlight_grounding_status = "ACTIVE"
+                # ITER3 Round B S2: S1-gated, mapping-supported visual positions join the grounding protection, keyed
+                # by ORIGINAL prompt position (the planner follows each token through compaction). They are a separate
+                # channel: the keyword caps do not count them.
+                for vis_pos, vis_ids in starlight_visual["positions"].items():
+                    starlight_grounding[vis_pos] = tuple(sorted(set(starlight_grounding.get(vis_pos, ())) | set(vis_ids)))
         tokens_generated: list[int] = []
         step_latencies: list[float] = []
         ttft_ms = 0.0
@@ -3061,6 +3073,19 @@ class RealSevenArmEngine:
                 "visual_positions_protected": starlight_visual["visual_positions_protected"],
                 "visual_protected_positions": starlight_visual["visual_protected_positions"],
                 "visual_geometry": starlight_visual["geometry"],
+                "visual_span": starlight_visual["span"],
+                # Protected visual positions still present in each full-attention layer at the END of the request
+                # (original positions tracked through compaction). Empty when nothing is protected.
+                "visual_protected_retained_final_by_layer": (
+                    {
+                        str(l_idx): len(
+                            set(starlight_visual["visual_protected_positions"])
+                            & set(np.asarray(starlight_orig[l_idx]).tolist())
+                        )
+                        for l_idx in self.config.full_attention_layers
+                    }
+                    if starlight_visual["visual_protected_positions"] else {}
+                ),
                 "visual_evidence_protection_note": VISUAL_EVIDENCE_NOTE,
                 "grounding_protected_by_evidence": grounding_by_evidence,
                 "candidate_basis": (
