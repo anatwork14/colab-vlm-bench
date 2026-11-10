@@ -37,6 +37,16 @@ MEASUREMENT_LABEL = "cpu_pytorch_reference_not_vllm"
 STATUS_OK = "OK"
 STATUS_INFEASIBLE = "INFEASIBLE_PROTECTED_EXCEEDS_BUDGET"
 
+# ITER3 Round A S3 (provisional policy A-2, engineering hypothesis): run-level fixed-budget verdict.
+# An INFEASIBLE step keeps every entry (it evicts nothing), so its KV is NOT budget-bounded. A run containing one
+# is reported as NOT a successful fixed-budget run. It is never reported as a budgeted run, and no full-cache
+# substitution is hidden behind a budget label.
+FIXED_BUDGET_MET = "FIXED_BUDGET_MET"
+FIXED_BUDGET_NOT_MET = "NOT_A_SUCCESSFUL_FIXED_BUDGET_RUN"
+FIXED_BUDGET_NOT_APPLICABLE = "NOT_APPLICABLE_NO_STARLIGHT_CONTROLLER"
+RETENTION_BUDGET_BOUNDED = "BUDGET_BOUNDED"
+RETENTION_AT_INFEASIBLE_STEPS = "NOT_BUDGET_BOUNDED_ENTRIES_ABOVE_BUDGET_RETAINED"
+
 DECISION_EVICT = "EVICT"
 DECISION_RETAIN_PROTECTED_VETOED = "RETAIN_PROTECTED_VETOED_H2O_CANDIDATE"
 DECISION_RETAIN_PROTECTED = "RETAIN_PROTECTED"
@@ -329,6 +339,29 @@ def summarize_plans(plans: Sequence[StarlightLayerPlan]) -> dict[str, Any]:
         "protected_evicted": protected_evicted,
         "evicted_not_candidate": evicted_not_candidate,
         "kv_budget_violated_layers": kv_violated,
+    }
+
+
+def fixed_budget_verdict(
+    summary: dict[str, Any], *, budget_total: int, max_retained_per_layer: int,
+) -> dict[str, Any]:
+    """Run-level verdict: is this a successful fixed-budget run?
+
+    Met only when no step is INFEASIBLE, no layer-step is recorded as a KV budget violation, and the largest
+    retained count of any layer-step does not exceed the budget. Any one of these makes the run NOT a successful
+    fixed-budget run, even when the other two look clean.
+    """
+    infeasible = int(summary["status_counts"].get(STATUS_INFEASIBLE, 0))
+    kv_violated = int(summary["kv_budget_violated_layers"])
+    over = max(0, int(max_retained_per_layer) - int(budget_total))
+    met = infeasible == 0 and kv_violated == 0 and over == 0
+    return {
+        "fixed_budget_run": met,
+        "status": FIXED_BUDGET_MET if met else FIXED_BUDGET_NOT_MET,
+        "budget_total": int(budget_total),
+        "infeasible_layer_steps": infeasible,
+        "kv_budget_violated_layers": kv_violated,
+        "max_retained_over_budget": over,
     }
 
 

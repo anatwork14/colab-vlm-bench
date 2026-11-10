@@ -52,9 +52,10 @@ from .h2o import H2OConfig, H2OCacheTracker, H2OMTPTransaction
 from .declarative_attention import DAConfig, DAFSM, DAMaskGenerator, DATag, DATagType
 from .grounding_evidence import ECRDConfig, EvidencePool, EvidenceItem, ECRDLogitsProcessor
 from .starlight import (
+    FIXED_BUDGET_NOT_APPLICABLE, RETENTION_AT_INFEASIBLE_STEPS, RETENTION_BUDGET_BOUNDED,
     STATUS_INFEASIBLE, StarlightLayerPlan, combine_summaries, compact_orig_positions,
     VISUAL_EVIDENCE_NOTE, da_protection_from_spans, evidence_provenance, evidence_validity,
-    evidence_assessments, grounding_protection_with_report, visual_evidence_protection_status,
+    evidence_assessments, fixed_budget_verdict, grounding_protection_with_report, visual_evidence_protection_status,
     plan_starlight_layer, summarize_plans,
 )
 from .evidence_verification import EvidencePolicy
@@ -2856,6 +2857,10 @@ class RealSevenArmEngine:
                     "peak_cuda_allocated_saving_bytes": None,
                     "peak_cuda_reserved_saving_bytes": None,
                     "device_hbm_reduction_measured": False,
+                    # ITER3 Round A S3: a non-STARLIGHT arm makes no fixed-budget claim. Set on STARLIGHT arms below.
+                    "fixed_budget_status": FIXED_BUDGET_NOT_APPLICABLE,
+                    "kv_retention_status": None,
+                    "max_retained_over_budget_per_layer_step": None,
                     "warning": "Each decode step's index_select size delta is added. The total is NOT a peak or allocated/reserved VRAM delta, and may count repeated reductions.",
                 },
                 "h2o_logical_selection_accounting": {
@@ -2982,6 +2987,18 @@ class RealSevenArmEngine:
             for labels in starlight_grounding.values():
                 for eid in labels:
                     grounding_by_evidence[eid] = grounding_by_evidence.get(eid, 0) + 1
+            # ITER3 Round A S3: run-level verdict. An INFEASIBLE step (or any retention above budget) is NOT a
+            # successful fixed-budget run, and the memory report must say so instead of implying a budget.
+            fixed_verdict = fixed_budget_verdict(
+                summary, budget_total=starlight_budget, max_retained_per_layer=starlight_max_retained,
+            )
+            result.telemetry["kv_memory_accounting"].update({
+                "fixed_budget_status": fixed_verdict["status"],
+                "kv_retention_status": (
+                    RETENTION_BUDGET_BOUNDED if fixed_verdict["fixed_budget_run"] else RETENTION_AT_INFEASIBLE_STEPS
+                ),
+                "max_retained_over_budget_per_layer_step": fixed_verdict["max_retained_over_budget"],
+            })
             result.telemetry["h2o_logical_selection_accounting"] = {
                 "method_variant": "NOT_APPLICABLE_STARLIGHT_ARM",
                 "note": "STARLIGHT arms report telemetry['starlight']; H2O budget fields are not used.",
@@ -3028,6 +3045,10 @@ class RealSevenArmEngine:
                 "kv_budget_violated": summary["kv_budget_violated_layers"] > 0,
                 "kv_budget_violated_layers": summary["kv_budget_violated_layers"],
                 "infeasible_steps": summary["status_counts"].get(STATUS_INFEASIBLE, 0),
+                # ITER3 Round A S3: NOT a successful fixed-budget run when any step is infeasible or over budget.
+                "fixed_budget_run": fixed_verdict["fixed_budget_run"],
+                "fixed_budget_status": fixed_verdict["status"],
+                "fixed_budget_verdict": fixed_verdict,
                 "evicted_total": summary["evicted_total"],
                 "retained_total": summary["retained_total"],
                 "max_retained_per_layer_step": starlight_max_retained,
