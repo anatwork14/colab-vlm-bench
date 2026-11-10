@@ -889,7 +889,7 @@ def render_markdown(report: dict) -> str:
               f"- Disk free on models root: {env['disk_free_gib']} GiB (guard: {report['rules']['min_free_gib']} GiB)",
               f"- Owner authorization file `{env['authorization_file']}`: {env['authorization_ok']}",
               f"- Authorization anchor: {env['authorization_anchor']}"
-              + (" (the signer file is operator-supplied; no owner key fingerprint is pinned, see READINESS §4a)"
+              + (" (no owner key fingerprint is pinned, so the signer file chooses the trusted key; see READINESS §4a)"
                  if env["authorization_anchor"] == "operator-supplied" else ""),
               f"- Datasets: " + "; ".join(f"`{k}` present={v['present']}" for k, v in env["datasets"].items()),
               f"- Pins from the owner-signed record (only source): models {env['revisions_pinned']}; "
