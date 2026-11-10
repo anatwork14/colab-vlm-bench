@@ -99,9 +99,12 @@ evaluator-only field.
 - `ensure_no_gold_in_request` (`src/vlmbench/workloads.py`) is **structural only**: it rejects a serialized payload
   whose top-level keys include `reference` or `answer`. It does not look at message text. A question or haystack
   that contains the answer string passes the check.
-- Required test before any official run (not present yet): for every normalized row, the serialized request must not
-  contain the gold string as a whole-token match outside the question text, and must not contain `answer_session_ids`
-  values. Record the result as a receipt.
+- **Implemented (ITER3 D2).** `native_records.check_record` and `receipt`: every normalized record gets a gold-free check, and
+  `normalize_memlens` returns `gold_free_receipt`. A gold key or the gold text as a message part is a structural violation
+  (`LEAKED`, the run fails). A gold token inside the haystack context is reported (`GOLD_TOKEN_IN_CONTEXT`) and not hidden. Haystack
+  text can contain the answer word legitimately. The question and the constant template wording are not counted. Session headers
+  (`[Session s1 — date]`) are template text, so `answer_session_ids` values are not searched in the request. Session ids are
+  visible for every session, not only the evidence sessions. Tests: `tests/test_native_records.py`.
 
 ## 3. MMLongBench-Doc
 
@@ -168,8 +171,10 @@ Stage 2 needs a GPT-4o run, which is an external paid service and has not been r
   (`src/vlmbench/datasets/mmlong.py`, lines 105–113). None of them may enter the request.
 - The same structural guard applies, and it has the same limit as §2.5: it checks top-level keys only.
 - Unanswerable rows carry the answer string `Not answerable`. That string must not appear in any message.
-- Required test (not present): for every row, the serialized request must not contain `reference`, `answer_format`, the
-  evidence page list, or the gold answer as a whole-token match outside the question.
+- **Implemented (ITER3 D2).** The same check as §2.5 applies. `reference`, `answer_format`, `evidence_pages` and
+  `evidence_sources` are kept in `meta` and must not appear in `messages` (`LEAKED` if they do). The unanswerable label
+  `Not answerable` is a gold text. The adapter's instruction "if not answerable say so" is constant wording for every row. It
+  is not counted as a leak, and the test `test_mmlong_template_wording_is_not_a_gold_leak_for_an_unanswerable_row` pins that.
 
 ## 4. Validation steps (both datasets, in order)
 
@@ -199,5 +204,27 @@ Each step produces a receipt. A failed step blocks the dataset. Nothing is downl
 
 - No file was downloaded or hashed beyond the DF numbers.
 - No token counts, page counts or context-fit results exist.
-- The gold-free test in §2.5 and §3.6 does not exist yet; the present guard is structural.
+- The gold-free receipt (§2.5, §3.6) is implemented on fixtures. It has not been run on the real upstream rows, because the rows are
+  not on this host (see `DRIVE_INVENTORY.md`).
+- The MMLongBench-Doc page count is taken from the renderer. It is not checked against the PDF independently.
 - The upstream MemLens judge is unpinned, so no MemLens official number is possible.
+
+## 7. Native record transformation (ITER3 D2)
+
+Implemented in `src/vlmbench/datasets/native_records.py`, used by `normalize_memlens` and `normalize_mmlong`.
+
+- **Ids.** MemLens: the upstream `question_id`, as a string. MMLongBench-Doc: `sha256(doc_id + "\n" + question)[:20]`. The
+  MMLong id does not depend on row order. Duplicates fail.
+- **Order and repeatability.** Output keeps source order. Two runs on the same input give the same output bytes (test).
+- **Missing references.** Every missing image (MemLens) or document (MMLongBench-Doc) is found before anything is written, and
+  all are reported together (`MissingReferences`). Nothing is published. Escaping paths still raise at once.
+- **Full references.** MemLens meta lists every image with its SHA-256. MMLongBench-Doc records every page file, the page
+  count, the PDF SHA-256 and the DPI. Page image bytes are not hashed, because they depend on the renderer.
+- **Transform hashes.** The summary has `transform` = version, parameter hash, source SHA-256 and output SHA-256.
+- **Native versus derived.** Native records stay on `native_quality`. A derived row is refused by `load_jsonl(track="native_quality")`
+  and is not produced here. Derived builders stay in `derivation.py` and `build_memlens_context_bins`.
+- **Scorer gate.** `quality.import_official("memlens", ...)` is `BLOCKED_NO_JUDGE` (test). The MMLongBench stage-3 gate is unchanged (ITER3 C4).
+
+Open (not closed by D2): the prompt text is still the adapter's own, so official prompt parity is pending. Upstream prompts are
+not on this host and were not fetched. MMLongBench-Doc rendering is tested with an injected renderer, because PyMuPDF
+is not installed in the test environment. No real PDF was rendered.
