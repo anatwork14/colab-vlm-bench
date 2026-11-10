@@ -27,6 +27,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,12 @@ DEFAULT_FEASIBILITY = REPO / "docs/harness/DATASET_FEASIBILITY.json"  # read-onl
 DEFAULT_RECEIPT_INDEX = REPO / "docs/harness/GPU_RECEIPT_INDEX.json"  # committed; a receipt counts only if listed here
 OWNER_NAMESPACE = "vlmbench-owner-compute"  # ssh-keygen -Y signature namespace for owner compute approval
 OWNER_PRINCIPAL = "owner"
+# G-PATH (ITER3 round 3): host tools are run from these fixed directories, never resolved through PATH.
+TRUSTED_BIN_DIRS = ("/usr/bin", "/usr/local/bin")
+# N-R2-1: optional pin of the owner's public key, as printed by `ssh-keygen -lf` (SHA256:...). It is None because
+# no owner public key exists in this repository and none is invented here. While None, the authorization anchor is
+# OPERATOR-SUPPLIED: whoever passes --allowed-signers chooses which key may authorise. See docs/harness/READINESS.md.
+OWNER_KEY_FINGERPRINT: str | None = None
 LOCAL_WEIGHTS_MANIFEST = "starlight_local_manifest.json"
 REQUIRED_CAPABILITY = 8.0       # BF16 native support (Ampere, sm_80 and newer). Assumption, stated in report.
 REQUIRED_VRAM_MIB = 39000       # matches vlmbench.config.validate (A100 40GB contract)
@@ -308,9 +315,20 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def trusted_binary(name: str) -> str | None:
+    """A host tool only from a fixed absolute location (G-PATH). A PATH shim with the same name is never used."""
+    for directory in TRUSTED_BIN_DIRS:
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def probe_gpu(runner=subprocess.run) -> dict | None:
-    args = ["nvidia-smi", "--query-gpu=name,uuid,compute_cap,memory.total",
-            "--format=csv,noheader,nounits"]
+    smi = trusted_binary("nvidia-smi")
+    if smi is None:
+        return None
+    args = [smi, "--query-gpu=name,uuid,compute_cap,memory.total", "--format=csv,noheader,nounits"]
     try:
         done = runner(args, capture_output=True, text=True, timeout=10, check=True)
     except (OSError, subprocess.SubprocessError):
@@ -327,13 +345,46 @@ def probe_gpu(runner=subprocess.run) -> dict | None:
         return None
 
 
+def _line_fingerprint(line: str, ssh: str, runner) -> str | None:
+    """SHA256 fingerprint of the key in one allowed_signers line (principal and options are skipped)."""
+    fields = line.split()
+    start = next((i for i, f in enumerate(fields) if f.startswith(("ssh-", "ecdsa-", "sk-"))), None)
+    if start is None or start + 1 >= len(fields):
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        key = Path(tmp) / "key.pub"
+        key.write_text(" ".join(fields[start:start + 2]) + "\n", encoding="utf8")
+        try:
+            done = runner([ssh, "-lf", str(key)], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+    parts = done.stdout.split() if done.returncode == 0 else []
+    return parts[1] if len(parts) >= 2 and parts[1].startswith("SHA256:") else None
+
+
+def _pinned_signer_lines(signers: Path, fingerprint: str, ssh: str, runner) -> list[str]:
+    """The lines of the operator's signer file whose key is the pinned owner key. Everything else is dropped."""
+    try:
+        lines = signers.read_text(encoding="utf8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    kept = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and _line_fingerprint(stripped, ssh, runner) == fingerprint:
+            kept.append(stripped)
+    return kept
+
+
 def verify_owner_authorization(record_path: Path, campaign_id: str, plan_path: Path,
                                allowed_signers: Path | None, runner=subprocess.run) -> dict:
     """Owner approval counts only as an ssh-keygen signature over the record, by a key in an
     owner signer file kept outside the repository, naming this campaign and this plan's hash.
     A bare JSON file, however it reads, never authorizes.
     """
-    out = {"verified": False, "reason": "", "resource": None, "pins": {}}
+    out = {"verified": False, "reason": "", "resource": None, "pins": {},
+           "anchor": (f"pinned owner key {OWNER_KEY_FINGERPRINT}" if OWNER_KEY_FINGERPRINT
+                      else "operator-supplied")}
     sig = record_path.with_name(record_path.name + ".sig")
     if not record_path.is_file() or not sig.is_file():
         out["reason"] = "no signed owner record"
@@ -358,13 +409,27 @@ def verify_owner_authorization(record_path: Path, campaign_id: str, plan_path: P
     if not record.get("resource") or not record.get("approved_on"):
         out["reason"] = "record lacks resource or approval date"
         return out
-    cmd = ["ssh-keygen", "-Y", "verify", "-f", str(allowed_signers), "-I", OWNER_PRINCIPAL,
-           "-n", OWNER_NAMESPACE, "-s", str(sig)]
-    try:
-        done = runner(cmd, input=record_path.read_bytes(), capture_output=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        out["reason"] = "signature check could not run"
+    ssh = trusted_binary("ssh-keygen")
+    if ssh is None:
+        out["reason"] = "ssh-keygen is not installed at a trusted path"
         return out
+    with tempfile.TemporaryDirectory() as tmp:
+        signers = allowed_signers
+        if OWNER_KEY_FINGERPRINT:
+            # N-R2-1: only the pinned key may authorise. Other keys in the operator's file are dropped before checking.
+            kept = _pinned_signer_lines(allowed_signers, OWNER_KEY_FINGERPRINT, ssh, runner)
+            if not kept:
+                out["reason"] = "the pinned owner key fingerprint is not in the signer file"
+                return out
+            signers = Path(tmp) / "pinned_signers"
+            signers.write_text("\n".join(kept) + "\n", encoding="utf8")
+        cmd = [ssh, "-Y", "verify", "-f", str(signers), "-I", OWNER_PRINCIPAL,
+               "-n", OWNER_NAMESPACE, "-s", str(sig)]
+        try:
+            done = runner(cmd, input=record_path.read_bytes(), capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            out["reason"] = "signature check could not run"
+            return out
     if done.returncode != 0:
         out["reason"] = "signature does not verify against the owner signer file"
         return out
@@ -750,6 +815,7 @@ def build_report(pilot_config: Path, matrix_manifest: Path, *, models_root: Path
             "disk_free_gib": round(disk_free, 3),
             "authorization_file": str(authorization),
             "authorization_ok": {"pilot": authorized_pilot, "full": authorized_full},
+            "authorization_anchor": auth_pilot["anchor"],
             "datasets": datasets,
             "dataset_revisions_pinned": dataset_revisions,
             "receipts_loaded": len(receipts),
@@ -822,6 +888,9 @@ def render_markdown(report: dict) -> str:
               f"- GPU (nvidia-smi): {env['gpu']}",
               f"- Disk free on models root: {env['disk_free_gib']} GiB (guard: {report['rules']['min_free_gib']} GiB)",
               f"- Owner authorization file `{env['authorization_file']}`: {env['authorization_ok']}",
+              f"- Authorization anchor: {env['authorization_anchor']}"
+              + (" (no owner key fingerprint is pinned, so the signer file chooses the trusted key; see READINESS §4a)"
+                 if env["authorization_anchor"] == "operator-supplied" else ""),
               f"- Datasets: " + "; ".join(f"`{k}` present={v['present']}" for k, v in env["datasets"].items()),
               f"- Pins from the owner-signed record (only source): models {env['revisions_pinned']}; "
               f"datasets {env['dataset_revisions_pinned']}; signed pins present: {bool(env['signed_pins_used'])}",
