@@ -28,6 +28,7 @@ from .evidence_verification import (
     assess_evidence, decide_protection,
 )
 
+import hashlib
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
@@ -585,6 +586,7 @@ def grounding_protection_from_pool(
     policy: EvidencePolicy | None = None,
     *,
     image_present: bool | None = None,
+    cap_policy: GroundingCapPolicy | None = None,
 ) -> dict[int, tuple[str, ...]]:
     """Grounding-protected prompt positions: token spans of evidence keywords whose items PROTECT.
 
@@ -596,7 +598,8 @@ def grounding_protection_from_pool(
     missed (documented limitation).
     """
     protected, _report = grounding_protection_with_report(
-        pool, prompt_ids, encode, current_request_id, image_sha256, policy, image_present=image_present)
+        pool, prompt_ids, encode, current_request_id, image_sha256, policy, image_present=image_present,
+        cap_policy=cap_policy)
     return protected
 
 
@@ -614,6 +617,54 @@ MAX_KEYWORD_PROMPT_FRACTION = 0.2
 # would push the union over the cap is rejected and listed in rejected_union (later keywords still considered).
 MAX_UNION_PROMPT_FRACTION = 0.5
 
+# ITER3 Round A S4 (provisional policy, engineering hypothesis, not owner ratification): the caps and the stopword
+# list are one VERSIONED object. A changed threshold or stopword list needs a NEW cap_policy_version, so telemetry
+# can never report a changed policy under the default id. A threshold of None means UNCAPPED for that threshold.
+DEFAULT_CAP_POLICY_VERSION = "GROUNDING_CAP_V1_ITER3_R3"
+
+
+@dataclass(frozen=True)
+class GroundingCapPolicy:
+    """Configurable, versioned caps and stopwords for grounding keyword protection (ablatable)."""
+
+    cap_policy_version: str
+    max_keyword_prompt_fraction: float | None
+    max_union_prompt_fraction: float | None
+    stopwords: frozenset[str]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cap_policy_version, str) or not self.cap_policy_version.strip():
+            raise ValueError("cap_policy_version must be a non-empty string")
+        for name, value in (("max_keyword_prompt_fraction", self.max_keyword_prompt_fraction),
+                            ("max_union_prompt_fraction", self.max_union_prompt_fraction)):
+            if value is not None and not (0.0 < float(value) <= 1.0):
+                raise ValueError(f"{name} must be None (uncapped) or in (0, 1], got {value!r}")
+        object.__setattr__(self, "stopwords", frozenset(str(w).strip().lower() for w in self.stopwords))
+        default_values = (MAX_KEYWORD_PROMPT_FRACTION, MAX_UNION_PROMPT_FRACTION, KEYWORD_STOPWORDS)
+        changed = (self.max_keyword_prompt_fraction, self.max_union_prompt_fraction, self.stopwords) != default_values
+        if self.cap_policy_version == DEFAULT_CAP_POLICY_VERSION and changed:
+            raise ValueError("a changed cap or stopword list needs a new cap_policy_version (the default id is taken)")
+
+    def stopword_set_sha256(self) -> str:
+        return hashlib.sha256("\n".join(sorted(self.stopwords)).encode("utf8")).hexdigest()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "cap_policy_version": self.cap_policy_version,
+            "max_keyword_prompt_fraction": self.max_keyword_prompt_fraction,
+            "max_union_prompt_fraction": self.max_union_prompt_fraction,
+            "stopword_count": len(self.stopwords),
+            "stopword_set_sha256": self.stopword_set_sha256(),
+        }
+
+
+DEFAULT_GROUNDING_CAP_POLICY = GroundingCapPolicy(
+    cap_policy_version=DEFAULT_CAP_POLICY_VERSION,
+    max_keyword_prompt_fraction=MAX_KEYWORD_PROMPT_FRACTION,
+    max_union_prompt_fraction=MAX_UNION_PROMPT_FRACTION,
+    stopwords=KEYWORD_STOPWORDS,
+)
+
 
 def grounding_protection_with_report(
     pool: Any,
@@ -624,6 +675,7 @@ def grounding_protection_with_report(
     policy: EvidencePolicy | None = None,
     *,
     image_present: bool | None = None,
+    cap_policy: GroundingCapPolicy | None = None,
 ) -> tuple[dict[int, tuple[str, ...]], dict[str, Any]]:
     """Grounding-protected positions AND the keyword policy report (accepted and rejected keywords).
 
@@ -632,15 +684,28 @@ def grounding_protection_with_report(
     before any of its positions is protected, so a rejected keyword protects nothing.
     """
     policy = policy or EvidencePolicy()
+    caps = cap_policy or DEFAULT_GROUNDING_CAP_POLICY
+    kw_limit = caps.max_keyword_prompt_fraction
+    union_limit = caps.max_union_prompt_fraction
     report: dict[str, Any] = {
-        "max_keyword_prompt_fraction": MAX_KEYWORD_PROMPT_FRACTION,
-        "max_union_prompt_fraction": MAX_UNION_PROMPT_FRACTION,
-        "stopword_list": sorted(KEYWORD_STOPWORDS),
+        "cap_policy_version": caps.cap_policy_version,
+        "cap_policy": caps.as_dict(),
+        "max_keyword_prompt_fraction": kw_limit,
+        "max_union_prompt_fraction": union_limit,
+        "stopword_list": sorted(caps.stopwords),
         "accepted_keywords": [],
         "rejected_stopword": [],
         "rejected_breadth": [],
         "rejected_union": [],
         "union_fraction": 0.0,
+        # ITER3 Round A S4: for each threshold, what it retained, rejected and omitted. A positions count is the
+        # prompt positions of that threshold's rejected keywords that are NOT protected in the final set.
+        "threshold_ledger": {
+            "stopword": {"limit": None, "rejected": [], "omitted_positions": 0},
+            "per_keyword_fraction": {"limit": kw_limit, "retained": [], "rejected": [], "omitted_positions": 0},
+            "union_fraction": {"limit": union_limit, "retained": [], "rejected": [], "omitted_positions": 0,
+                               "retained_positions": 0},
+        },
         "evidence_policy": policy.as_dict(),
         "assessments": {},
         "omitted_items": [],
@@ -657,13 +722,12 @@ def grounding_protection_with_report(
     valid_ids = {eid for eid, a in assessments.items() if a["protects"]}
     n_prompt = len(prompt_ids)
     protected: dict[int, set[str]] = {}
+    ledger = report["threshold_ledger"]
+    rejected_at: dict[str, set[int]] = {"stopword": set(), "per_keyword_fraction": set(), "union_fraction": set()}
     # Declared order (the pool's insertion order), not alphabetical: the union cap is order-dependent by design.
     for keyword, evidence_ids in pool.keyword_index().items():
         supporting = [eid for eid in evidence_ids if eid in valid_ids]
         if not supporting:
-            continue
-        if keyword.strip().lower() in KEYWORD_STOPWORDS:
-            report["rejected_stopword"].append(keyword)
             continue
         own: dict[int, set[str]] = {}
         variants = {keyword, f" {keyword}", keyword.capitalize(), f" {keyword.capitalize()}"}
@@ -672,17 +736,43 @@ def grounding_protection_with_report(
             for start in match_token_spans(prompt_ids, tokens):
                 for pos in range(start, start + len(tokens)):
                     own.setdefault(pos, set()).update(supporting)
-        fraction = (len(own) / n_prompt) if n_prompt else 0.0
-        if fraction > MAX_KEYWORD_PROMPT_FRACTION:
-            report["rejected_breadth"].append({"keyword": keyword, "protected_fraction": round(fraction, 6)})
+        if keyword.strip().lower() in caps.stopwords:
+            report["rejected_stopword"].append(keyword)
+            ledger["stopword"]["rejected"].append(keyword)
+            rejected_at["stopword"].update(own)
             continue
+        fraction = (len(own) / n_prompt) if n_prompt else 0.0
+        if kw_limit is not None and fraction > kw_limit:
+            report["rejected_breadth"].append({"keyword": keyword, "protected_fraction": round(fraction, 6)})
+            ledger["per_keyword_fraction"]["rejected"].append(
+                {"keyword": keyword, "protected_fraction": round(fraction, 6)})
+            rejected_at["per_keyword_fraction"].update(own)
+            continue
+        ledger["per_keyword_fraction"]["retained"].append(keyword)
         new_positions = len(set(own) - set(protected))
         union_if_added = ((len(protected) + new_positions) / n_prompt) if n_prompt else 0.0
-        if union_if_added > MAX_UNION_PROMPT_FRACTION:
+        if union_limit is not None and union_if_added > union_limit:
             report["rejected_union"].append({"keyword": keyword, "union_fraction_if_added": union_if_added})
+            ledger["union_fraction"]["rejected"].append(
+                {"keyword": keyword, "union_fraction_if_added": union_if_added})
+            rejected_at["union_fraction"].update(own)
             continue
         report["accepted_keywords"].append(keyword)
+        ledger["union_fraction"]["retained"].append(keyword)
         for pos, ids in own.items():
             protected.setdefault(pos, set()).update(ids)
-    report["union_fraction"] = (len(protected) / n_prompt) if n_prompt else 0.0
+    final = set(protected)
+    for threshold, positions in rejected_at.items():
+        ledger[threshold]["omitted_positions"] = len(positions - final)
+    ledger["union_fraction"]["retained_positions"] = len(final)
+    omitted_total = len(set().union(*rejected_at.values()) - final)
+    # Never claim perfect preservation while a capped occurrence was dropped (no silent truncation).
+    report["omitted_positions_total"] = omitted_total
+    report["perfect_preservation_claimed"] = omitted_total == 0
+    report["preservation_claim"] = (
+        "PERFECT_PRESERVATION_OF_KEYWORD_OCCURRENCES" if omitted_total == 0
+        else "NOT_PERFECT_PRESERVATION_CAPPED_OCCURRENCES_OMITTED"
+    )
+    report["preservation_scope"] = "CAP_OMISSIONS_ON_KEYWORD_OCCURRENCES_OF_VALID_EVIDENCE; evidence items are in omitted_items"
+    report["union_fraction"] = (len(final) / n_prompt) if n_prompt else 0.0
     return {pos: tuple(sorted(ids)) for pos, ids in sorted(protected.items())}, report

@@ -52,11 +52,11 @@ from .h2o import H2OConfig, H2OCacheTracker, H2OMTPTransaction
 from .declarative_attention import DAConfig, DAFSM, DAMaskGenerator, DATag, DATagType
 from .grounding_evidence import ECRDConfig, EvidencePool, EvidenceItem, ECRDLogitsProcessor
 from .starlight import (
-    FIXED_BUDGET_NOT_APPLICABLE, RETENTION_AT_INFEASIBLE_STEPS, RETENTION_BUDGET_BOUNDED,
-    STATUS_INFEASIBLE, StarlightLayerPlan, combine_summaries, compact_orig_positions,
+    DEFAULT_GROUNDING_CAP_POLICY, FIXED_BUDGET_NOT_APPLICABLE, GroundingCapPolicy,
+    RETENTION_AT_INFEASIBLE_STEPS, RETENTION_BUDGET_BOUNDED, STATUS_INFEASIBLE, StarlightLayerPlan, combine_summaries, compact_orig_positions,
     VISUAL_EVIDENCE_NOTE, da_protection_from_spans, evidence_provenance, evidence_validity,
-    evidence_assessments, fixed_budget_verdict, grounding_protection_with_report, visual_evidence_protection_status,
-    plan_starlight_layer, summarize_plans,
+    evidence_assessments, fixed_budget_verdict, grounding_protection_with_report,
+    visual_evidence_protection_status, plan_starlight_layer, summarize_plans,
 )
 from .evidence_verification import EvidencePolicy
 from .adapters import HardwareGateError, check_vllm_hardware_compatibility
@@ -1195,6 +1195,7 @@ class RealSevenArmEngine:
         starlight_record_decisions: bool = False,
         dtype_override: str | None = None,
         evidence_policy: EvidencePolicy | None = None,
+        grounding_cap_policy: GroundingCapPolicy | None = None,
     ):
         if method_arm not in self.SUPPORTED_ARMS:
             raise ValueError(f"Unknown method arm: {method_arm}")
@@ -1257,6 +1258,8 @@ class RealSevenArmEngine:
         self.starlight_record_decisions = bool(starlight_record_decisions)
         # ITER3 R3 S1: explicit evidence policy. Default accept_declared=False (declared text-only evidence does not protect).
         self.evidence_policy = evidence_policy or EvidencePolicy()
+        # ITER3 Round A S4: versioned caps and stopwords; the version id is reported in telemetry.
+        self.grounding_cap_policy = grounding_cap_policy or DEFAULT_GROUNDING_CAP_POLICY
         self.da_fsm = DAFSM() if method_arm in DA_MASKING_ARMS else None
         self.da_mask_gen = DAMaskGenerator() if method_arm in DA_MASKING_ARMS else None
         self.ecrd_processors: dict[str, ECRDLogitsProcessor] = {}
@@ -2394,7 +2397,13 @@ class RealSevenArmEngine:
         starlight_grounding_status = "NOT_STARTED" if "grounding" in starlight_enabled else "DISABLED_ABLATION"
         starlight_verdicts: dict[str, list[str]] = {}
         starlight_provenance: dict[str, dict[str, str]] = {}
-        starlight_keyword_report: dict[str, Any] = {}
+        # ITER3 Round A S4: the cap policy is traceable on EVERY starlight run, even when grounding does not run.
+        starlight_keyword_report: dict[str, Any] = {
+            "cap_policy_version": self.grounding_cap_policy.cap_policy_version,
+            "cap_policy": self.grounding_cap_policy.as_dict(),
+            "grounding_computed": False,
+            "reason": "NO_KEYWORD_MATCHING_THIS_REQUEST",
+        }
         starlight_assessments: dict[str, dict[str, Any]] = {}
         starlight_summaries: list[dict[str, Any]] = []
         starlight_max_retained = 0
@@ -2458,6 +2467,7 @@ class RealSevenArmEngine:
                         starlight_grounding, starlight_keyword_report = grounding_protection_with_report(
                             evidence_pool, full_prompt, self.tokenizer.encode, request_id, image_sha,
                             self.evidence_policy, image_present=bool(image_present),
+                            cap_policy=self.grounding_cap_policy,
                         )
                         starlight_grounding_status = "ACTIVE"
         tokens_generated: list[int] = []
