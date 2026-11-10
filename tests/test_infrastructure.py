@@ -1,0 +1,746 @@
+"""Tests for Seven-Arm Multimodal Infrastructure (H2O, DA, ECRD, Adapters, Hardware Gate).
+
+Validates:
+1. H2O KV-cache eviction policy, recurrent layer immunity, visual/system token protection under sequence growth.
+2. H2O speculative MTP transaction state machine (begin, partial/zero commit, rollback with zero residual state, nested protection).
+3. Declarative Attention (DA) FSM parsing, tag normalization, causal 2D read mask generation, and strict exclusion.
+4. ECRD logits processor contracts (is_argmax_invariant() callable returning False, citation provenance, winning-token alignment).
+5. Hardware gate enforcement (deterministic mocked CPU, sm_61, sm_75, sm_80 profiles; floor lowering prohibited).
+6. End-to-end execution of all 7 method arms with telemetry verification under synthetic test harness labeling.
+"""
+from unittest.mock import patch
+
+from vlmbench.infrastructure.adapters import InfrastructureRunner  # SYNTHETIC harness, not exported
+import numpy as np
+import pytest
+
+from vlmbench.infrastructure import (
+    H2OConfig,
+    H2OCacheTracker,
+    H2OEvictionPolicy,
+    H2OMTPTransaction,
+    DAConfig,
+    DATag,
+    DATagType,
+    DAFSM,
+    DAMaskGenerator,
+    DAAttentionModifier,
+    ECRDConfig,
+    EvidenceItem,
+    EvidencePool,
+    ECRDLogitsProcessor,
+    HardwareGateError,
+    check_vllm_hardware_compatibility,
+)
+
+
+# --- 1. H2O KV Eviction Tests ---
+
+def test_h2o_score_accumulation_and_budget():
+    config = H2OConfig(budget_ratio=0.5, recent_ratio=0.2, min_budget=4, protect_system_tokens=2)
+    tracker = H2OCacheTracker(config=config, num_layers=4, num_kv_heads=2)
+
+    # Simulate 10 tokens of attention
+    seq_len = 10
+    weights = np.ones((2, 1, seq_len), dtype=np.float32)
+    tracker.update_attention_scores(0, weights)
+
+    retained, metrics = tracker.compute_eviction_plan(0, current_length=seq_len)
+    assert len(retained) == seq_len
+    # R4-1: 2 sinks are protected and outside the budget. Unprotected = 8, budget = int(8 * 0.5) = 4.
+    # Retained = 2 + 4 = 6 (was 5 when the sinks sat inside the budget).
+    assert metrics["retained_tokens"] == 6
+    assert metrics["evicted_tokens"] == 4
+    # First 2 system tokens permanently protected
+    assert retained[0] and retained[1]
+    # Recent tokens retained
+    assert retained[-1]
+    assert "per_step_evicted_slot_rate" in metrics
+    assert "logical_selection_fraction" not in metrics  # R4-1: ambiguous name removed
+    assert metrics["kv_bytes_freed"] == "NOT_MEASURED_LOGICAL_MASK_ONLY"
+
+
+def test_h2o_recurrent_layer_immunity():
+    tracker = H2OCacheTracker(num_layers=4, num_kv_heads=1)
+    tracker.register_recurrent_layer(1)  # DeltaNet linear layer
+
+    weights = np.ones((1, 1, 8), dtype=np.float32)
+    tracker.update_attention_scores(1, weights)
+
+    # Recurrent layer should have zero scores accumulated (bypassed)
+    assert tracker.layers[1].scores.shape[1] == 0
+
+    retained, metrics = tracker.compute_eviction_plan(1, current_length=8)
+    assert np.all(retained)
+    assert metrics["retained_tokens"] == 8
+    assert metrics["evicted_tokens"] == 0
+
+
+def test_h2o_visual_token_protection_under_sequence_growth():
+    config = H2OConfig(budget_ratio=0.3, recent_ratio=0.1, min_budget=4, protect_visual_tokens=True)
+    tracker = H2OCacheTracker(config=config, num_layers=2, num_kv_heads=1)
+
+    # Initial mask defines 20 positions with tokens 5..9 as visual
+    visual_mask = [False] * 20
+    for i in range(5, 10):
+        visual_mask[i] = True
+    tracker.set_visual_tokens(visual_mask)
+
+    # SA-03 probe: Sequence grows past 20 to 25 positions
+    grown_seq_len = 25
+    weights = np.random.RandomState(42).rand(1, 1, grown_seq_len).astype(np.float32)
+    tracker.update_attention_scores(0, weights)
+
+    retained, metrics = tracker.compute_eviction_plan(0, current_length=grown_seq_len)
+    # All visual tokens 5..9 MUST remain protected despite sequence growth
+    for i in range(5, 10):
+        assert retained[i], f"Visual token at index {i} was evicted after sequence growth to {grown_seq_len}!"
+
+
+def test_h2o_mtp_transaction_lifecycle_and_residual_state():
+    tracker = H2OCacheTracker(num_layers=2, num_kv_heads=1)
+    weights = np.ones((1, 1, 4), dtype=np.float32)
+    tracker.update_attention_scores(0, weights)
+
+    orig_scores = np.copy(tracker.layers[0].scores)
+    assert tracker.seq_len == 4
+
+    mtp_tx = H2OMTPTransaction(tracker)
+
+    # 1. Begin transaction
+    mtp_tx.begin()
+    assert mtp_tx.in_transaction
+
+    # Nested begin must be blocked
+    with pytest.raises(RuntimeError, match="Nested MTP transactions not allowed"):
+        mtp_tx.begin()
+
+    # Speculative proposal: propose 4 tokens (seq_len becomes 8)
+    spec_weights = np.ones((1, 1, 8), dtype=np.float32) * 5.0
+    tracker.update_attention_scores(0, spec_weights)
+    assert tracker.seq_len == 8
+
+    # 2. Rollback when rejected
+    mtp_tx.rollback()
+    assert not mtp_tx.in_transaction
+    assert tracker.seq_len == 4
+    np.testing.assert_array_equal(tracker.layers[0].scores[:, :4], orig_scores)
+
+    # 3. Partial commit (SA-04 probe): proposing length 4->8 and committing 1 token
+    mtp_tx.begin()
+    tracker.update_attention_scores(0, spec_weights)
+    mtp_tx.commit(accepted_tokens=1)
+    # New sequence length must be exactly 4 + 1 = 5, not 8!
+    assert tracker.seq_len == 5
+    # Scores beyond index 5 must be zeroed out
+    assert np.all(tracker.layers[0].scores[:, 5:] == 0.0)
+
+    # 4. Commit 0 tokens triggers clean rollback
+    mtp_tx.begin()
+    tracker.update_attention_scores(0, np.ones((1, 1, 7), dtype=np.float32))
+    mtp_tx.commit(accepted_tokens=0)
+    assert tracker.seq_len == 5
+
+
+def test_h2o_per_layer_visual_mask_survives_different_compaction_indices():
+    config = H2OConfig(
+        budget_ratio=0.25, recent_ratio=0.2,
+        min_budget=1, protect_system_tokens=1, protect_visual_tokens=True,
+    )
+    tracker = H2OCacheTracker(config=config, num_layers=2, num_kv_heads=1)
+    original_visual = np.array([False, True, True, False, False, False, False, False])
+    tracker.set_visual_tokens(original_visual)
+
+    # Attention layers retain different index maps; image positions move to
+    # different physical indices. Global original mask must never be rewritten.
+    tracker.compact_layer_state(0, np.array([0, 1, 3, 5, 7]))
+    tracker.compact_layer_state(1, np.array([0, 2, 4, 6, 7]))
+    np.testing.assert_array_equal(tracker.visual_token_mask, original_visual)
+    assert tracker.layers[0].visual_token_mask.tolist() == [False, True, False, False, False]
+    assert tracker.layers[1].visual_token_mask.tolist() == [False, True, False, False, False]
+
+    # Next decode appends one nonvisual token per layer, then plans eviction.
+    for layer_idx in (0, 1):
+        retained, _ = tracker.compute_eviction_plan(layer_idx, current_length=6)
+        assert retained[1], f"Layer {layer_idx} lost protected visual evidence after compaction"
+        assert tracker.layers[layer_idx].visual_token_mask[-1] == False
+
+    # Speculative rollback restores each layer's coordinates independently.
+    tx = H2OMTPTransaction(tracker)
+    tx.begin()
+    tracker.compact_layer_state(0, np.array([0, 2, 4]))
+    tracker.compact_layer_state(1, np.array([0, 1, 3, 5]))
+    tx.rollback()
+    for layer_idx in (0, 1):
+        assert tracker.layers[layer_idx].visual_token_mask[1]
+        assert len(tracker.layers[layer_idx].visual_token_mask) == 6
+
+
+# --- 2. Declarative Attention (DA) Tests ---
+
+def test_da_fsm_tag_parsing():
+    fsm = DAFSM()
+    raw_prompt = (
+        "<da:global>Always read this context.</da:global> "
+        "Normal text here. "
+        "<da:focus id=\"img1\">Image caption and details.</da:focus> "
+        "<da:local window=\"32\">Sliding window paragraph.</da:local>"
+    )
+    clean_text, spans = fsm.parse_text(raw_prompt)
+
+    assert "<da:" not in clean_text
+    assert "</da:" not in clean_text
+    assert len(spans) == 3
+
+    types = [s[2] for s in spans]
+    assert types == [DATagType.GLOBAL, DATagType.FOCUS, DATagType.LOCAL]
+    assert spans[1][3]["id"] == "img1"
+    assert spans[2][3]["window"] == 32
+
+
+def test_da_fsm_malformed_and_unclosed_tags():
+    fsm = DAFSM()
+    raw = "<da:global>System instructions without closing tag"
+    clean, spans = fsm.parse_text(raw)
+    assert len(spans) == 1
+    assert spans[0][2] == DATagType.GLOBAL
+    assert clean == "System instructions without closing tag"
+
+
+def test_da_attention_mask_invariants():
+    generator = DAMaskGenerator(DAConfig(default_local_window=2))
+    seq_len = 6
+    tags = [
+        DATag(DATagType.GLOBAL, 0, 1),
+        DATag(DATagType.FOCUS, 1, 3, focus_id="A"),
+        DATag(DATagType.LOCAL, 3, 6, window=1),
+    ]
+    mask = generator.generate_attention_mask(seq_len=seq_len, tags=tags)
+
+    assert mask.shape == (seq_len, seq_len)
+
+    # Invariant 1: Causal masking (strictly lower-triangular + diagonal)
+    for q in range(seq_len):
+        for k in range(q + 1, seq_len):
+            assert not mask[q, k], f"Query {q} attended to future key {k}"
+
+    # Invariant 2: Global token (k=0) is attended to by all queries
+    for q in range(seq_len):
+        assert mask[q, 0], f"Query {q} failed to attend to global token 0"
+
+    # Invariant 3: Focus isolation
+    assert not mask[3, 1]
+    assert not mask[3, 2]
+
+    # Invariant 4: Local window 1
+    assert mask[5, 5]
+    assert mask[5, 4]
+    assert not mask[5, 3]
+
+    stats = generator.mask_statistics(mask)
+    assert stats["read_reduction_estimate"] > 0.0
+    assert stats["kv_cache_preserved_ratio"] == 1.0
+
+
+def test_da_attention_modifier_strict_exclusion():
+    modifier = DAAttentionModifier()
+    # SA-07 probe: allowed logit 0.0, forbidden logit 100000.0
+    logits = np.array([[[0.0, 100000.0]]], dtype=np.float32)
+    mask = np.array([[True, False]])
+    mod_logits = modifier.modify_attention_logits(logits, mask)
+
+    # With strict exclusion (-1e9), allowed logit MUST beat the forbidden logit
+    assert mod_logits[0, 0, 0] == 0.0
+    assert mod_logits[0, 0, 1] <= -1e8
+    assert np.argmax(mod_logits[0, 0]) == 0
+
+
+# --- 3. Grounding Evidence (ECRD) Tests ---
+
+class _MockTokenizer:
+    def decode(self, token_ids, skip_special_tokens=True):
+        mapping = {10: "apple", 20: "banana", 30: "orange"}
+        return " ".join(mapping.get(t, f"tok_{t}") for t in token_ids)
+
+
+def test_ecrd_is_argmax_invariant_contract():
+    pool = EvidencePool("test")
+    processor = ECRDLogitsProcessor(pool, _MockTokenizer())
+
+    # SA-05 contract: is_argmax_invariant() MUST be callable and return False
+    assert callable(processor.is_argmax_invariant)
+    assert processor.is_argmax_invariant() is False
+
+
+def test_ecrd_evidence_provenance_and_validation():
+    pool = EvidencePool("req_val")
+
+    # 1. Unverified evidence item rejected
+    with pytest.raises(ValueError, match="verified=False"):
+        pool.add_evidence(
+            EvidenceItem("ev_unverified", "text_span", "bad", "a" * 64, verified=False)
+        )
+
+    # 2. Invalid SHA256 rejected
+    with pytest.raises(ValueError, match="invalid SHA256"):
+        pool.add_evidence(
+            EvidenceItem("ev_bad_sha", "text_span", "bad", "not_a_valid_sha256", verified=True)
+        )
+
+    # 3. gold_answer_prohibited=False rejected
+    with pytest.raises(ValueError, match="gold_answer_prohibited=False"):
+        pool.add_evidence(
+            EvidenceItem("ev_leak", "text_span", "leak", "b" * 64, gold_answer_prohibited=False)
+        )
+
+
+def test_ecrd_citation_alignment_and_request_isolation():
+    pool = EvidencePool("req_1")
+    pool.add_evidence(
+        EvidenceItem("ev_apple", "image_region", "red fruit", "a" * 64),
+        keywords=["apple"],
+    )
+
+    tokenizer = _MockTokenizer()
+    config = ECRDConfig(reweight_alpha=2.0)
+    processor = ECRDLogitsProcessor(pool, tokenizer, config)
+
+    # Scenario A: Apple boosted and wins -> citation recorded
+    logits = np.zeros(50, dtype=np.float32)
+    logits[20] = 5.0  # banana
+    logits[10] = 4.0  # apple (+2.0 -> 6.0)
+    res = processor([1], logits)
+    assert np.argmax(res) == 10
+    assert len(processor.citations) == 1
+    assert processor.citations[0]["evidence_ids"] == ["ev_apple"]
+
+    # Scenario B (SA-06 probe): Apple boosted (+2.0 -> 3.0), but banana (10.0) still wins
+    processor.reset_request(pool)
+    logits_b = np.zeros(50, dtype=np.float32)
+    logits_b[20] = 10.0  # banana
+    logits_b[10] = 1.0   # apple
+    res_b = processor([1], logits_b)
+    assert np.argmax(res_b) == 20
+    # Winning token (banana) has NO evidence -> citations must be EMPTY!
+    assert len(processor.citations) == 0
+
+    # Scenario C: Request isolation -> reset_request clears previous state
+    processor.reset_request(None)
+    assert processor.evidence_pool.total_items == 0
+    assert len(processor.citations) == 0
+
+
+def test_ecrd_nan_safety():
+    pool = EvidencePool("nan_test")
+    processor = ECRDLogitsProcessor(pool, _MockTokenizer())
+
+    # NaNs or all -inf must raise ValueError cleanly
+    with pytest.raises(ValueError, match="NaN"):
+        processor([], np.array([np.nan, 1.0, 2.0], dtype=np.float32))
+
+    with pytest.raises(ValueError, match="all -inf"):
+        processor([], np.array([-np.inf, -np.inf], dtype=np.float32))
+
+
+# --- 4. Hardware Gate and Adapters Tests ---
+
+def test_hardware_gate_floor_lowering_prohibited():
+    # SA-08: Attempting to lower min_compute_capability below sm_75 must be blocked
+    with pytest.raises(ValueError, match="Cannot lower vLLM minimum compute capability"):
+        check_vllm_hardware_compatibility(target_backend="vllm", min_compute_capability=(6, 1))
+
+    # Invalid backend name must be rejected
+    with pytest.raises(ValueError, match="Unknown target_backend"):
+        check_vllm_hardware_compatibility(target_backend="unknown_engine")
+
+
+def test_hardware_gate_deterministic_mocks(monkeypatch):
+    import sys
+    # SA-09: Test hardware gate across all architectures deterministically using mocks
+
+    # Case 1: CPU mode (no CUDA detected)
+    monkeypatch.setitem(sys.modules, "torch", None)
+    monkeypatch.setattr("shutil.which", lambda _: None)
+    with pytest.raises(HardwareGateError, match="CUDA is not available"):
+        check_vllm_hardware_compatibility(target_backend="vllm")
+    cpu_prof = check_vllm_hardware_compatibility(target_backend="pytorch")
+    assert cpu_prof["device_name"] == "CPU"
+
+    # Case 2: sm_61 host (GTX 1080 Ti)
+    mock_run_sm61 = lambda *args, **kwargs: type("Res", (), {
+        "returncode": 0,
+        "stdout": "NVIDIA GeForce GTX 1080 Ti, 6.1, 11264 MiB\n",
+    })()
+    monkeypatch.setattr("subprocess.run", mock_run_sm61)
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/nvidia-smi")
+
+    # vLLM on sm_61 fails closed
+    with pytest.raises(HardwareGateError, match="requires compute capability >= sm_75, but detected sm_61"):
+        check_vllm_hardware_compatibility(target_backend="vllm")
+    # PyTorch on sm_61 succeeds
+    sm61_prof = check_vllm_hardware_compatibility(target_backend="pytorch")
+    assert sm61_prof["compute_capability"] == (6, 1)
+    assert sm61_prof["vllm_binary_compatible"] is False
+
+    # Case 3: sm_80 host (A100 40GB)
+    mock_run_a100 = lambda *args, **kwargs: type("Res", (), {
+        "returncode": 0,
+        "stdout": "NVIDIA A100-SXM4-40GB, 8.0, 40960 MiB\n",
+    })()
+    monkeypatch.setattr("subprocess.run", mock_run_a100)
+
+    a100_prof = check_vllm_hardware_compatibility(target_backend="vllm")
+    assert a100_prof["vllm_binary_compatible"] is True
+    assert a100_prof["compute_capability"] == (8, 0)
+
+
+def test_seven_arm_engine_all_arms_suite():
+    runner = InfrastructureRunner(target_backend="pytorch")
+    results = runner.run_all_arms_suite(max_tokens=6)
+
+    expected_arms = {
+        "base",
+        "h2o_base",
+        "da_base",
+        "ecrd_base",
+        "mtp",
+        "h2o_mtp",
+        "da_mtp",
+    }
+    assert set(results.keys()) == expected_arms
+
+    for arm, res in results.items():
+        assert res.method_arm == arm
+        assert len(res.tokens_generated) == 6
+        assert res.ttft_ms > 0.0
+        assert res.total_latency_ms > 0.0
+        assert res.execution_classification == "SYNTHETIC_REFERENCE_POLICY_TEST_HARNESS"
+        assert res.qualification_status == "BACKEND_UNQUALIFIED_A100_EXECUTION_REQUIRED"
+
+        if "h2o" in arm:
+            assert "final_h2o" in res.verification_trace
+            assert res.verification_trace["final_h2o"]["retained_tokens"] > 0
+            assert "per_step_evicted_slot_rate" in res.verification_trace["final_h2o"]
+        if "da" in arm:
+            assert "final_da_read_ratio" in res.verification_trace
+        if "ecrd" in arm:
+            assert "ecrd_citations" in res.verification_trace
+            assert "ecrd_auxiliary_calls" in res.verification_trace
+
+
+def test_h2o_visual_protection_not_miscounted_as_heavy_hitters():
+    """Visual protected keys sit OUTSIDE the budget (R4-1). The budget caps unprotected tokens only,
+    and no protected token is ever counted as a score-selected heavy hitter.
+    (Changed in R4-1: this test previously accepted that protected keys could exceed the budget.)"""
+    tracker = H2OCacheTracker(
+        H2OConfig(budget_ratio=0.2, recent_ratio=0.25, min_budget=4,
+                  protect_system_tokens=2, protect_visual_tokens=True),
+        num_layers=2,
+        num_kv_heads=1,
+    )
+    visual = [False] * 20
+    visual[5:10] = [True] * 5
+    tracker.set_visual_tokens(visual)
+    tracker.update_attention_scores(
+        0, np.ones((1, 1, 20), dtype=np.float32)
+    )
+    kept, metrics = tracker.compute_eviction_plan(0, current_length=20)
+    assert np.all(kept[5:10]), "Protected visual evidence must stay resident"
+    assert kept[0] and kept[1], "Sink tokens must stay resident"
+    # R4-1: heavy hitters are now real score-selected UNPROTECTED tokens. Protected visual tokens
+    # must never be counted among them. Budget 4 minus recent 1 leaves 3 heavy hitters.
+    assert metrics["heavy_hitters"] == metrics["budget"] - metrics["recent_tokens"] == 3
+    assert metrics["retained_tokens"] > metrics["heavy_hitters"]
+    assert int(kept.sum()) == metrics["protected_tokens"] + metrics["budget"]
+    unprotected_retained = metrics["retained_tokens"] - metrics["protected_tokens"]
+    assert unprotected_retained <= metrics["budget"], "budget caps unprotected retained tokens"
+
+
+def test_h2o_heavy_hitters_report_only_actual_score_selected_candidates():
+    tracker = H2OCacheTracker(
+        H2OConfig(budget_ratio=0.5, recent_ratio=0.2, min_budget=4,
+                  protect_system_tokens=2, protect_visual_tokens=False),
+        num_layers=1,
+        num_kv_heads=1,
+    )
+    tracker.update_attention_scores(
+        0, np.arange(10, dtype=np.float32)[None, None, :]
+    )
+    kept, metrics = tracker.compute_eviction_plan(0, current_length=10)
+    # R4-1: 2 sinks outside the budget. Unprotected = 8, budget 4 = 1 recent + 3 score-selected.
+    # Highest scores among candidates 2..8 are 8, 7, 6; recent window is position 9.
+    assert metrics["retained_tokens"] == 6
+    assert metrics["heavy_hitters"] == 3
+    assert int(kept.sum()) == 6
+    assert kept[0] and kept[1] and kept[6] and kept[7] and kept[8] and kept[9]
+    assert not kept[2:6].any()
+
+
+# --- P7 engine regression tests (2026-11-09 audit, base cfccc4b) ---
+
+def test_p7_h2o_mtp_commit_rejects_more_tokens_than_proposed():
+    """Regression: commit(accepted) larger than the proposal left seq_len past scored state."""
+    tracker = H2OCacheTracker(num_layers=2, num_kv_heads=1)
+    tracker.update_attention_scores(0, np.ones((1, 1, 4), dtype=np.float32))
+    tx = H2OMTPTransaction(tracker)
+    tx.begin()
+    tracker.update_attention_scores(0, np.ones((1, 1, 4), dtype=np.float32))  # 4 proposed
+    with pytest.raises(ValueError, match="exceed"):
+        tx.commit(accepted_tokens=10)
+    # Refused commit must leave the transaction open and rollback-able.
+    assert tx.in_transaction
+    tx.rollback()
+    assert tracker.seq_len == 4
+    assert tracker.layers[0].scores.shape[1] == 4
+
+
+@pytest.mark.parametrize("window_attr", ['"-4"', '"abc"'])
+def test_p7_da_rejects_negative_or_malformed_local_window(window_attr):
+    """Regression: a negative window made every local key unreadable (even by itself),
+    and a non-numeric window crashed with an opaque numpy int() error."""
+    fsm = DAFSM()
+    _, spans = fsm.parse_text(f"<da:local window={window_attr}>x</da:local>")
+    tags = fsm.spans_to_token_tags(spans, [(0, 1)])
+    with pytest.raises(ValueError, match="window"):
+        DAMaskGenerator().generate_attention_mask(seq_len=1, tags=tags)
+    with pytest.raises(ValueError, match="window"):
+        DAMaskGenerator().generate_attention_mask(
+            seq_len=2, tags=[DATag(DATagType.LOCAL, 0, 2, window=-1)])
+
+
+def test_p7_da_zero_window_keeps_self_attention():
+    """Boundary: window=0 is legal and must still let each query read itself (no empty row)."""
+    mask = DAMaskGenerator().generate_attention_mask(
+        seq_len=3, tags=[DATag(DATagType.LOCAL, 0, 3, window=0)])
+    assert np.all(np.diag(mask))
+
+
+# --- P7 round 2: fixed H2O budget from prefill length (audit wF:p9, CRITICAL) ---
+
+def _h2o_decode_steps(tracker, layer_idx, start_len, steps, seed=0):
+    """Drive repeated decode compaction exactly like the engine: plan -> compact -> score."""
+    rng = np.random.RandomState(seed)
+    length = start_len
+    tracker.update_attention_scores(layer_idx, rng.rand(1, length, length).astype(np.float32))
+    retained_counts = []
+    for step in range(steps):
+        keep, _ = tracker.compute_eviction_plan(layer_idx, current_length=length + 1)
+        idx = np.where(keep)[0]
+        tracker.compact_layer_state(layer_idx, idx)
+        tracker.update_attention_scores(
+            layer_idx, rng.rand(1, 1, len(idx)).astype(np.float32))
+        length = len(idx)
+        retained_counts.append(int(keep.sum()))
+    return retained_counts
+
+
+def test_p7_h2o_budget_does_not_decay_under_repeated_compaction():
+    """Regression: the budget was recomputed from the already-compacted length each step
+    (300 -> 150 -> 75 -> 38 -> 32). A fixed prefill-derived budget must hold steady."""
+    tracker = H2OCacheTracker(H2OConfig(budget_ratio=0.5, min_budget=32), num_layers=1, num_kv_heads=1)
+    tracker.initialize_budget(0, prefill_length=300)
+    counts = _h2o_decode_steps(tracker, 0, start_len=300, steps=8)
+    # R4-1 changed text-only totals: budget = int((300 - 4 sinks) * 0.5) = 148, plus 4 protected sinks.
+    # Was [150]*8 when sinks sat inside the budget. Still fixed, not decaying.
+    assert counts == [152] * 8, f"retained count decayed: {counts}"
+
+
+def test_p7_h2o_zero_eviction_while_within_budget():
+    tracker = H2OCacheTracker(H2OConfig(budget_ratio=0.5, min_budget=4), num_layers=1, num_kv_heads=1)
+    tracker.initialize_budget(0, prefill_length=20)  # 4 sinks protected; budget = int(16 * 0.5) = 8
+    tracker.update_attention_scores(0, np.ones((1, 1, 10), dtype=np.float32))
+    for length in (5, 9, 12):  # unprotected 1, 5, 8 <= 8
+        keep, m = tracker.compute_eviction_plan(0, current_length=length)
+        assert keep.all() and m["evicted_tokens"] == 0, f"evicted within budget at length {length}"
+    # R4-1: 13 tokens = 4 protected + 9 unprotected > budget 8 -> exactly one unprotected eviction
+    keep, m = tracker.compute_eviction_plan(0, current_length=13)
+    assert int(keep.sum()) == 12 and m["evicted_tokens"] == 1
+
+
+def test_p7_h2o_protected_saturation_is_explicit():
+    """R4-1 (replaces the round-2 saturation semantics, which let retained exceed the budget):
+    protected sinks+visual are OUTSIDE the budget. Budget = int((30 - 22) * 0.5) = 4 unprotected slots.
+    Total retained = 22 protected + 4 unprotected = 26. No saturation state exists any more."""
+    tracker = H2OCacheTracker(
+        H2OConfig(budget_ratio=0.5, recent_ratio=0.2, min_budget=4,
+                  protect_system_tokens=2, protect_visual_tokens=True),
+        num_layers=1, num_kv_heads=1)
+    visual = [False] * 30
+    visual[4:24] = [True] * 20
+    tracker.set_visual_tokens(visual)
+    tracker.initialize_budget(0, prefill_length=30)  # budget 15 < 22 protected
+    tracker.update_attention_scores(0, np.ones((1, 1, 30), dtype=np.float32))
+    keep, m = tracker.compute_eviction_plan(0, current_length=30)
+    assert "protected_saturated" not in m
+    assert keep[:2].all() and keep[4:24].all() and keep[-1]
+    assert int(keep.sum()) == 26  # 22 protected + 4 unprotected (budget)
+    assert m["heavy_hitters"] == 3 and m["budget"] == 4
+
+
+def test_p7_h2o_unsaturated_protected_keeps_total_budget():
+    tracker = H2OCacheTracker(
+        H2OConfig(budget_ratio=0.5, recent_ratio=0.2, min_budget=4,
+                  protect_system_tokens=2, protect_visual_tokens=True),
+        num_layers=1, num_kv_heads=1)
+    visual = [False] * 40
+    visual[5:9] = [True] * 4
+    tracker.set_visual_tokens(visual)
+    counts = _h2o_decode_steps(tracker, 0, start_len=40, steps=6, seed=3)
+    # R4-1: 6 protected (2 sinks + 4 visual) sit outside the budget; unprotected budget = 17.
+    assert counts == [23] * 6
+
+
+# --- P7 round 2: ECRD keyword matching must be word-bounded (audit wF:p9) ---
+
+def _p7_pool(keyword):
+    pool = EvidencePool("p7_ecrd")
+    pool.add_evidence(EvidenceItem("ev_kw", "text_span", "fact", "4" * 64), keywords=[keyword])
+    return pool
+
+
+@pytest.mark.parametrize("token_text", ["reduced", "shred", "hundred", "tar", "rede"])
+def test_p7_ecrd_keyword_does_not_match_inside_other_words(token_text):
+    """Regression: 'red' matched 'reduced'/'shred'; 'tar' matched 'target' (substring rule)."""
+    keyword = "red" if token_text != "tar" else "target"
+    assert _p7_pool(keyword).match_keywords(token_text) == []
+
+
+@pytest.mark.parametrize("token_text", ["red", " Red", "red.", "RED,"])
+def test_p7_ecrd_keyword_matches_whole_word_with_bpe_and_punctuation(token_text):
+    assert _p7_pool("red").match_keywords(token_text) == ["ev_kw"]
+
+
+def test_p7_ecrd_multiword_keyword_matches_contiguous_words_only():
+    pool = _p7_pool("red apple")
+    assert pool.match_keywords("red apple") == ["ev_kw"]
+    assert pool.match_keywords("apple") == []
+    assert pool.match_keywords("red") == []
+
+
+def test_p7_ecrd_does_not_boost_substring_token_in_logits():
+    class _Tok:
+        table = {5: "reduced", 6: "red"}
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join(self.table.get(i, "") for i in ids)
+
+        def encode(self, text):
+            return []
+
+    proc = ECRDLogitsProcessor(_p7_pool("red"), _Tok(), ECRDConfig(reweight_alpha=3.0))
+    logits = np.zeros(10, dtype=np.float32)
+    logits[5] = 1.0  # "reduced" would win only if it were boosted
+    out = proc([], logits)
+    assert out[5] == pytest.approx(1.0), "substring token was boosted by evidence keyword"
+    assert out[6] == pytest.approx(3.0), "whole-word token must still be boosted by alpha"
+    assert int(np.argmax(out)) == 6
+
+
+def test_p7_adapter_da_numbers_carry_scope_label():
+    """DA numbers from the synthetic harness must not read as decode-only scripted results."""
+    res = InfrastructureRunner(target_backend="pytorch").run_method_verification("da_base", max_tokens=4)
+    assert "final_da_read_ratio" in res.verification_trace
+    assert res.verification_trace["final_da_label"] == "SYNTHETIC_PROMPT_MASK_STATS_NOT_DECODE_ONLY_DIAGNOSTIC"
+
+
+# --- R4-1 (lead round 4, auditor H2O HIGH): protected tokens outside the budget ---
+
+def _r4_decode_with_identity(tracker, layer_idx, prefill_len, steps, seed=0):
+    """Engine-like decode that tracks the ORIGINAL position of every physical slot."""
+    rng = np.random.RandomState(seed)
+    ids = np.arange(prefill_len)
+    tracker.update_attention_scores(layer_idx, rng.rand(1, prefill_len, prefill_len).astype(np.float32))
+    next_id = prefill_len
+    history = []
+    for _ in range(steps):
+        keep, m = tracker.compute_eviction_plan(layer_idx, current_length=len(ids) + 1)
+        ids = np.append(ids, next_id)
+        next_id += 1
+        idx = np.where(keep)[0]
+        tracker.compact_layer_state(layer_idx, idx)
+        ids = ids[idx]
+        tracker.update_attention_scores(layer_idx, rng.rand(1, 1, len(idx)).astype(np.float32))
+        history.append((ids.copy(), m))
+    return history
+
+
+def _r4_image_tracker(prefill_len=340, visual=range(20, 320)):
+    tracker = H2OCacheTracker(
+        H2OConfig(budget_ratio=0.5, recent_ratio=0.2, min_budget=32,
+                  protect_system_tokens=4, protect_visual_tokens=True),
+        num_layers=1, num_kv_heads=1)
+    mask = [False] * prefill_len
+    for p in visual:
+        mask[p] = True
+    tracker.set_visual_tokens(mask)
+    tracker.initialize_budget(0, prefill_length=prefill_len)
+    return tracker, set(visual)
+
+
+def test_r4_budget_is_computed_from_unprotected_prefill_length():
+    tracker, _ = _r4_image_tracker()
+    # protected at prefill = 4 sinks + 300 visual = 304; unprotected = 36; budget = max(32, int(36*0.5)) = 32
+    assert tracker.layers[0].budget == 32
+    assert tracker.layers[0].budget != max(32, int(340 * 0.5)), "budget must not use the full prefill length"
+
+
+def test_r4_text_tokens_survive_on_image_prompt_across_many_decode_steps():
+    """Round-3 code kept 0 prompt-text tokens from step 2 on this prompt (auditor simulation)."""
+    tracker, visual = _r4_image_tracker()
+    text_prefill = {p for p in range(340) if p not in visual and p >= 4}  # non-sink text positions
+    history = _r4_decode_with_identity(tracker, 0, prefill_len=340, steps=40)
+    for step, (ids, m) in enumerate(history, start=1):
+        kept_text = text_prefill & set(ids.tolist())
+        assert len(kept_text) > 0, f"no prompt text token survived at decode step {step}"
+
+
+def test_r4_retained_unprotected_never_exceeds_budget_and_total_is_protected_plus_budget():
+    tracker, visual = _r4_image_tracker()
+    budget = tracker.layers[0].budget
+    protected_ids = visual | {0, 1, 2, 3}
+    history = _r4_decode_with_identity(tracker, 0, prefill_len=340, steps=40)
+    for step, (ids, m) in enumerate(history, start=1):
+        kept = set(ids.tolist())
+        unprotected_kept = kept - protected_ids
+        assert len(unprotected_kept) <= budget, f"step {step}: {len(unprotected_kept)} > budget {budget}"
+        if m["evicted_tokens"] > 0:  # steady state: retained = protected + budget exactly
+            assert len(kept) == len(protected_ids) + budget, f"step {step}: total {len(kept)}"
+
+
+def test_r4_protected_tokens_are_never_evicted():
+    tracker, visual = _r4_image_tracker()
+    protected_ids = visual | {0, 1, 2, 3}
+    history = _r4_decode_with_identity(tracker, 0, prefill_len=340, steps=40)
+    for step, (ids, _) in enumerate(history, start=1):
+        assert protected_ids <= set(ids.tolist()), f"protected token evicted at step {step}"
+
+
+def test_r4_per_step_rate_is_named_per_step_and_cumulative_is_not_in_plan():
+    tracker, _ = _r4_image_tracker()
+    _, m = tracker.compute_eviction_plan(0, current_length=341)
+    assert "per_step_evicted_slot_rate" in m and "logical_selection_fraction" not in m
+    assert m["protected_tokens"] == 304 and m["budget"] == 32
+
+
+# --- R4-2: h2o.py header must say the MTP transaction is used only by the synthetic adapter ---
+
+def test_r4_h2o_module_header_scopes_mtp_transaction_to_synthetic_adapter():
+    import vlmbench.infrastructure.h2o as h2o_mod
+    doc = h2o_mod.__doc__
+    assert "synthetic" in doc.lower()
+    assert "not used by the real engine" in doc.lower()
+
+
+# --- R5-1: tracker no-eviction oracle (protection off, budget covers the sequence) ---
+
+def test_r5_protection_off_full_budget_returns_full_mask_every_step():
+    tracker = H2OCacheTracker(
+        H2OConfig(budget_ratio=1.0, min_budget=1000, protect_visual_tokens=False,
+                  protect_system_tokens=0),
+        num_layers=1, num_kv_heads=1)
+    tracker.initialize_budget(0, prefill_length=50)
+    tracker.update_attention_scores(0, np.random.RandomState(0).rand(1, 50, 50).astype(np.float32))
+    for length in (50, 51, 77, 300, 999):
+        keep, m = tracker.compute_eviction_plan(0, current_length=length)
+        assert keep.all() and keep.shape == (length,), f"length {length}"
+        assert m["evicted_tokens"] == 0 and m["unprotected_retained"] == length

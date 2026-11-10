@@ -15,7 +15,9 @@ __pycache__/
 models/
 data/
 raw/
-artifacts/
+artifacts/*
+!artifacts/*.json
+!artifacts/*.md
 runs/
 outputs/
 *.log
@@ -26,5 +28,8 @@ outputs/
 **/token.json
 
 # Agent-operated Colab CLI: never commit local receipts / source snapshots
-agent_artifacts/
+agent_artifacts/*
+!artifacts/*.json
+!artifacts/*.md
 *.pending
+*.egg-info/

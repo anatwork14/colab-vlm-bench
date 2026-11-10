@@ -6,6 +6,8 @@
 **Active owner priority:** [Qwen3.5-0.8B + 4B Base/MTP](QWEN_PRIORITY.md) — pilot, then confirmatory, on Colab A100 40GB. Status **NOT_RUN** until real GPU measurements arrive. Other models deferred.
 
 
+**GPU gate order and stop rules:** [GPU_RUNBOOK.md](GPU_RUNBOOK.md) (audit 2026-11-09; paid execution blocked until its gates G-A to G-F are closed). Numeric audit: [docs/audit/NUMERIC_INTEGRITY_LEDGER.md](../docs/audit/NUMERIC_INTEGRITY_LEDGER.md), [docs/audit/REPRODUCIBILITY_MANIFEST.md](../docs/audit/REPRODUCIBILITY_MANIFEST.md).
+
 **Current status: NOT_RUN.** No GPU results have been generated from this repository.
 
 Run records use `runbooks/<campaign_id>/RUNBOOK.md` plus `summary.json`, source/config SHA256 and source revision. Large raw artifacts must live in secure Drive storage (do not publish anonymous access links). Failure/OOM/capacity records are first-class.

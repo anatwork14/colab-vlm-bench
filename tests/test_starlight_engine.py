@@ -1,0 +1,391 @@
+"""STARLIGHT Stage 1 wired into RealSevenArmEngine (cpu_pytorch_reference_not_vllm).
+
+Hard cases from the ITER2 brief, each exercised through the engine or its per-step helper:
+DA/H2O conflict, grounding/H2O conflict, protection > budget (INFEASIBLE), expired and stale
+evidence, irrelevant evidence wrongly protected (measured), long-context pressure, missing and
+malformed declarations, multi-request isolation, multi-turn continuity, no eligible candidates.
+Invariants: protected never evicted; evicted subset of H2O candidates; retained <= budget unless
+INFEASIBLE; ablations differ only by the removed signal; no-eviction oracle; recurrent exemption.
+"""
+
+import hashlib
+
+import numpy as np
+import pytest
+import torch
+
+from vlmbench.infrastructure.evidence_verification import EvidencePolicy
+from vlmbench.infrastructure.grounding_evidence import EvidenceItem, EvidencePool
+from vlmbench.infrastructure.h2o import H2OCacheTracker, H2OConfig
+from vlmbench.infrastructure.model_config import Qwen35ModelConfig
+from vlmbench.infrastructure.real_engine import RealSevenArmEngine
+
+# S1 (evidence policy): text-only fixtures with caller verified=True do not protect by default. The tests below
+# that check grounding MECHANICS opt in explicitly (accept_declared=True, reported and ablatable). The default-off
+# gate is pinned in tests/test_i3a_s1_evidence_dimensions.py.
+ACCEPT_DECLARED = EvidencePolicy(accept_declared=True)
+from vlmbench.infrastructure.starlight import (
+    STATUS_INFEASIBLE,
+    STATUS_OK,
+    combine_summaries,
+    summarize_plans,
+)
+
+SEVEN_ARMS = frozenset(("base", "h2o_base", "da_base", "ecrd_base", "mtp", "h2o_mtp", "da_mtp"))
+STARLIGHT_ARMS = frozenset((
+    "starlight_s1", "starlight_s1_no_da", "starlight_s1_no_grounding", "starlight_s1_mtp",
+))  # Stage 2(b): + starlight_s1_mtp
+# ITER3 Round A H2 confounder control (no internal protection). A control, not a STARLIGHT arm.
+H2_CONTROL_ARMS = frozenset(("h2o_shared_base",))
+SHA = hashlib.sha256(b"no-image").hexdigest()
+
+
+def _cfg():
+    return Qwen35ModelConfig(
+        model_id="Qwen/Qwen3.5-StarlightTest", model_type="qwen3_5",
+        architectures=("Qwen3_5ForConditionalGeneration",),
+        vocab_size=512, hidden_size=64, num_hidden_layers=8, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=16, intermediate_size=128, max_position_embeddings=1024,
+        image_token_id=500, vision_start_token_id=501, vision_end_token_id=502,
+        pad_token_id=0, eos_token_id=1, full_attention_layers=(3, 7),
+        recurrent_layers=(0, 1, 2, 4, 5, 6), mtp_num_speculative_tokens=2,
+    )
+
+
+class _WordTok:
+    """Fake tokenizer: case- and space-insensitive word ids below the tiny vocab."""
+
+    VOCAB = {"the": 7, "car": 8, "cat": 9}
+
+    def encode(self, text):
+        return [self.VOCAB[w] for w in text.lower().split() if w in self.VOCAB]
+
+    def decode(self, ids, skip_special_tokens=True):
+        return " ".join(f"t{int(i)}" for i in ids)
+
+
+def _engine(arm, **kw):
+    torch.manual_seed(1234)
+    return RealSevenArmEngine(method_arm=arm, device="cpu", config=_cfg(), **kw)
+
+
+def _pool(request_id, keywords, eid="ev_1", sha=SHA):
+    pool = EvidencePool(request_id)
+    pool.add_evidence(EvidenceItem(evidence_id=eid, modality="text_span", content=" ".join(keywords),
+                                   source_sha256=sha, verified=True), keywords=list(keywords))
+    return pool
+
+
+def _scored_tracker(scores):
+    t = H2OCacheTracker(config=H2OConfig(), num_layers=8, num_kv_heads=2)
+    for layer in (3, 7):
+        w = np.tile(np.asarray(scores, dtype=np.float32), (4, 1, 1))  # 4 query heads, 1 query
+        t.update_attention_scores(layer, w)
+    return t
+
+
+def _step(engine, tracker, length, budget, da_spans=(), grounding=None, enabled=("da", "grounding")):
+    k_lens = {3: length, 7: length}
+    orig = {3: np.arange(length - 1), 7: np.arange(length - 1)}
+    return engine._starlight_build_step_plans(
+        tracker, k_lens, orig, length - 1, budget, list(da_spans), dict(grounding or {}), tuple(enabled),
+    )
+
+
+# --- arm registry -------------------------------------------------------------------------
+
+def test_supported_arms_adds_four_starlight_arms_and_keeps_the_seven():
+    # Updated in ITER3 Round A: the set now also contains the H2 control arm (expectation extended, not relaxed).
+    assert RealSevenArmEngine.SUPPORTED_ARMS == SEVEN_ARMS | STARLIGHT_ARMS | H2_CONTROL_ARMS
+
+
+def test_existing_h2o_base_has_no_starlight_telemetry():
+    result = _engine("h2o_base").execute_request(
+        request_id="r_h2o", prompt_token_ids=list(range(100, 130)), image_present=False, max_new_tokens=4)
+    assert "starlight" not in result.telemetry
+
+
+# --- helper-level hard cases (one engine step, deterministic scores) ----------------------
+
+def test_da_h2o_conflict_is_vetoed_not_evicted():
+    engine = _engine("starlight_s1")
+    tracker = _scored_tracker([0, 0, 5, 4, 3, 2, 1, 1, 1, 1])
+    plans_t, orig_next, plans = _step(engine, tracker, length=10, budget=6,
+                                      da_spans=[("sink_global", 0, 2)])
+    plan = plans[0]
+    assert plan.status == STATUS_OK
+    assert plan.h2o_candidates_vetoed == 2            # slots 0 and 1: H2O wanted them gone
+    assert plan.evicted == (5, 6, 7, 8)
+    assert plan.retained == (0, 1, 2, 3, 4, 9)
+    assert len(plan.retained) == 6                    # budget respected
+    assert sorted(plans_t[3].tolist()) == list(plan.retained)
+    assert orig_next[3].tolist() == list(plan.retained)
+
+
+def test_grounding_h2o_conflict_is_vetoed_not_evicted():
+    engine = _engine("starlight_s1")
+    tracker = _scored_tracker([5, 4, 3, 2, 1, 0, 0, 0, 0, 1])
+    _, _, plans = _step(engine, tracker, length=10, budget=6, grounding={5: ("ev_1",)})
+    plan = plans[0]
+    assert plan.status == STATUS_OK
+    assert plan.decisions[5].decision == "RETAIN_PROTECTED_VETOED_H2O_CANDIDATE"
+    assert plan.decisions[5].signals_fired == ("grounding:ev_1",)
+    assert plan.evicted == (4, 6, 7, 8)
+    assert plan.retained == (0, 1, 2, 3, 5, 9)
+
+
+def test_protection_exceeding_budget_is_infeasible_and_nothing_is_evicted():
+    # ITER2 D4 S-3 (auditor HIGH, lead ruling): when INFEASIBLE, evict NOTHING in that step.
+    engine = _engine("starlight_s1")
+    tracker = _scored_tracker([1] * 10)
+    _, _, plans = _step(engine, tracker, length=10, budget=6, da_spans=[("sink_global", 0, 7)])
+    plan = plans[0]
+    assert plan.status == STATUS_INFEASIBLE
+    assert plan.infeasible_reason == "protected_exceeds_budget"
+    assert plan.evicted == ()                        # was (7, 8, 9) before S-3: now nothing evicted
+    assert plan.retained == tuple(range(10))         # all protected and all other entries retained
+    assert plan.kv_budget_violated is True           # 10 retained > budget 6, reported explicitly
+    unprotected_candidates = [d for d in plan.decisions if d.h2o_candidate and not d.internally_protected]
+    assert unprotected_candidates, "fixture must contain H2O candidates that would have been evicted"
+    assert all(d.reason_code == "INFEASIBLE_NO_EVICTION" for d in unprotected_candidates)
+
+
+def test_within_budget_has_no_candidates_and_no_eviction():
+    engine = _engine("starlight_s1")
+    tracker = _scored_tracker([1] * 5)
+    _, _, plans = _step(engine, tracker, length=5, budget=6)
+    assert plans[0].status == STATUS_OK
+    assert plans[0].evicted == ()
+    assert plans[0].h2o_candidates_vetoed == 0
+
+
+# --- engine-level runs --------------------------------------------------------------------
+
+def test_no_eviction_oracle_matches_base_tokens_when_budget_covers_the_sequence():
+    prompt = list(range(100, 140))
+    base_engine = _engine("base", stop_at_eos=False)
+    base_tokens = base_engine.execute_request(
+        request_id="oracle", prompt_token_ids=prompt, image_present=False, max_new_tokens=8).tokens_generated
+    star_engine = _engine("starlight_s1", stop_at_eos=False, h2o_min_budget=256)
+    result = star_engine.execute_request(
+        request_id="oracle", prompt_token_ids=prompt, image_present=False, max_new_tokens=8)
+    assert result.tokens_generated == base_tokens
+    assert result.telemetry["starlight"]["evicted_total"] == 0
+
+
+def test_long_context_pressure_keeps_budget_and_invariants():
+    prompt = list(range(100, 140))  # 40 tokens; budget 16 forces eviction from the first step
+    result = _engine("starlight_s1", stop_at_eos=False, h2o_min_budget=16, h2o_budget_ratio=0.2) \
+        .execute_request(request_id="pressure", prompt_token_ids=prompt, image_present=False,
+                         max_new_tokens=12)
+    s = result.telemetry["starlight"]
+    assert s["budget_total"] == 16
+    assert s["evicted_total"] > 0
+    assert s["max_retained_per_layer_step"] <= 16
+    assert s["infeasible_steps"] == 0
+    assert s["invariant_protected_evicted"] == 0
+    assert s["invariant_evicted_not_candidate"] == 0
+
+
+def test_expired_evidence_protects_nothing_and_is_reported():
+    tok = _WordTok()
+    pool = _pool("request_earlier", ["the"])
+    result = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False).execute_request(
+        request_id="request_now", prompt_token_ids=[7, 9, 7, 8, 7], image_present=False,
+        max_new_tokens=2, evidence_pool=pool)
+    s = result.telemetry["starlight"]
+    assert s["grounding_protected_by_evidence"] == {}
+    assert s["grounding_evidence_verdicts"] == {"ev_1": ["expired", "pool_request_id_mismatch", "EXPIRED_EVIDENCE"]}
+    assert s["protected_count_by_source"]["grounding"] == 0
+
+
+def test_irrelevant_evidence_protection_is_measured_per_evidence_id():
+    # ITER3 R2 C-4 RE-DERIVED. The original keyword 'the' (three tokens) is a stop-word: it now protects
+    # nothing, and the rejection is REPORTED (it is measured, not hidden). The per-evidence measurement is kept
+    # with a content keyword: 'car' (token 8) occurs once in this 5-token prompt, fraction 1/5 = 0.2, at the cap.
+    tok = _WordTok()
+    stop = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False,
+                   evidence_policy=ACCEPT_DECLARED).execute_request(
+        request_id="req_irr", prompt_token_ids=[7, 9, 7, 8, 7], image_present=False,
+        max_new_tokens=2, evidence_pool=_pool("req_irr", ["the"], eid="ev_the"))
+    s_stop = stop.telemetry["starlight"]
+    assert s_stop["grounding_protected_by_evidence"] == {}
+    assert s_stop["grounding_keyword_policy"]["rejected_stopword"] == ["the"]
+    content = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False,
+                      evidence_policy=ACCEPT_DECLARED).execute_request(
+        request_id="req_irr2", prompt_token_ids=[7, 9, 7, 8, 7], image_present=False,
+        max_new_tokens=2, evidence_pool=_pool("req_irr2", ["car"], eid="ev_car"))
+    s = content.telemetry["starlight"]
+    assert s["grounding_protected_by_evidence"] == {"ev_car": 1}  # the one 'car' token, reported
+    assert s["protected_count_by_source"]["grounding"] > 0
+
+
+def test_missing_declarations_are_explicit_not_silent():
+    no_pool = _engine("starlight_s1", tokenizer=_WordTok(), stop_at_eos=False).execute_request(
+        request_id="r_nopool", prompt_token_ids=[7, 9], image_present=False, max_new_tokens=1)
+    assert no_pool.telemetry["starlight"]["grounding_signal_status"] == "NO_EVIDENCE_DECLARED"
+    pool = _pool("r_notok", ["the"])
+    no_tok = _engine("starlight_s1", stop_at_eos=False).execute_request(
+        request_id="r_notok", prompt_token_ids=[7, 9], image_present=False, max_new_tokens=1,
+        evidence_pool=pool)
+    assert no_tok.telemetry["starlight"]["grounding_signal_status"] == "UNAVAILABLE_NO_TOKENIZER"
+    assert no_tok.telemetry["starlight"]["protected_count_by_source"]["grounding"] == 0
+
+
+def test_malformed_evidence_declaration_is_rejected_before_any_protection():
+    bad = EvidenceItem(evidence_id="ev_bad", modality="text_span", content="the",
+                       source_sha256="not-a-sha", verified=True)
+    pool = EvidencePool("r_bad")
+    with pytest.raises(ValueError, match="SHA256"):
+        pool.add_evidence(bad, keywords=["the"])
+    assert pool.total_items == 0
+
+
+def test_multi_request_isolation_second_request_is_unaffected_by_first():
+    tok = _WordTok()
+    prompt = [7, 9, 7, 8, 7, 9, 8, 7, 9, 9, 8, 7]
+    engine = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False, h2o_min_budget=8,
+                     h2o_budget_ratio=0.5, evidence_policy=ACCEPT_DECLARED)
+    # ITER3 R2 C-4 RE-DERIVED: keyword 'the' -> 'car', prompt extended to 36 tokens so car (3 of 36) is under the cap.
+    prompt = prompt + list(range(100, 124))
+    first = engine.execute_request(request_id="iso_a", prompt_token_ids=prompt, image_present=False,
+                                   max_new_tokens=4, evidence_pool=_pool("iso_a", ["car"], eid="ev_a"))
+    assert first.telemetry["starlight"]["grounding_protected_by_evidence"], "first request must protect (non-vacuous)"
+    second = engine.execute_request(request_id="iso_b", prompt_token_ids=prompt, image_present=False,
+                                    max_new_tokens=4)
+    fresh = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False, h2o_min_budget=8,
+                    h2o_budget_ratio=0.5, evidence_policy=ACCEPT_DECLARED).execute_request(
+        request_id="iso_b", prompt_token_ids=prompt, image_present=False, max_new_tokens=4)
+    assert second.tokens_generated == fresh.tokens_generated
+    assert second.telemetry["starlight"]["protected_count_by_source"] == \
+        fresh.telemetry["starlight"]["protected_count_by_source"]
+    assert second.telemetry["starlight"]["grounding_protected_by_evidence"] == {}
+
+
+def test_multi_turn_continuity_same_request_id_matches_fresh_engine():
+    tok = _WordTok()
+    prompt = [7, 9, 7, 8, 7, 9, 8, 7, 9, 9, 8, 7]
+    engine = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False, h2o_min_budget=8,
+                     h2o_budget_ratio=0.5, evidence_policy=ACCEPT_DECLARED)
+    # ITER3 R2 C-4 RE-DERIVED: keyword 'the' -> 'car' and prompt extended (car 3 of 36 is under the cap).
+    prompt = prompt + list(range(100, 124))
+    pool = _pool("turns", ["car"])
+    turn1 = engine.execute_request(request_id="turns", prompt_token_ids=prompt, image_present=False,
+                                   max_new_tokens=3, evidence_pool=pool)
+    assert turn1.telemetry["starlight"]["grounding_protected_by_evidence"], "turn 1 must protect (non-vacuous)"
+    turn2 = engine.execute_request(request_id="turns", prompt_token_ids=prompt, image_present=False,
+                                   max_new_tokens=3, evidence_pool=pool)
+    fresh = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False, h2o_min_budget=8,
+                    h2o_budget_ratio=0.5, evidence_policy=ACCEPT_DECLARED).execute_request(
+        request_id="turns", prompt_token_ids=prompt, image_present=False, max_new_tokens=3,
+        evidence_pool=pool)
+    assert turn2.tokens_generated == fresh.tokens_generated == turn1.tokens_generated
+    assert turn2.telemetry["starlight"]["evicted_total"] == fresh.telemetry["starlight"]["evicted_total"]
+
+
+def test_ablation_no_da_removes_only_the_da_signal_and_does_not_enable_da_masking():
+    tok = _WordTok()
+    prompt = list(range(100, 140))
+    for i in (5, 20, 33):  # ITER3 R2 C-4 RE-DERIVED: 'car' (token 8) at 3 of 40 positions, under the cap
+        prompt[i] = 8
+    pool = _pool("abl", ["car"])
+    full = _engine("starlight_s1", tokenizer=tok, stop_at_eos=False, h2o_min_budget=16,
+                   h2o_budget_ratio=0.2, evidence_policy=ACCEPT_DECLARED).execute_request(
+        request_id="abl", prompt_token_ids=prompt, image_present=False, max_new_tokens=4, evidence_pool=pool)
+    no_da = _engine("starlight_s1_no_da", tokenizer=tok, stop_at_eos=False, h2o_min_budget=16,
+                    h2o_budget_ratio=0.2, evidence_policy=ACCEPT_DECLARED).execute_request(
+        request_id="abl", prompt_token_ids=prompt, image_present=False, max_new_tokens=4, evidence_pool=pool)
+    assert no_da.telemetry["starlight"]["signals_enabled"] == ["grounding", "structural"]
+    assert no_da.telemetry["starlight"]["protected_count_by_source"]["da"] == 0
+    assert no_da.telemetry["starlight"]["conflicts_by_source"]["da"] == 0
+    assert full.telemetry["starlight"]["protected_count_by_source"]["da"] > 0
+    assert full.telemetry["starlight"]["protected_count_by_source"]["grounding"] > 0  # non-vacuous ablation
+    assert no_da.telemetry["da_cost_accounting"]["attention_mask_restriction_ratio"] is None
+    assert no_da.attention_mask_restriction_ratio is None
+
+
+def test_starlight_arms_report_cpu_reference_labels_and_recurrent_exemption():
+    result = _engine("starlight_s1", stop_at_eos=False, h2o_min_budget=64).execute_request(
+        request_id="labels", prompt_token_ids=list(range(100, 120)), image_present=False, max_new_tokens=2)
+    s = result.telemetry["starlight"]
+    assert s["measurement_label"] == "cpu_pytorch_reference_not_vllm"
+    assert s["method_variant"] == "starlight_stage1::da+grounding+structural"
+    assert s["method_variant_is_upstream_h2o"] is False
+    assert s["recurrent_layers_exempt"] == [0, 1, 2, 4, 5, 6]
+    assert s["recurrent_exemption_label"] == "RECURRENT_STATE_NOT_TOKEN_ADDRESSABLE_KV"
+    assert s["layers"] == [3, 7]
+    assert result.telemetry["h2o_logical_selection_accounting"]["method_variant"] == "NOT_APPLICABLE_STARLIGHT_ARM"
+    assert 0.0 <= s["text_side_retained_fraction_last_step"] <= 1.0
+
+
+def test_combine_summaries_adds_steps_and_keeps_invariant_counts():
+    p = _scored_tracker([0, 0, 5, 4, 3, 2, 1, 1, 1, 1])
+    engine = _engine("starlight_s1")
+    _, _, plans = _step(engine, p, length=10, budget=6, da_spans=[("sink_global", 0, 2)])
+    one = summarize_plans(plans)
+    total = combine_summaries([one, one])
+    assert total["steps"] == 2
+    assert total["h2o_candidates_vetoed"] == 2 * one["h2o_candidates_vetoed"]
+    assert total["evicted_total"] == 2 * one["evicted_total"]
+    assert total["protected_evicted"] == 0 and total["evicted_not_candidate"] == 0
+    assert total["status_counts"] == {STATUS_OK: 4}  # 2 steps x 2 full-attention layers
+
+
+# --- ITER2 D4 S-1 (auditor HIGH): candidate set is ablation-independent --------------------
+
+_S1_SCORES = [0, 0, 5, 4, 3, 2, 1, 1, 1, 1]
+_S1_ARMS = {
+    "starlight_s1": ("da", "grounding", "structural"),
+    "starlight_s1_no_da": ("grounding", "structural"),
+    "starlight_s1_no_grounding": ("da", "structural"),
+}
+
+
+def test_s1_candidate_set_is_ablation_independent_and_only_the_veto_differs():
+    plans_by_arm = {}
+    for arm, enabled in _S1_ARMS.items():
+        engine = _engine(arm)
+        tracker = _scored_tracker(_S1_SCORES)
+        _, _, plans = _step(engine, tracker, length=10, budget=6,
+                            da_spans=[("sink_global", 0, 2)], enabled=enabled)
+        plans_by_arm[arm] = plans[0]
+
+    def candidates(plan):
+        return frozenset(d.entry_id for d in plan.decisions if d.h2o_candidate)
+
+    full = plans_by_arm["starlight_s1"]
+    # The candidate set is computed once from the FULL arm's protected count, never per ablation.
+    assert candidates(full) == frozenset({0, 1, 5, 6, 7, 8})
+    for arm, plan in plans_by_arm.items():
+        assert candidates(plan) == candidates(full), arm
+        assert len(plan.retained) <= 6, f"{arm}: retained {len(plan.retained)} exceeds budget"
+
+    # Only the DA veto is removed in the no-DA arm: the released entries are exactly the
+    # DA-protected candidates {0, 1}; nothing else changes.
+    no_da = plans_by_arm["starlight_s1_no_da"]
+    assert set(no_da.evicted) - set(full.evicted) == {0, 1}
+    assert set(full.evicted) - set(no_da.evicted) == set()
+
+    # Ablating grounding (no grounding labels supplied) changes nothing here.
+    no_ground = plans_by_arm["starlight_s1_no_grounding"]
+    assert no_ground.evicted == full.evicted
+    assert no_ground.retained == full.retained
+
+
+# --- ITER2 D4 S-4 (auditor): the H-6 cache-length check must be testable -------------------
+
+def test_s4_cache_length_check_detects_an_injected_mismatch():
+    engine = _engine("starlight_s1")
+    prompt = list(range(100, 140))
+    clean = engine.execute_request("s4_clean", prompt_token_ids=prompt, image_present=False,
+                                   max_new_tokens=6).telemetry["starlight"]
+    assert clean["cache_length_mismatch_steps"] == 0
+
+    # Inject an off-by-one physical length into every decode step. The H-6 check must count it.
+    engine._test_cache_len_offset = 1
+    try:
+        broken = engine.execute_request("s4_injected", prompt_token_ids=prompt, image_present=False,
+                                        max_new_tokens=6).telemetry["starlight"]
+    finally:
+        engine._test_cache_len_offset = 0
+    assert broken["cache_length_mismatch_steps"] > 0, "mutating the H-6 check must fail this test"

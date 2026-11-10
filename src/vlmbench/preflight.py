@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 from pathlib import Path
 
@@ -195,7 +194,8 @@ def serving_readiness(
             if not line.strip():
                 continue
             row = json.loads(line)
-            if row.get("dataset") != dataset or row.get("track") != "derived_serving":
+            track = "amber_serving" if dataset == "amber" else "derived_serving"
+            if row.get("dataset") != dataset or row.get("track") != track:
                 raise PreflightError("Annotated JSONL has wrong dataset/track")
             sid = str(row["id"])
             if sid in seen:
@@ -205,10 +205,11 @@ def serving_readiness(
             if stat.get("verified_by") != "vllm_effective_token_accounting":
                 continue
             text_len, effective = stat.get("text_tokens"), stat.get("effective_total_tokens")
-            if not isinstance(text_len, int) or not isinstance(effective, int):
+            if (type(effective) is not int or effective <= 0
+                    or (dataset != "amber" and type(text_len) is not int)):
                 continue
             for n in {c["input_length"] for c in cells}:
-                if (abs(text_len - n) / n <= tolerance and
+                if ((dataset == "amber" or abs(text_len - n) / n <= tolerance) and
                         effective < max_model_len - 256):
                     counts[n] += 1
     ready, blocked = [], []

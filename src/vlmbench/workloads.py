@@ -33,7 +33,7 @@ def load_jsonl(path: str | Path, *, dataset: str, track: str) -> list[dict]:
         seen.add(row["id"])
         if track == "native_quality" and not row.get("native_context_complete", False):
             raise WorkloadError("Native quality input missing complete context declaration")
-        if track == "derived_serving" and row.get("derived_from") is None:
+        if track in ("derived_serving", "amber_serving") and row.get("derived_from") is None:
             raise WorkloadError("Derived serving input must record origin")
         results.append(row)
     if not results:

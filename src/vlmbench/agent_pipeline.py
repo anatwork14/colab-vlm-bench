@@ -6,21 +6,22 @@ from pathlib import Path
 
 from .artifacts import atomic_json, sha256, staged_copy
 from .config import load_config
-from .datasets import normalize_memlens, normalize_mmlong
+from .execution_safety import require_compute_approval
+from .datasets import normalize_memlens, normalize_mmlong, normalize_amber, build_memlens_context_bins
+from .drive_inventory import inspect_existing_drive
 from .engine import a100_inventory, server_argv, start_server, stop_server, wait_ready
 from .hf_sources import DATASETS, MODELS, _qa_file, fetch_dataset, fetch_model
-from .drive_inventory import inspect_existing_drive
 from .notebook_bridge import build_serving_candidates, write_local_campaign
 from .preflight import assess_resources, checkpoint_inventory, host_resources
+from .qualification import qualify_all_drive_assets
+from .source_mapping import read_mapping, verify_mapping, drive_path, stage_amber_archive
 
 
 def paths_for(job: dict) -> dict:
-    root = Path(job["drive_root"])
-    if not str(root).startswith("/content/drive/"):
-        raise ValueError("Source and results must use mounted Google Drive")
+    root = drive_path(job["drive_root"])
     model, ds, phase = job["model"], job["dataset"], job["phase"]
     limit = job.get("qa_limit", 0)
-    if model not in MODELS or ds not in DATASETS or phase not in ("pilot", "full"):
+    if model not in MODELS or ds not in {*DATASETS, "amber"} or phase not in ("pilot", "full"):
         raise ValueError("Unapproved model, dataset or phase")
     if not Path("/content/drive/MyDrive").is_dir():
         raise RuntimeError("Colab Drive not mounted; call colab drivemount")
@@ -28,17 +29,36 @@ def paths_for(job: dict) -> dict:
         raise ValueError("QA limit must be zero for full study")
     suffix = f"n{limit}" if limit else "all"
     base = root / "prepared" / model / ds / phase
-    return {
+    paths = {
         "root": root,
         "model_root": root / "hf" / "models" / model,
         "dataset_root": root / "hf" / "datasets" / ds,
-        "native": root / "prepared" / ds / f"native_{suffix}.jsonl",
+        "native": base / f"native_{suffix}.jsonl",
         "candidates": base / f"candidates_{suffix}.jsonl",
         "annotated": base / f"annotated_{suffix}.jsonl",
         "manifest": base / f"source_{suffix}.json",
         "pdf_render": root / "prepared" / ds / "pdf_pages_96dpi",
         "suffix": suffix,
     }
+    if job.get("source_mode", "historical") == "historical":
+        source_map = drive_path(job.get("source_map") or str(
+            root / "source_maps" / f"{model}__{ds}.json"))
+        if job.get("action") == "status" and not source_map.is_file():
+            return paths
+        mapping = read_mapping(source_map, model, ds)
+        for key in ("model_root", "dataset_root"):
+            source = drive_path(mapping[key]).resolve()
+            if key == "dataset_root" and mapping.get("archive_path"):
+                expected = root / "source_cache" / "amber" / str(mapping.get("archive_sha256", ""))
+                if source != expected.resolve():
+                    raise ValueError("AMBER archive requires independent source cache mapping")
+                continue
+            if root.resolve().is_relative_to(source) or source.is_relative_to(root.resolve()):
+                raise ValueError("Output namespace must be separate from original sources")
+        paths.update(model_root=drive_path(mapping["model_root"]),
+                     dataset_root=drive_path(mapping["dataset_root"]),
+                     source_map=source_map, mapping=mapping)
+    return paths
 
 
 def require_prepared(job: dict, paths: dict) -> dict:
@@ -54,11 +74,35 @@ def require_prepared(job: dict, paths: dict) -> dict:
                       ("candidates", "candidate_sha256")):
         if not paths[key].is_file() or sha256(paths[key]) != manifest.get(name):
             raise ValueError(f"Frozen {key} source changed or missing")
-    model_receipt = json.loads(
-        (paths["model_root"] / ".hf_source.json").read_text(encoding="utf8"))
+    if "source_map" in paths:
+        if sha256(paths["source_map"]) != manifest.get("source_map_sha256"):
+            raise ValueError("Historical source mapping changed")
+        model_receipt = verify_mapping(paths["mapping"])
+    else:
+        model_receipt = json.loads(
+            (paths["model_root"] / ".hf_source.json").read_text(encoding="utf8"))
     if model_receipt.get("revision") != manifest["model_revision"]:
         raise ValueError("Prepared model source HF revision mismatch")
     return manifest
+
+
+def _accelerator_indicators() -> list[str]:
+    """Inspect driver and device names without opening accelerator devices."""
+    indicators = []
+    driver = Path("/proc/driver/nvidia")
+    try:
+        try:
+            driver.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            indicators.append(str(driver))
+        # Covers numbered devices, control/UVM nodes, capabilities and Tegra.
+        indicators.extend(str(p) for p in Path("/dev").iterdir()
+                          if p.name.startswith(("nvidia", "nvhost")))
+    except OSError as exc:
+        raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: cannot inspect accelerator devices") from exc
+    return indicators
 
 
 def require_cpu_for_hf_intake() -> None:
@@ -66,32 +110,72 @@ def require_cpu_for_hf_intake() -> None:
     import shutil
     import subprocess
     if shutil.which("nvidia-smi"):
-        probe = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=10, check=False,
-        )
-        if probe.returncode == 0 and probe.stdout.strip():
-            raise RuntimeError(
-                "GPU_SESSION_REFUSED_FOR_PREPARE: download and render on CPU Colab"
+        try:
+            probe = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=10, check=False,
             )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: GPU probe failed") from exc
+        if probe.returncode != 0:
+            raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: GPU probe failed")
+        if probe.stdout.strip():
+            raise RuntimeError("GPU_SESSION_REFUSED_FOR_PREPARE: download and render on CPU Colab")
+        if _accelerator_indicators():
+            raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: driver/device evidence contradicts empty probe")
+        return
+
+    # When nvidia-smi binary is not installed (e.g. standard CPU container):
+    # Verify no NVIDIA driver, character devices, or CUDA runtime are present.
+    if _accelerator_indicators():
+        raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: NVIDIA driver/device present but nvidia-smi missing")
+    try:
+        import torch
+        cuda_available = torch.cuda.is_available()
+    except Exception as exc:
+        raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: CUDA state cannot be verified") from exc
+    if cuda_available is True:
+        raise RuntimeError("GPU_SESSION_REFUSED_FOR_PREPARE: download and render on CPU Colab")
+    if cuda_available is not False:
+        raise RuntimeError("ACCELERATOR_STATE_UNKNOWN: CUDA probe did not return a boolean")
 
 
 def prepare(job: dict) -> dict:
     require_cpu_for_hf_intake()
     p = paths_for(job)
+    if "source_map" in p:
+        stage_amber_archive(p["mapping"], p["root"])
     if p["manifest"].is_file():
         return {**require_prepared(job, p),
                 "status": "PREPARED_REUSED_NO_NEW_DOWNLOAD"}
-    model = fetch_model(job["model"], p["root"],
-                        revision=job.get("model_revision"))
-    dataset = fetch_dataset(job["dataset"], p["root"],
-                            revision=job.get("dataset_revision"))
+    if "source_map" in p:
+        model = verify_mapping(p["mapping"])
+        dataset = {"revision": p["mapping"]["dataset_revision"]}
+    else:
+        if job["dataset"] == "amber":
+            raise ValueError("AMBER requires a reviewed historical source map")
+        model = fetch_model(job["model"], p["root"], revision=job.get("model_revision"))
+        dataset = fetch_dataset(job["dataset"], p["root"], revision=job.get("dataset_revision"))
+    intent = p["manifest"].with_suffix(".intent.json")
+    expected_intent = {"model_revision": model["revision"], "dataset_revision": dataset["revision"],
+                       "source_map_sha256": sha256(p["source_map"]) if "source_map" in p else None}
+    if intent.exists():
+        if json.loads(intent.read_text()) != expected_intent:
+            raise ValueError("Partial prepared artifacts belong to different frozen sources")
+    elif p["native"].exists() or p["candidates"].exists():
+        raise ValueError("Unbound partial prepared artifacts require audit before reuse")
+    atomic_json(intent, expected_intent)
     p["native"].parent.mkdir(parents=True, exist_ok=True)
     limit = job.get("qa_limit", 0)
     if not p["native"].is_file():
-        if job["dataset"] == "memlens":
+        if job["dataset"] == "amber":
+            native_info = normalize_amber(
+                p["mapping"]["query_path"], p["mapping"]["images_root"], p["native"],
+                pass_type="natural_eos_quality", limit=limit or None)
+        elif job["dataset"] == "memlens":
             native_info = normalize_memlens(
-                p["dataset_root"] / "dataset_32k.json", p["dataset_root"],
+                Path(p.get("mapping", {}).get("query_path", p["dataset_root"] / "dataset_32k.json")),
+                Path(p.get("mapping", {}).get("images_root", p["dataset_root"])),
                 p["native"], limit=limit or None)
         else:
             native_info = normalize_mmlong(
@@ -107,7 +191,20 @@ def prepare(job: dict) -> dict:
     ]
     p["candidates"].parent.mkdir(parents=True, exist_ok=True)
     if not p["candidates"].is_file():
-        candidate_info = build_serving_candidates(
+        if job["dataset"] == "amber":
+            candidate_info = normalize_amber(
+                p["mapping"]["query_path"], p["mapping"]["images_root"], p["candidates"],
+                pass_type="fixed_serving", limit=limit or None)
+        elif job["dataset"] == "memlens" and "source_map" in p:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(str(p["model_root"]),
+                                                     local_files_only=True, trust_remote_code=False)
+            candidate_info = build_memlens_context_bins(
+                p["native"], p["candidates"], tokenizer=tokenizer,
+                input_lengths=[128, 512, 1024, 2048, 4096, 8192, 16384],
+                max_per_bin=job.get("max_per_bin", 192))
+        else:
+            candidate_info = build_serving_candidates(
             p["native"], p["candidates"], dataset=job["dataset"],
             model_directory=p["model_root"],
             input_lengths=lengths, max_per_bin=job.get("max_per_bin", 192),
@@ -129,6 +226,7 @@ def prepare(job: dict) -> dict:
         "native_details": native_info,
         "serving_details": candidate_info,
         "official_quality": "UPSTREAM_SCORER_NOT_VERIFIED",
+        "source_map_sha256": sha256(p["source_map"]) if "source_map" in p else None,
     }
     atomic_json(p["manifest"], manifest)
     return manifest
@@ -143,7 +241,8 @@ def campaign(job: dict, paths: dict) -> tuple[dict, Path]:
     outfile = paths["root"] / "configs" / (
         f"{job['phase']}_{job['model']}_{job['dataset']}_{paths['suffix']}.json")
     data = {}
-    for ds in DATASETS:
+    campaign_datasets = ("memlens", "amber") if job["dataset"] == "amber" or "source_map" in paths else tuple(DATASETS)
+    for ds in campaign_datasets:
         if ds == job["dataset"]:
             data[ds] = {"native": str(paths["native"]),
                         "derived": str(paths["annotated"])}
@@ -153,6 +252,16 @@ def campaign(job: dict, paths: dict) -> tuple[dict, Path]:
                 "derived": str(paths["root"] / "NOT_PREPARED" / ds / "annotated.jsonl"),
             }
     if not outfile.is_file():
+        if "amber" in campaign_datasets:
+            template_data = json.loads(template.read_text(encoding="utf8"))
+            template_data["datasets"][1]["id"] = "amber"
+            template_data["datasets"][1]["scorer"] = "amber_proxy_unverified"
+            template_data["campaign_id"] += "-amber-memlens-v1"
+            # Every context bin and CCU is explicit, including in pilot configs.
+            template_data["execution_scope"]["input_lengths"] = template_data["performance"]["input_lengths"]
+            template_data["execution_scope"]["concurrencies"] = [1, 2, 4, 8, 16, 32]
+            template = p_template = paths["root"] / "configs" / f"amber_memlens_{job['phase']}_template.json"
+            atomic_json(p_template, template_data)
         write_local_campaign(
             template, outfile, model_id=job["model"],
             drive_model=str(paths["model_root"]),
@@ -172,8 +281,10 @@ def campaign(job: dict, paths: dict) -> tuple[dict, Path]:
 
 
 def stage_for_gpu(cfg: dict, job: dict, paths: dict) -> tuple[dict, dict]:
+    require_compute_approval(job.get("owner_approved_compute"))
     a100_inventory()
     import importlib.metadata
+
     import torch
     if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
         raise RuntimeError("A100 BF16 unavailable")
@@ -193,6 +304,7 @@ def stage_for_gpu(cfg: dict, job: dict, paths: dict) -> tuple[dict, dict]:
 
 
 def annotate(job: dict) -> dict:
+    require_compute_approval(job.get("owner_approved_compute"))
     p = paths_for(job)
     require_prepared(job, p)
     cfg, _ = campaign(job, p)
@@ -200,10 +312,11 @@ def annotate(job: dict) -> dict:
     if type(limit) is not int or not 1 <= limit <= 128:
         raise ValueError("Annotation budget must be 1..128")
     spec, staged = stage_for_gpu(cfg, job, p)
-    from .derivation import annotate_with_backend
-    from .bench import request_payload
-    from .workloads import load_jsonl
     import httpx
+
+    from .bench import request_payload
+    from .derivation import annotate_with_backend
+    from .workloads import load_jsonl
 
     log = p["root"] / "logs" / (
         f"{job['model']}_{job['dataset']}_base_annotation.log")
@@ -212,7 +325,7 @@ def annotate(job: dict) -> dict:
         wait_ready(proc, cfg["serving"]["port"], timeout_s=600,
                    expected_model=job["model"])
         examples = load_jsonl(p["candidates"], dataset=job["dataset"],
-                              track="derived_serving")
+                              track="amber_serving" if job["dataset"] == "amber" else "derived_serving")
         if not examples:
             raise RuntimeError("No real VLM image examples for annotation")
         with httpx.Client(timeout=150) as client:
@@ -228,7 +341,7 @@ def annotate(job: dict) -> dict:
             p["candidates"], p["annotated"], job["dataset"], job["model"],
             staged["local_path"],
             f"http://127.0.0.1:{cfg['serving']['port']}",
-            limit=limit)
+            limit=limit, owner_approved_compute=True)
         return {**result, "model": job["model"], "dataset": job["dataset"],
                 "gpu_status": "ANNOTATION_ONLY_NOT_FULL_BENCHMARK"}
     finally:
@@ -236,6 +349,7 @@ def annotate(job: dict) -> dict:
 
 
 def benchmark(job: dict) -> dict:
+    require_compute_approval(job.get("owner_approved_compute"))
     p = paths_for(job)
     require_prepared(job, p)
     if not job.get("quality", False) and not p["annotated"].is_file():
@@ -246,15 +360,25 @@ def benchmark(job: dict) -> dict:
     max_cells = job.get("max_cells", 1)
     if type(max_cells) is not int or not 1 <= max_cells <= 6:
         raise ValueError("GPU run max_cells must be between 1 and 6")
-    from .cli import run_job
     from types import SimpleNamespace
+
+    from .cli import run_job
+    requeue = job.get("requeue_nonpass", False)
+    if type(requeue) is not bool:
+        raise ValueError("requeue_nonpass must be a boolean")
     status = run_job(SimpleNamespace(
         config=config_path, model=job["model"], mode=job["mode"],
         dataset=job["dataset"], max_cells=max_cells,
-        quality=bool(job.get("quality", False))
+        quality=bool(job.get("quality", False)), owner_approved_compute=True,
+        requeue_nonpass=requeue,
     ))
     if status:
-        raise RuntimeError(f"Bench refused, code {status}. Check Drive receipts.")
+        # Non-zero exit is a failure for the remote wrapper (ACTION_FAILED). Name the cause.
+        run_status = Path(cfg["storage"]["local_scratch_dir"]) / cfg["campaign_id"] / "run_status.json"
+        name = (json.loads(run_status.read_text(encoding="utf8")).get("status", "UNKNOWN")
+                if run_status.is_file() else "NO_RUN_STATUS")
+        raise RuntimeError(f"Bench finished with status {name} (exit {status}). "
+                           "Check run_status.json and the cell receipts before retrying.")
     return {"status": "GPU_JOB_FINISHED_CHECK_OBSERVED_RECEIPTS",
             "campaign_id": cfg["campaign_id"], "model": job["model"],
             "mode": job["mode"], "dataset": job["dataset"]}
@@ -275,9 +399,17 @@ def report(job: dict) -> dict:
 
 def execute(job: dict) -> dict:
     action = job["action"]
+    if action in {"annotate", "benchmark"}:
+        require_compute_approval(job.get("owner_approved_compute"))
     if action == "drive-inventory":
         # A read-only, CPU-only source discovery action: no downloads or vLLM.
         return inspect_existing_drive()
+    if action == "qualify-drive":
+        # A read-only, CPU-only dataset/model qualification action.
+        drive_root = Path(job.get("drive_root", "/content/drive/MyDrive"))
+        tolerance = float(job.get("tolerance", 0.05))
+        compute_shards = bool(job.get("compute_shards_sha", False))
+        return qualify_all_drive_assets(drive_root, tolerance=tolerance, compute_shards_sha=compute_shards)
     if action == "prepare":
         return prepare(job)
     if action == "annotate":

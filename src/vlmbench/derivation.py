@@ -5,6 +5,7 @@ not replaced by random tokens, but evidence may be omitted by the derivation.
 """
 from __future__ import annotations
 
+from . import derivation_labels
 import json
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import httpx
 
 from .artifacts import atomic_json, atomic_jsonl, sha256
 from .config import LENGTHS
+from .execution_safety import require_compute_approval
 from .workloads import load_jsonl
 from .bench import request_payload
 
@@ -51,12 +53,12 @@ def generate_candidates(native_path: Path, output: Path, dataset: str,
             parts.extend(selected_images)
             parts.append(question_part)
             result.append({
-                "id": str(row["id"]) + "__t" + str(target),
+                "id": f"{row['id']}__text{target}",
                 "dataset": dataset, "track": "derived_serving",
                 "derived_from": str(row["id"]),
                 "messages": [{"role": "user", "content": parts}],
                 "requested_text_length_bin": target,
-                "derivation": "last_text_words_plus_last_k_images_v1",
+                "derivation": derivation_labels.LAST_WORDS_LAST_K_IMAGES,
                 "image_count": len(selected_images),
                 "model_token_counts": {},
                 "meta": {"original_native_id": str(row["id"]),
@@ -72,6 +74,7 @@ def generate_candidates(native_path: Path, output: Path, dataset: str,
 def annotate_with_backend(
     source: Path, output: Path, dataset: str,
     model_id: str, checkpoint_path: str, base_url: str, limit: int = 0,
+    *, owner_approved_compute: bool = False,
 ) -> dict:
     """Prompt-token usage from real vLLM + model tokenizer counts of text segments.
 
@@ -79,12 +82,14 @@ def annotate_with_backend(
     explicit owner approval and an already-booted matching Base model. Do not
     perform automatically during a paid full benchmark.
     """
+    require_compute_approval(owner_approved_compute)
     try:
         from transformers import AutoTokenizer
     except ImportError as exc:
         raise RuntimeError("Install transformers to annotate model text tokens") from exc
 
-    rows = load_jsonl(source, dataset=dataset, track="derived_serving")
+    track = "amber_serving" if dataset == "amber" else "derived_serving"
+    rows = load_jsonl(source, dataset=dataset, track=track)
     if limit < 0:
         raise ValueError("Annotation budget must be >= 0")
     source_sha = sha256(source)
@@ -95,7 +100,7 @@ def annotate_with_backend(
         previous_state = json.loads(state.read_text(encoding="utf8"))
         if previous_state.get("source_sha256") != source_sha or previous_state.get("model") != model_id:
             raise ValueError("Annotation source/model changed; use distinct output path")
-        previous = load_jsonl(output, dataset=dataset, track="derived_serving")
+        previous = load_jsonl(output, dataset=dataset, track=track)
         if [x["id"] for x in rows] != [x["id"] for x in previous]:
             raise ValueError("Annotation resume IDs differ from original candidates")
         rows = previous

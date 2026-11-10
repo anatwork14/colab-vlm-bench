@@ -1,0 +1,23 @@
+{
+  "schema": "starlight_qualification_v2_supersession_notice",
+  "qualification_verdict": "SUPERSEDED_NO_POST_REPAIR_PRETRAINED_GPU_RECEIPT",
+  "source_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "old_receipt_ref": "artifacts/historical/qwen35_pretrained_qualification_receipt_20261109_before_scientific_repairs.json",
+  "source_old_receipt_generated_utc": "2026-11-09 08:10:23 UTC",
+  "old_results_not_publishable": [
+    "MTP acceptance 0.4/0.5 was artificially forced",
+    "DA 0.1895 was hand-fitted",
+    "H2O 638976B/811008B were sums of KV tensor-size deltas, not peak VRAM saved",
+    "Base inference included MTP-head overhead",
+    "4 canonical image task keyword heuristics did not measure accuracy"
+  ],
+  "release_gates": {
+    "CPU_CODE_AND_REGRESSION_TESTS": "QUALIFY_VIA_LATEST_COMMIT_CI",
+    "PRETRAINED_MODEL_FORWARD_AFTER_REPAIR": "PENDING_LOCAL_GPU_RERUN",
+    "NATIVE_SPECULATIVE_MTP_CORRECTNESS": "GATED",
+    "DA_PAPER_FAITHFUL_MODEL_DECLARED": "GATED",
+    "PHYSICAL_GPU_VRAM_SAVING": "NOT_MEASURED",
+    "NATIVE_VLLM_A100": "BLOCKED"
+  },
+  "guidance": "Run scripts/run_progressive_qualification.py against exact pinned pretrained checkpoint on authorized local GPU and store fresh receipt with manifest. Never use this supersession notice as a run receipt."
+}

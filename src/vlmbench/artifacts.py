@@ -8,6 +8,11 @@ import shutil
 from pathlib import Path
 
 
+def code_identity() -> str:
+    """Source revision that produced a receipt. 'UNRECORDED' when the launcher did not set it."""
+    return os.environ.get("VLMBENCH_SOURCE_SHA") or "UNRECORDED"
+
+
 def sha256(path: str | Path) -> str:
     h = hashlib.sha256()
     with Path(path).open("rb") as f:

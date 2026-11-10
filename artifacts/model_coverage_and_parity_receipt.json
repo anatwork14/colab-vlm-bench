@@ -1,0 +1,55 @@
+{
+  "timestamp": "2026-11-09 08:17:37 UTC",
+  "checkpoint_dir": "/mnt/ssd/genos2/research_workspace/models/Qwen/Qwen3.5-0.8B",
+  "coverage_audit": {
+    "checkpoint_dir": "/mnt/ssd/genos2/research_workspace/models/Qwen/Qwen3.5-0.8B",
+    "total_source_tensors": 488,
+    "source_tensor_categories": {
+      "language_model_tensors": 320,
+      "vision_encoder_tensors": 153,
+      "mtp_speculative_tensors": 15,
+      "other_tensors": 0
+    },
+    "custom_neural_model_scaffold": {
+      "mapped_tensors": 126,
+      "unmapped_tensors": 362,
+      "coverage_percentage": 25.82,
+      "scientific_status": "PARTIALLY_WEIGHTED_PYTORCH_REFERENCE",
+      "unmapped_modules": [
+        "model.language_model.layers.*.mlp.gate_proj",
+        "model.language_model.layers.*.mlp.up_proj",
+        "model.language_model.layers.*.mlp.down_proj",
+        "model.visual.blocks.*"
+      ]
+    },
+    "official_transformers_model": {
+      "total_parameters": 852985920,
+      "mtp_parameters": 20452864,
+      "total_checkpoint_parameters": 873438784,
+      "direct_model_tensors": 473,
+      "mtp_speculative_tensors": 15,
+      "total_accounted_tensors": 488,
+      "unmapped_tensors": 0,
+      "coverage_percentage": 100.0,
+      "parameter_coverage_ratio": 1.0,
+      "scientific_status": "OFFICIAL_TRANSFORMERS_HOOK_QUALIFIED",
+      "unmapped_modules": []
+    }
+  },
+  "logits_parity": {
+    "status": "PASS",
+    "device": "cuda",
+    "prompt": "Answer the question directly: What is the color of an emerald?",
+    "input_tokens_count": 26,
+    "vocab_size": 248320,
+    "max_logits_absolute_difference": 4.76837158203125e-06,
+    "predicted_next_token_id": 18978,
+    "predicted_next_token_text": "Green",
+    "parity_tolerance": 0.0001
+  },
+  "scientific_qualification": {
+    "custom_scaffold_label": "PARTIALLY_WEIGHTED_PYTORCH_REFERENCE",
+    "official_hooked_label": "OFFICIAL_TRANSFORMERS_HOOK_QUALIFIED",
+    "recommendation": "Use official Transformers hooking for faithful pretrained inference"
+  }
+}

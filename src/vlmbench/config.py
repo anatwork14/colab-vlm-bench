@@ -17,6 +17,7 @@ EXPECTED_MODELS = {
     "gemma4_e4b": "google/gemma-4-E4B-it",
 }
 DATASETS = {"memlens", "mmlongbench_doc"}
+SUPPORTED_DATASETS = DATASETS | {"amber"}
 MODES = {"base", "mtp"}
 ID_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{2,95}$")
 
@@ -84,7 +85,9 @@ def validate(c: dict, *, execution: bool = False) -> None:
             raise ConfigError("Gemma E4B requires matching assistant; Qwen uses native MTP")
     if set(c["modes"]) != MODES or len(c["modes"]) != 2:
         raise ConfigError("Must run matched base and MTP")
-    if len(c["datasets"]) != 2 or {d["id"] for d in c["datasets"]} != DATASETS:
+    if len(c["datasets"]) != 2 or {d["id"] for d in c["datasets"]} not in (
+        DATASETS, {"memlens", "amber"}
+    ):
         raise ConfigError("Two expected datasets required")
     if tuple(p["input_lengths"]) != LENGTHS or tuple(p["concurrencies"]) != CONCURRENCIES:
         raise ConfigError("Fixed 7x6 grid was changed")
@@ -92,6 +95,8 @@ def validate(c: dict, *, execution: bool = False) -> None:
         raise ConfigError("VLM bins must represent model-tokenized text; multimodal tokens reported separately")
     if p["output_tokens"] != 256 or p["repetitions"] != 3:
         raise ConfigError("Output and repetitions are frozen")
+    if q["max_output_tokens"] != 256:
+        raise ConfigError("Natural-EOS quality output cap must be 256")
     if len(set(p["seeds"])) != 3 or len(p["seeds"]) != 3:
         raise ConfigError("Three independent fixed seeds required")
     if not p["require_real_token_counts"] or not (0.0 < p["max_bin_relative_error"] <= 0.05):
@@ -171,7 +176,7 @@ def planned_cells(c: dict) -> Iterator[dict]:
                 continue
             for mode in c["modes"]:
                 for rep in scope["repetitions"]:
-                    for n in scope["input_lengths"]:
+                    for n in ([None] if ds["id"] == "amber" else scope["input_lengths"]):
                         for ccu in scope["concurrencies"]:
                             yield {
                                 "dataset": ds["id"], "model": model["id"], "mode": mode,

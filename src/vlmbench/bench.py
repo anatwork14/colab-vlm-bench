@@ -13,8 +13,9 @@ from typing import Any
 
 import httpx
 
-from .artifacts import atomic_json, atomic_jsonl, sha256, sync_files, verified_resume
+from .artifacts import atomic_json, atomic_jsonl, code_identity, sha256, sync_files, verified_resume
 from .config import cell_id, fingerprint
+from .derivation_labels import rows_label
 from .telemetry import GPUSampler
 from .workloads import (WorkloadError, exact_bin_pool, resolve_messages,
                         sample_digest, sample_unique, ensure_no_gold_in_request)
@@ -29,8 +30,26 @@ def quantile(values: list[float], q: float) -> float | None:
     return arr[a] + (arr[b] - arr[a]) * (pos - a)
 
 
+async def admitted_stream(client: httpx.AsyncClient, url: str, request: dict, request_id: str,
+                          semaphore: asyncio.Semaphore, submitted_at: float) -> dict:
+    """Wait for a CCU slot, then stream. E2E counts from submission, not from the slot.
+
+    A user who submitted at ``submitted_at`` experiences the client-side slot wait, so
+    it is added to e2e. TTFT stays HTTP-send based (docs/METRICS.md). Before this fix
+    the slot wait was invisible: a CCU=1 second request reported only its service time.
+    """
+    async with semaphore:
+        acquired_at = perf_counter()
+        result = await stream_completion(client, url, request, request_id)
+    queue_ms = max(0.0, (acquired_at - submitted_at) * 1000)
+    result["client_queue_wait_ms"] = queue_ms
+    if isinstance(result.get("e2e_ms"), (int, float)):
+        result["e2e_ms"] = result["e2e_ms"] + queue_ms
+    return result
+
+
 async def stream_completion(client: httpx.AsyncClient, url: str, request: dict, request_id: str) -> dict:
-    start = perf_counter()
+    start = perf_counter()  # HTTP send: service-side timing origin
     first_token_at = None
     emitted_chunks = 0
     output_text = []
@@ -38,6 +57,8 @@ async def stream_completion(client: httpx.AsyncClient, url: str, request: dict, 
     ended = None
     status = "ERROR"
     error = None
+    terminal_seen = False
+    finish_reason = None
     try:
         async with client.stream("POST", url, json=request) as response:
             response.raise_for_status()
@@ -46,6 +67,7 @@ async def stream_completion(client: httpx.AsyncClient, url: str, request: dict, 
                     continue
                 payload = line[5:].strip()
                 if payload == "[DONE]":
+                    terminal_seen = True
                     break
                 if not payload:
                     continue
@@ -55,6 +77,9 @@ async def stream_completion(client: httpx.AsyncClient, url: str, request: dict, 
                 if obj.get("error"):
                     raise ValueError(str(obj["error"]))
                 for choice in obj.get("choices", []):
+                    if choice.get("finish_reason") is not None:
+                        finish_reason = choice["finish_reason"]
+                        terminal_seen = True
                     delta = choice.get("delta") or {}
                     text = delta.get("content", "")
                     if isinstance(text, str) and text:
@@ -63,6 +88,8 @@ async def stream_completion(client: httpx.AsyncClient, url: str, request: dict, 
                         emitted_chunks += 1
                         output_text.append(text)
             ended = perf_counter()
+            if not terminal_seen:
+                raise ValueError("INCOMPLETE_STREAM: no terminal DONE or finish_reason")
             status = "HTTP_OK"
     except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
         error = f"{type(exc).__name__}: {exc}"
@@ -70,6 +97,7 @@ async def stream_completion(client: httpx.AsyncClient, url: str, request: dict, 
     output_tokens = usage.get("completion_tokens")
     return {
         "id": request_id, "status": status, "error": error,
+        "terminal_seen": terminal_seen, "finish_reason": finish_reason,
         "ttft_ms": (first_token_at - start) * 1000 if first_token_at is not None else None,
         "e2e_ms": (ended - start) * 1000,
         "tpot_ms": (
@@ -106,66 +134,119 @@ def request_payload(sample: dict, *, model_id: str, max_tokens: int,
     return payload
 
 
+def eligible_pool(cfg: dict, cell: dict, rows: list[dict], model_id: str) -> list[dict]:
+    """Rows eligible for this cell's text bin under the verified-token policy."""
+    p, s = cfg["performance"], cfg["serving"]
+    # Native tasks and synthetic reference snippets must not be assigned invented token counts.
+    if cell["dataset"] == "amber":
+        pool = []
+        for row in rows:
+            stat = row.get("model_token_counts", {}).get(model_id, {})
+            total_tokens = stat.get("effective_total_tokens")
+            if (row.get("track") == "amber_serving"
+                    and stat.get("verified_by") == "vllm_effective_token_accounting"
+                    and type(total_tokens) is int
+                    and 0 < total_tokens < s["max_model_len"] - cell["output_tokens"]):
+                pool.append(row)
+        return pool
+    return exact_bin_pool(rows, model_id, cell["input_length"], p["max_bin_relative_error"],
+                          max_effective_total=s["max_model_len"] - cell["output_tokens"])
+
+
+def select_cell_samples(pool: list[dict], cell: dict) -> tuple[list[dict], list[dict]]:
+    """Deterministic (warmup, measured) prompts for one cell from its eligible pool.
+
+    Shared by the runner and by the resume check, so a receipt's sample_id_sha256 can be
+    verified against the current derived dataset. Raises WorkloadError if the pool is short.
+    """
+    total = cell["requests"] + cell["warmup"]
+    chosen = sample_unique(pool, total, cell["seed"])
+    # Warmup samples are distinct from measured requests and never included in their metrics.
+    return chosen[:cell["warmup"]], chosen[cell["warmup"]:]
+
+
 async def run_performance_cell(
     cfg: dict, cell: dict, rows: list[dict], root: Path, drive_root: Path,
     model_id: str, dataset_sha256: str,
 ) -> dict:
     """A complete cell includes unique warmups + measured requests, with a hard deadline."""
     p, s = cfg["performance"], cfg["serving"]
+    if p["output_tokens"] != 256 or cell["output_tokens"] != 256:
+        raise ValueError("Fixed serving pass requires exactly 256 output tokens")
     out = root / "cells" / f"{cell_id(cell)}.json"
     expected = {
-        "config_sha256": fingerprint(cfg), "dataset_sha256": dataset_sha256, "cell": cell,
+        "config_sha256": fingerprint(cfg), "dataset_sha256": dataset_sha256,
+        "code_sha256": code_identity(), "cell": cell,
+        "derivation": rows_label(rows),
+        "execution_pass": "FIXED_OUTPUT_SERVING_256",
+        "output_contract": {"max_tokens": 256, "min_tokens": 256, "ignore_eos": True},
     }
     if verified_resume(out, expected):
         return {"status": "RESUMED_PASS_MEASURED", "cell": cell}
 
-    # Native tasks and synthetic reference snippets must not be assigned invented token counts.
-    pool = exact_bin_pool(rows, model_id, cell["input_length"], p["max_bin_relative_error"],
-                          max_effective_total=s["max_model_len"] - cell["output_tokens"])
-    total = cell["requests"] + cell["warmup"]
+    pool = eligible_pool(cfg, cell, rows, model_id)
     try:
-        chosen = sample_unique(pool, total, cell["seed"])
+        warmups, measured = select_cell_samples(pool, cell)
     except WorkloadError as exc:
         receipt = {**expected, "status": "INSUFFICIENT_WORKLOAD", "error": str(exc),
-                   "eligible_prompts": len(pool), "required_unique_prompts": total}
+                   "eligible_prompts": len(pool),
+                   "required_unique_prompts": cell["requests"] + cell["warmup"]}
         atomic_json(out, receipt)
         sync_files(root, drive_root)
         return receipt
 
-    # Warmup samples are distinct from measured requests and never included in their metrics.
-    warmups = chosen[:cell["warmup"]]
-    measured = chosen[cell["warmup"]:]
     url = f"http://127.0.0.1:{s['port']}/v1/chat/completions"
     timeout = httpx.Timeout(timeout=float(p["request_timeout_s"]), connect=30.0)
     semaphore = asyncio.Semaphore(cell["concurrency"])
     failures: list[dict] = []
     start_cell = perf_counter()
     observations: list[dict] = []
+    request_evidence: list[dict] = []
+    gpu_report = {}
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            async def one(sample):
-                async with semaphore:
+            async def one(sample, phase):
+                submitted_at = perf_counter()
+                try:
                     payload = request_payload(sample, model_id=model_id,
                                               max_tokens=cell["output_tokens"],
                                               streaming=True, fixed_output=True)
-                    return await stream_completion(client, url, payload, str(sample["id"]))
-            # Warm up the actual offered parallelism. Thirty-two sequential
-            # 16K requests are slow, costly, and not a CCU32 warmup.
-            warm_observations = await asyncio.gather(*(one(w) for w in warmups))
-            for warm in warm_observations:
-                if warm["status"] != "HTTP_OK" or warm["output_tokens"] != cell["output_tokens"]:
-                    raise WorkloadError(f"WARMUP_INVALID: {warm['error']} / {warm['output_tokens']}")
-            start_cell = perf_counter()
-            with GPUSampler(0.5) as gpu:
-                observations = await asyncio.wait_for(
-                    asyncio.gather(*(one(sample) for sample in measured)),
-                    timeout=float(p["cell_timeout_s"]),
-                )
-            gpu_report = gpu.report()
+                    result = await admitted_stream(client, url, payload, str(sample["id"]),
+                                                   semaphore, submitted_at)
+                except asyncio.CancelledError:
+                    request_evidence.append({"id": str(sample["id"]), "phase": phase,
+                                             "status": "CANCELLED", "output_tokens": None})
+                    raise
+                except (WorkloadError, OSError, ValueError, httpx.HTTPError) as exc:
+                    result = {"id": str(sample["id"]), "status": "ERROR", "output_tokens": None,
+                              "client_queue_wait_ms": None,
+                              "error": f"{type(exc).__name__}: {exc}"}
+                request_evidence.append({**result, "phase": phase})
+                return result
+            async def phases():
+                nonlocal observations, start_cell, gpu_report
+                active_tasks = [asyncio.create_task(one(w, "warmup")) for w in warmups]
+                try:
+                    warm_observations = await asyncio.gather(*active_tasks)
+                    for warm in warm_observations:
+                        if warm["status"] != "HTTP_OK" or warm["output_tokens"] != cell["output_tokens"]:
+                            raise WorkloadError(f"WARMUP_INVALID: {warm['error']} / {warm['output_tokens']}")
+                    start_cell = perf_counter()
+                    with GPUSampler(0.5) as gpu:
+                        active_tasks = [asyncio.create_task(one(sample, "measurement")) for sample in measured]
+                        observations = await asyncio.gather(*active_tasks)
+                    gpu_report = gpu.report()
+                finally:
+                    for task in active_tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*active_tasks, return_exceptions=True)
+            await asyncio.wait_for(phases(), timeout=float(p["cell_timeout_s"]))
     except (WorkloadError, asyncio.TimeoutError, httpx.HTTPError, ValueError) as exc:
         receipt = {**expected, "status": "TIMEOUT" if isinstance(exc, asyncio.TimeoutError)
                    else "ERROR", "error": str(exc),
                    "warmup": cell["warmup"], "expected_requests": cell["requests"]}
+        atomic_jsonl(root / "requests" / f"{cell_id(cell)}.jsonl", request_evidence)
         atomic_json(out, receipt)
         sync_files(root, drive_root)
         return receipt
@@ -185,6 +266,11 @@ async def run_performance_cell(
         "e2e_p50_ms": quantile([x["e2e_ms"] for x in valid], 0.50),
         "e2e_p95_ms": quantile([x["e2e_ms"] for x in valid], 0.95),
         "e2e_p99_ms": quantile([x["e2e_ms"] for x in valid], 0.99),
+        # Client-side wait for a CCU slot before the HTTP send (included in e2e).
+        "client_queue_wait_p50_ms": quantile(
+            [x["client_queue_wait_ms"] for x in valid if x.get("client_queue_wait_ms") is not None], 0.50),
+        "client_queue_wait_p95_ms": quantile(
+            [x["client_queue_wait_ms"] for x in valid if x.get("client_queue_wait_ms") is not None], 0.95),
         "actual_effective_prompt_tokens_p50": quantile(
             [x["input_tokens_reported"] for x in valid
              if isinstance(x["input_tokens_reported"], int)], 0.50),
@@ -197,6 +283,11 @@ async def run_performance_cell(
         "peak_total_gpu_used_mib": gpu_report["peak_total_gpu_used_mib"],
         "minimum_available_system_ram_gib": gpu_report["minimum_available_system_ram_gib"],
         "minimum_free_local_ssd_gib": gpu_report["minimum_free_local_ssd_gib"],
+        # Telemetry trust fields: a non-zero failure count means the GPU peak is not reliable.
+        "gpu_samples": gpu_report.get("samples"),
+        "gpu_parse_failures": gpu_report.get("parse_failures"),
+        "gpu_query_failures": gpu_report.get("query_failures"),
+        "gpu_count_max": gpu_report.get("gpu_count_max"),
         "peak_system_ram_used_gib": gpu_report["peak_system_ram_used_gib"],
         "physical_kv_bytes": "NOT_MEASURED",
         "mtp_acceptance_rate": "NOT_MEASURED",
@@ -214,7 +305,7 @@ async def run_performance_cell(
         "metrics": metric,
         "notes": [
             "Fixed length request count checked against per-request streaming usage.completion_tokens",
-            "TTFT based on first streamed content chunk; TPOT derived from stream interval/output token count",
+            "TTFT from HTTP send to first streamed content chunk; E2E from submission (includes client CCU-slot queue wait); TPOT from stream interval/output token count",
             "nvidia-smi total MiB is not KV resident memory",
         ],
     }
@@ -256,14 +347,17 @@ async def run_quality_predictions(cfg: dict, model_id: str, mode: str,
                 response = await client.post(url, json=payload)
                 response.raise_for_status()
                 data = response.json()
-                pred = data["choices"][0]["message"].get("content", "")
+                choice = data["choices"][0]
+                pred = choice["message"].get("content", "")
                 results.append({"id": row["id"], "status": "SUCCESS",
                                 "prediction": pred, "usage": data.get("usage", {}),
+                                "finish_reason": choice.get("finish_reason"),
                                 "e2e_ms": (perf_counter() - start) * 1000})
                 consecutive_failures = 0
             except Exception as exc:
                 results.append({"id": row["id"], "status": "FAILED",
-                                "error": f"{type(exc).__name__}: {exc}", "prediction": None})
+                                "error": f"{type(exc).__name__}: {exc}", "prediction": None,
+                                "finish_reason": None})
                 consecutive_failures += 1
             # Avoid losing all quality predictions if Colab disconnects.
             atomic_jsonl(output, results)
@@ -278,6 +372,9 @@ async def run_quality_predictions(cfg: dict, model_id: str, mode: str,
                 break
     receipt = {
         "dataset": dataset, "model": model_id, "mode": mode,
+        "execution_pass": "NATURAL_EOS_QUALITY",
+        "output_contract": {"max_tokens": cfg["quality"]["max_output_tokens"],
+                            "ignore_eos": False},
         "status": ("QUALITY_STOPPED_AFTER_REPEATED_FAILURES" if aborted_quality
                    else "QUALITY_PREDICTIONS_UNSCORED"),
         "count": len(results),

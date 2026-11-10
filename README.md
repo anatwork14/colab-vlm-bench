@@ -33,6 +33,8 @@ python scripts/colab_agent.py prepare --session vlmb-cpu --model qwen35_08b --da
 
 The seven frozen arms are **Base**, **H2O+Base**, **Declarative Attention+Base**, **ECRD Grounding+Base**, **MTP Speculative Decoding**, **H2O+MTP**, and **Declarative Attention+MTP**. These methods are *not all supported by stock vLLM*. H2O/DA/ECRD and their combinations require verified Qwen3.5 A100 backend implementations and must never be emulated by simply changing a method label.
 
+The engine also registers the four STARLIGHT arms and the H2O confounder control `h2o_shared_base` (ITER3 round A; 12 engine arm IDs in total). These five are **not** in the 3,528-cell matrix, the 168-cell seven-method pilot, or the 48-cell priority pilot, and they have no inventory rows. `tests/test_i3b_arm_consistency.py` pins this split.
+
 - [Seven-arm pilot, 168 planned cells](configs/a100_qwen_7methods_pilot.json)
 - [Seven-arm confirmatory, 3,528 planned cells](configs/a100_qwen_7methods_full.json)
 - [Scientific seven-arm protocol](docs/SEVEN_ARM_PROTOCOL.md)
