@@ -56,7 +56,7 @@ from .starlight import (
     RETENTION_AT_INFEASIBLE_STEPS, RETENTION_BUDGET_BOUNDED, STATUS_INFEASIBLE, StarlightLayerPlan, combine_summaries, compact_orig_positions,
     da_protection_from_spans, evidence_provenance, evidence_validity,
     evidence_assessments, fixed_budget_verdict, grounding_protection_with_report,
-    plan_starlight_layer, summarize_plans,
+    plan_starlight_layer, summarize_plans, comparison_validity, protected_positions_at_prefill,
 )
 from .visual_mapping import VISUAL_EVIDENCE_NOTE, visual_evidence_report, visual_geometry_inputs
 from .speculative_route import speculative_route
@@ -1754,8 +1754,10 @@ class RealSevenArmEngine:
 
     def _mtp_text_speculation_route(self, image_present: bool) -> bool:
         """True when the mtp arm must run verifier-backed speculation (official, text-only)."""
+        # ITER3 closure (F-8): honour the speculation ablation flag, as the policy route does.
         return (
             self.method_arm == "mtp"
+            and self._speculation_enabled
             and self.is_official_hf_hooked
             and not image_present
             and getattr(self.model, "mtp_module", None) is not None
@@ -1839,6 +1841,7 @@ class RealSevenArmEngine:
                     n_layers=len(self.config.full_attention_layers),
                 ),
                 "speculation_executed": True,
+                "speculative_route": self._speculative_route_telemetry(False),
                 "arm_label": "mtp_cpu_speculative_reference_text_only_not_vllm",
                 "speculation": speculation,
                 "generation": {
@@ -2463,7 +2466,11 @@ class RealSevenArmEngine:
         starlight_orig: dict[int, np.ndarray] = {}
         starlight_da_spans: list[tuple[str, int, int]] = []
         starlight_grounding: dict[int, tuple[str, ...]] = {}
-        starlight_grounding_status = "NOT_STARTED" if "grounding" in starlight_enabled else "DISABLED_ABLATION"
+        # ITER3 closure F-11: a control arm (no signal at all) is not an ablation; an ablation has signals and drops one.
+        starlight_grounding_status = (
+            "NOT_STARTED" if "grounding" in starlight_enabled
+            else "DISABLED_BY_ABLATION" if starlight_enabled else "NOT_APPLICABLE_CONTROL_ARM_NO_GROUNDING_SIGNAL"
+        )
         starlight_verdicts: dict[str, list[str]] = {}
         starlight_provenance: dict[str, dict[str, str]] = {}
         # ITER3 Round A S4: the cap policy is traceable on EVERY starlight run, even when grounding does not run.
@@ -2486,7 +2493,9 @@ class RealSevenArmEngine:
         starlight_cache_mismatch_steps = 0
         # ITER3 Round B S2: visual evidence status for this request (replaced by the grounding branch below).
         starlight_visual: dict[str, Any] = {
-            "status": "DISABLED_ABLATION", "unsupported_reason": None, "items": {},
+            "status": ("DISABLED_BY_ABLATION" if starlight_enabled
+                       else "NOT_APPLICABLE_CONTROL_ARM_NO_GROUNDING_SIGNAL"),
+            "unsupported_reason": None, "items": {},
             "visual_positions_protected": 0, "visual_protected_positions": [], "geometry": None, "span": None,
             "note": VISUAL_EVIDENCE_NOTE,
         }
@@ -3094,6 +3103,10 @@ class RealSevenArmEngine:
             fixed_verdict = fixed_budget_verdict(
                 summary, budget_total=starlight_budget, max_retained_per_layer=starlight_max_retained,
             )
+            # ITER3 closure F-1: protection the controller sees at prefill, for the run-level comparability label.
+            protected_at_prefill = protected_positions_at_prefill(
+                len(full_prompt), starlight_da_spans, starlight_grounding.keys(), starlight_structural,
+            )
             result.telemetry["kv_memory_accounting"].update({
                 "fixed_budget_status": fixed_verdict["status"],
                 "kv_retention_status": (
@@ -3114,7 +3127,8 @@ class RealSevenArmEngine:
                 "method_variant_is_upstream_h2o": False,
                 "signals_enabled": list(starlight_enabled),
                 "da_signal": (
-                    "SCRIPTED_DIAGNOSTIC_NOT_MODEL_DECLARED" if "da" in starlight_enabled else "DISABLED_ABLATION"
+                    "SCRIPTED_DIAGNOSTIC_NOT_MODEL_DECLARED" if "da" in starlight_enabled
+                    else "DISABLED_BY_ABLATION" if starlight_enabled else "NOT_APPLICABLE_CONTROL_ARM_NO_DA_SIGNAL"
                 ),
                 "grounding_signal_status": starlight_grounding_status,
                 "grounding_declaration_missing": grounding_missing,
@@ -3203,4 +3217,16 @@ class RealSevenArmEngine:
                     "text-side retention only. No speed or VRAM claim."
                 ),
             }
+            # ITER3 closure F-1: an image run whose protection reaches the budget and that evicted nothing is a
+            # full-cache run, labelled NOT comparable. Surfaced at top level so every arm report reads it.
+            result.telemetry["comparison_validity"] = comparison_validity(
+                starlight_active=True, evicted_total=summary["evicted_total"],
+                protected_at_prefill=protected_at_prefill, budget_total=starlight_budget,
+                fixed_budget_run=fixed_verdict["fixed_budget_run"],
+            )
+        else:
+            result.telemetry["comparison_validity"] = comparison_validity(
+                starlight_active=False, evicted_total=0, protected_at_prefill=0, budget_total=0,
+                fixed_budget_run=False,
+            )
         return result
