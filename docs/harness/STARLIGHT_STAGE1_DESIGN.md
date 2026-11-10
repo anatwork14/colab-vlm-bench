@@ -134,6 +134,24 @@ If grounding is enabled and the request has an image but no image bytes or path,
 `NO_EVIDENCE_DECLARED`. A missing tokenizer is `UNAVAILABLE_NO_TOKENIZER`. Each is reported in
 telemetry, never silently zero.
 
+### 4.4 Visual evidence (`image_region`, ITER3 Round B S2)
+
+Visual protection is a separate channel from keyword grounding. It protects visual token positions only when all of
+the following hold for an item (see §18):
+
+- S1 protects the item: the source bytes are VERIFIED and bound to this request (`decide_protection`).
+- `location_valid` is VERIFIED: the box is well formed, with `0 <= ymin < ymax <= 1` and `0 <= xmin < xmax <= 1`.
+- The mapping is SUPPORTED for the request: the image is present and hashable, the processor geometry is established
+  (`grid_thw` agrees with the smart-resize arithmetic), and the prompt holds exactly one image token run of the right
+  length.
+
+The mapping is `visual_mapping.py`. A box covers every merged 2x2 cell it overlaps with positive area, so it is a
+superset of the box. Partially covered cells are counted (`partial_cells`). Positions are ORIGINAL prompt positions,
+so they follow each token through compaction. A region that cannot be mapped is UNSUPPORTED with a reason, never a guess.
+
+**Preserving a visual span does not prove the model used it.** Telemetry records that the cache kept those positions.
+It does not show that any answer depends on them. The status says nothing about grounding or quality.
+
 ## 5. Recurrent layers
 
 Gated-DeltaNet layers hold recurrent state, not token-addressable KV. They are exempt. They are
@@ -201,8 +219,10 @@ an H2O variant label is never attached to a STARLIGHT run.
 - CPU PyTorch reference only. Nothing here is vLLM, GPU, or a speed or VRAM result.
 - Keyword matching is token-level on the tokenizer's ids, so a word split across tokens in an
   unexpected way can be missed. ECRD matches on decoded words, so the two may differ.
-- Image-region evidence (bounding boxes) is not mapped to visual token positions. Only text
-  keyword spans protect in Stage 1.
+- Image-region evidence protects visual tokens only under the conditions in §4.4 (S1 verified, location valid,
+  mapping SUPPORTED). Otherwise the status is UNSUPPORTED with a reason, and no visual token is protected. Preserving a
+  visual span does not prove the model used it.
+- Visual protection is not counted in the keyword caps (§4.2), so the caps do not bound it.
 - `EvidenceItem` has no timestamp. Expiry is request-scoped.
 - Each `execute_request` is an independent request with a fresh tracker and position state. No KV
   is carried across calls, which matches the existing engine. "Multi-turn continuity" therefore
@@ -219,7 +239,8 @@ an H2O variant label is never attached to a STARLIGHT run.
    invariant under vetoes), or accept protection-inside-budget as implemented?
 2. Should DA sink protection be capped (e.g., a fraction of the budget), given it can exceed it?
 3. Image-region evidence: map bounding boxes to visual token positions in Stage 2, or keep it
-   text-only?
+   text-only? (ITER3 Round B implemented the mapping and the gate in §4.4. Whether the gate and the
+   UNSUPPORTED cases are the right policy is still the owner's decision. Not ratified.)
 4. Evidence expiry: add a timestamp or turn index to `EvidenceItem`?
 
 ## 12. Coverage against the auditor oracle (wF:p9, `docs/harness/STARLIGHT_INVARIANTS_ORACLE.md`)
@@ -347,9 +368,10 @@ structural).
   steps.
 - *Found and fixed by the equivalence test.* The normal STARLIGHT path builds scripted DA spans
   (`sink_global`, focus segment) even on text-only prefills. The driver mirrors them.
-- *Limits.* Text-only requests; no evidence pool (grounding not declared, `arm_status`
-  `degraded_text_only_no_evidence`); `da_mtp` stays non-speculative (no 2-row DA mask path); image
-  requests stay on the diagnostic path; the driver does not measure bytes freed (evictions happen).
+- *Limits.* Text-only requests. Evidence no longer changes the route (ITER3 Round B, §18): text-only keyword spans
+  protect on the policy path under `accept_declared` only. `da_mtp` stays non-speculative (explicit status
+  `NOT_SPECULATIVE_DA_MTP`, no 2-row DA mask path). Image requests are `UNSUPPORTED_IMAGE_PROMPT` on this path and stay
+  on the diagnostic path. The driver does not measure bytes freed (evictions happen).
 
 **(c) Per-KV-head score selection** (upstream fidelity A4-02). `H2OConfig.per_kv_head_selection`,
 default False (default path unchanged). `compute_eviction_plan_per_head` gives each KV head its own
@@ -395,3 +417,39 @@ configurable, versioned and ablatable, and were not tuned on confirmatory answer
   shows up as `fixed_budget_run` False while the control stays within budget. Tests: `tests/test_i3a_h2_shared_base.py` (7).
 - Not done in Round A: S2 visual mapping (Round B). The `adapters.py` placeholder `source_sha256 = "a"*64`
   (around line 487) is not changed here and is an open item.
+
+## 18. ITER3 Round B (S2 visual mapping; Stage 2 combined methods)
+
+Provisional policy values (engineering hypotheses, not owner ratification): the visual gate in §4.4, the superset rule
+for boxes, and `accept_declared` for text-only evidence on the speculative path.
+
+- **S2 mapping.** `visual_mapping.py` (§4.4). The geometry is the local Qwen3.5-0.8B processor's: patch 16, merge 2,
+  factor 32, pixel bounds 65536 to 16777216. Tests check `smart_resize` and the grid against the real processor on fixtures
+  (256x256, 300x200, 1000x37, 64x64, 640x480, 2000x2000). The token order (row-major over merged cells) is checked
+  against the real `pixel_values`. A column-major mutant gives max abs error 1.76, against 6e-8 for row-major, so the
+  check discriminates. Files: `tests/test_i3b_s2_visual_mapping.py`, `tests/test_i3b_s2_visual_protection.py`.
+- **Visual status (replaces `NOT_IMPLEMENTED`).** Per request: `SUPPORTED` or `UNSUPPORTED` with a reason (§4.4). The
+  C-5 expectations in `tests/test_r2_c5_visual_evidence.py` were re-derived with a stated reason: the old fixed label
+  is replaced by a status that depends on the request. A pool with image evidence and no image is now
+  `UNSUPPORTED / NO_IMAGE_IN_REQUEST`.
+- **Engine (official checkpoint).** The source size is recorded in `vis_trace`. Geometry comes from the processor, and the
+  single image token run comes from the prompt. Verified cells join the grounding protection by original position and
+  survive compaction. `visual_protected_retained_final_by_layer` is measured at the end of each request. Heavy test:
+  `tests/test_i3b_s2_visual_engine.py` (fixture `tests/fixtures/000000039769.png`, 640x480, grid 30x40, 300 tokens):
+  80 merged cells protected for the top-left quadrant, each retained in every full-attention layer.
+- **Stage 2 route.** `speculative_route.py` gives an explicit status per arm and request (§2 of BACKEND_INTERFACE.md).
+  Evidence no longer changes the route. For `h2o_mtp` and `starlight_s1_mtp` on text-only requests, the grounding
+  protection enters the policy state, and it is retained under speculation. Text-only evidence protects only under
+  `accept_declared`, because it has no source bytes to verify. An image prompt on a combined or serving MTP arm is
+  `UNSUPPORTED_IMAGE_PROMPT`. `da_mtp` is `NOT_SPECULATIVE_DA_MTP`. The MTP text paths are CPU verifier references, not
+  native vLLM MTP.
+- **Rollback and invariants.** `tests/test_i3b_s2_combined_speculation.py` checks: a rejection after an accepted block
+  restores the cache, the policy state, and the original-position map; protected original positions stay retained at every
+  speculative step; requests are isolated. The rollback is also checked by a mutant that skips the original-position
+  restore. The engine then raises a bookkeeping error (`position bookkeeping out of sync`), so a missing restore fails closed.
+- **Scope.** A preserved visual or text span does NOT prove the model used it. The telemetry shows what the cache kept.
+  Nothing here is a quality, speed, or vLLM result. Stage 2 numerics are a CPU reference. Accepted 2-row blocks are not
+  asserted bit-identical to single-row steps (§15b).
+- **Open items.** Owner ratification of the §4.4 gate and the `accept_declared` default. Image prompts on the speculative
+  path (UNSUPPORTED by design, not implemented). Multi-image requests (the engine takes one image per request, and the
+  mapping refuses multi-image). Native vLLM MTP (BLOCKED). The `adapters.py` placeholder from Round A (open).
