@@ -10,10 +10,10 @@ is used here as the reference layout, not as evidence about the 4B.
 
 | Item | State |
 |---|---|
-| `models/Qwen/` | contains `Qwen3.5-0.8B` only. No `Qwen3.5-4B` directory at depth 3. |
+| `models/Qwen/` | contains `Qwen3.5-0.8B` only. No `Qwen3.5-4B` directory at depth 3. (Unchanged on 2026-11-10; see §9.) |
 | `~/.cache/huggingface/hub` | `hf-internal-testing/tiny-random-gpt2` only |
 | Config pin for 4B (`configs/a100_qwen_priority_pilot.json`) | `hf_id: Qwen/Qwen3.5-4B`, `revision: UNPINNED` |
-| Free space on `/mnt/ssd` | 15 GB at the time of reading (`df`), 100% used. The harness guard is 20 GiB. |
+| Free space on `/mnt/ssd` | 15 GB at the time of reading (`df`), 100% used. On 2026-11-10 the storage check read 13,925,695,488 bytes (12.97 GiB). The harness guard is 20 GiB. |
 | 0.8B reference layout | 13 top-level files plus `.cache/huggingface` (76 KB). See §3. |
 
 ## 2. Revision pin (UNKNOWN; owner-authorised metadata step)
@@ -123,10 +123,56 @@ chat template must render identically under the pinned tokenizer for Base and MT
 
 Until S1 runs, every 4B cell stays at `NONE` or `PLAN_AUTHORIZED` in the ladder, and the 4B rows in the inventory are BLOCKED.
 
-## 9. Not closed
+## 9. Drive findings and the storage check (ITER3 D3, 2026-11-10)
+
+Source: `docs/harness/DRIVE_INVENTORY.md` (read-only listing; no file was downloaded). The Drive holds a **candidate 4B**:
+`weights_system_one/public/qwen3.5-4b`, 15 files, 9,342,907,510 bytes, with both shards listed. Its sizes are in
+`docs/harness/QWEN35_4B_DRIVE_EXPECTED_SIZES.json`. Those sizes are not a pin, and Drive gives MD5 only.
+
+What the Drive changes:
+
+- **§2 (revision):** still UNKNOWN. The folder's `.workspace-revision` file (41 bytes) and its `config.json` could not be read (§5 of
+  `DRIVE_INVENTORY.md`: the duplicated folder name `weights_system_one` gives "directory not found"). Two `.cache` file names are 40-hex
+  strings. They are **unverified** as commit SHAs and are not used.
+- **§3 (safetensors):** both shards are listed (5,329,398,688 and 3,990,429,408 bytes). The index (76,196 bytes) was not read, so the tensor
+  groups and the `mtp` count are still UNKNOWN.
+- **§4 (tokenizer):** `tokenizer.json`, `vocab.json`, `merges.txt` and `preprocessor_config.json` have the same MD5 as the local
+  Qwen3.5-0.8B copy. `tokenizer_config.json`, `chat_template.jinja` and `config.json` differ. The EOS question (`generation_config.json`)
+  is still open: the Drive folder has no `generation_config.json`.
+- **§7 (backend):** unchanged. Nothing was loaded in vLLM.
+- **§5 (hashes):** Drive stores MD5, not SHA-256. The signed `weights_manifest_sha256` needs the bytes.
+
+### 9a. Storage check (run 2026-11-10, dry)
+
+Command (the target was not created):
+
+```
+python scripts/storage_safety_check.py --target /mnt/ssd/genos2/research_workspace/models/Qwen/Qwen3.5-4B \
+  --expected <sizes.json from QWEN35_4B_DRIVE_EXPECTED_SIZES.json> --guard-gib 20
+```
+
+Result: **REFUSE, exit 2.** Free 13,925,695,488 bytes. Need 9,342,907,510 bytes (15 files, none present). Free after the transfer
+4,582,787,978 bytes (4.27 GiB), which is below the 20 GiB guard. This matches §6: the 4B does not fit under the guard today.
+
+### 9b. Verify-and-reuse path (proposed; each step needs its own owner approval)
+
+1. **Owner decision on the path.** Rename or de-duplicate the two `weights_system_one` folders on the Drive, or name another way to read
+   them. Until then, nothing under that folder can be read (BLOCKED).
+2. **Owner decision on the revision (S1).** Record the revision for the folder, from a read-only HF metadata request for
+   `Qwen/Qwen3.5-4B`, and check it against the Drive's `.workspace-revision` once that file can be read.
+3. **Owner decision on space or the guard (S3).** The check refuses today. Freeing about 5 GiB more, or an owner decision on the
+   guard, is needed before any transfer. This plan does not change the guard.
+4. **Transfer (S4), only after 1–3.** Copy to a new directory (not over the existing 0.8B files). Before the copy, run the storage check; after
+   it, the files are checked by size and SHA-256 against the signed manifest, not by the free-space gate.
+5. **Verify (S5).** SHA-256 each file; sign the manifest; the inventory then checks the signed values (`scripts/harness_inventory.py`).
+
+A file already present at the expected size is reused by the check (not transferred). A size mismatch is transferred again. The check never
+deletes the existing file.
+
+## 10. Not closed
 
 - No revision SHA for the 4B. (S1.)
-- No 4B file list, sizes or tensor counts. (S1, S6.)
+- No 4B tensor counts or index contents (the Drive index was not read). The file list and sizes are known from Drive metadata only (§9). (S1, S6.)
 - No `generation_config.json` status for 4B, and the EOS question is open for both models. (S6.)
 - No vLLM load test for the 4B architecture. (S8.)
 - The disk guard and the free space conflict. (S3.)

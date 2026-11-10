@@ -14,6 +14,8 @@ from typing import Any
 from ..artifacts import atomic_jsonl, sha256
 from ..config import LENGTHS
 from ..workloads import load_jsonl
+from .native_records import (TRANSFORM_VERSION, MissingReferences, check_record,
+                              receipt, transform_params_sha256)
 
 CANONICAL_LENGTHS: tuple[int, ...] = LENGTHS  # (128, 512, 1024, 2048, 4096, 8192, 16384)
 
@@ -26,7 +28,9 @@ def normalize_memlens(
 ) -> dict[str, Any]:
     """Stream MemLens JSON question-by-question, without copying the whole file.
 
-    Peak RAM is bounded by one 32K item and its normalized message list.
+    ITER3 D2: a first pass checks every image reference and reports all missing ones together
+    (`MissingReferences`); nothing is published when any is missing. The second pass writes the native records in
+    source order with every image path and its SHA-256, and runs the gold-free check on each record.
     """
     try:
         import ijson
@@ -42,90 +46,124 @@ def normalize_memlens(
     if limit is not None and limit < 1:
         raise ValueError("Limit must be positive or None")
 
+    def items():
+        with source.open("rb") as fp:
+            for index, item in enumerate(ijson.items(fp, "item")):
+                if limit is not None and index >= limit:
+                    break
+                yield item
+
+    def image_path(relative: Path, qid: str) -> Path:
+        path = (images_root / "release_images" / relative).resolve()
+        if not path.is_relative_to(images_root):
+            raise ValueError(f"Escaping MemLens image path in {qid}: {relative}")
+        return path
+
+    # Pass 1: every image reference, before anything is written.
+    missing: list[dict[str, Any]] = []
+    for item in items():
+        if not isinstance(item, dict):
+            raise TypeError("MemLens expects a top-level JSON list of objects")
+        qid = str(item["question_id"])
+        for session in item["haystack_sessions"]:
+            for turn in session:
+                for image_ref in turn.get("images", []):
+                    relative = Path(image_ref["file"])
+                    path = image_path(relative, qid)
+                    if not path.is_file():
+                        missing.append({"kind": "memlens_image", "id": qid, "path": relative.as_posix()})
+    if missing:
+        raise MissingReferences(missing)
+
     seen: set[str] = set()
     count = 0
     image_count_total = 0
+    checks: list[dict[str, Any]] = []
 
     def records():
         nonlocal count, image_count_total
-        with source.open("rb") as fp:
-            for item in ijson.items(fp, "item"):
-                if not isinstance(item, dict):
-                    raise TypeError("MemLens expects a top-level JSON list of objects")
-                qid = str(item["question_id"])
-                if qid in seen:
-                    raise ValueError(f"Duplicate MemLens question id: {qid}")
-                seen.add(qid)
-                session_ids = item["haystack_session_ids"]
-                sessions = item["haystack_sessions"]
-                dates = item["haystack_dates"]
-                if len(session_ids) != len(sessions) or len(sessions) != len(dates):
-                    raise ValueError(f"Inconsistent MemLens session metadata: {qid}")
+        for item in items():
+            if not isinstance(item, dict):
+                raise TypeError("MemLens expects a top-level JSON list of objects")
+            qid = str(item["question_id"])
+            if qid in seen:
+                raise ValueError(f"Duplicate MemLens question id: {qid}")
+            seen.add(qid)
+            session_ids = item["haystack_session_ids"]
+            sessions = item["haystack_sessions"]
+            dates = item["haystack_dates"]
+            if len(session_ids) != len(sessions) or len(sessions) != len(dates):
+                raise ValueError(f"Inconsistent MemLens session metadata: {qid}")
 
-                parts = []
-                image_count = 0
-                for sid, date, session in zip(session_ids, dates, sessions):
-                    parts.append({"type": "text", "text": f"\n[Session {sid} — {date}]\n"})
-                    for turn in session:
-                        raw_role = str(turn["role"]).strip().lower()
-                        if "assistant" in raw_role:
-                            role = "assistant"
-                        elif "user" in raw_role:
-                            role = "user"
-                        else:
-                            raise ValueError(f"Unknown MemLens role {turn['role']} in {qid}")
+            parts = []
+            image_refs: list[dict[str, str]] = []
+            for sid, date, session in zip(session_ids, dates, sessions):
+                parts.append({"type": "text", "text": f"\n[Session {sid} — {date}]\n"})
+                for turn in session:
+                    raw_role = str(turn["role"]).strip().lower()
+                    if "assistant" in raw_role:
+                        role = "assistant"
+                    elif "user" in raw_role:
+                        role = "user"
+                    else:
+                        raise ValueError(f"Unknown MemLens role {turn['role']} in {qid}")
+                    parts.append({
+                        "type": "text",
+                        "text": f"[{role}] {turn.get('content', '')}\n",
+                    })
+                    for image_ref in turn.get("images", []):
+                        relative = Path(image_ref["file"])
+                        path = image_path(relative, qid)
                         parts.append({
-                            "type": "text",
-                            "text": f"[{role}] {turn.get('content', '')}\n",
+                            "type": "image_path",
+                            "path": str(path),
+                            "asset_root": str(images_root),
                         })
-                        for image_ref in turn.get("images", []):
-                            relative = Path(image_ref["file"])
-                            path = (images_root / "release_images" / relative).resolve()
-                            if not path.is_relative_to(images_root) or not path.is_file():
-                                raise ValueError(f"Missing or escaping MemLens image: {relative}")
-                            parts.append({
-                                "type": "image_path",
-                                "path": str(path),
-                                "asset_root": str(images_root),
-                            })
-                            image_count += 1
+                        image_refs.append({"path": relative.as_posix(), "sha256": sha256(path)})
 
-                parts.append({"type": "text", "text": f"\nQuestion: {item['question']}"})
-                record = {
-                    "id": qid,
-                    "dataset": "memlens",
-                    "track": "native_quality",
-                    "messages": [{"role": "user", "content": parts}],
-                    "reference": str(item["answer"]),
-                    "native_context_complete": True,
-                    "meta": {
-                        "question_type": item["question_type"],
-                        "question_date": item.get("question_date"),
-                        "session_ids": session_ids,
-                        "evidence_session_ids": item.get("answer_session_ids", []),
-                        "image_count": image_count,
-                        "adapter_provenance": (
-                            "colab-vlm-bench-memlens-v2-streaming; "
-                            "official_prompt_parity_pending"
-                        ),
-                    },
-                }
-                count += 1
-                image_count_total += image_count
-                yield record
-                if limit is not None and count >= limit:
-                    break
+            parts.append({"type": "text", "text": f"\nQuestion: {item['question']}"})
+            record = {
+                "id": qid,
+                "dataset": "memlens",
+                "track": "native_quality",
+                "messages": [{"role": "user", "content": parts}],
+                "reference": str(item["answer"]),
+                "native_context_complete": True,
+                "meta": {
+                    "question_type": item["question_type"],
+                    "question_date": item.get("question_date"),
+                    "session_ids": session_ids,
+                    "evidence_session_ids": item.get("answer_session_ids", []),
+                    "image_count": len(image_refs),
+                    "image_refs": image_refs,
+                    "adapter_provenance": (
+                        "colab-vlm-bench-memlens-v3-native-records; "
+                        "official_prompt_parity_pending"
+                    ),
+                },
+            }
+            checks.append(check_record(record))
+            count += 1
+            image_count_total += len(image_refs)
+            yield record
 
     atomic_jsonl(output, records())
+    gold_free = receipt(checks)
+    params = {"version": TRANSFORM_VERSION, "dataset": "memlens", "limit": limit}
+    source_sha = sha256(source)
+    output_sha = sha256(output)
     return {
         "dataset": "memlens",
         "count": count,
         "image_references": image_count_total,
-        "sha256_source": sha256(source),
-        "sha256_normalized": sha256(output),
+        "sha256_source": source_sha,
+        "sha256_normalized": output_sha,
         "output": str(output),
         "status": "NORMALIZED_NEEDS_OFFICIAL_PROMPT_PARITY",
         "memory_strategy": "ijson_stream_one_question_and_atomic_jsonl",
+        "transform": {"version": TRANSFORM_VERSION, "params_sha256": transform_params_sha256(params),
+                      "source_sha256": source_sha, "output_sha256": output_sha},
+        "gold_free_receipt": gold_free,
     }
 
 
