@@ -1022,6 +1022,9 @@ STARLIGHT_ARM_SIGNALS: dict[str, tuple[str, ...]] = {
     "starlight_s1_no_da": ("grounding", "structural"),
     "starlight_s1_no_grounding": ("da", "structural"),
     "starlight_s1_mtp": ("da", "grounding", "structural"),
+    # ITER3 Round A H2 confounder control: the same shared selection as STARLIGHT with NO internal protection.
+    # An empty tuple is a real arm (not "no arm"): the controller runs with zero signals.
+    "h2o_shared_base": (),
 }
 STARLIGHT_MEASUREMENT_LABEL = "cpu_pytorch_reference_not_vllm"
 # Arms that run the DA attention mask. Exact membership, never a substring test: the name
@@ -1178,6 +1181,7 @@ class RealSevenArmEngine:
         "starlight_s1_no_da",
         "starlight_s1_no_grounding",
         "starlight_s1_mtp",
+        "h2o_shared_base",
     ))
 
     def __init__(
@@ -1817,7 +1821,7 @@ class RealSevenArmEngine:
         full = tuple(self.config.full_attention_layers)
         if kind == "h2o":
             return _PolicyState(kind=kind, cache=cache, tracker=tracker, full_layers=full)
-        if not self.starlight_signals:
+        if self.starlight_signals is None:  # an empty signal set is a valid control arm (h2o_shared_base)
             raise ValueError("kind 'starlight' requires a starlight arm")
         budget_total = max(self.h2o_config.min_budget, int(prompt_len * self.h2o_config.budget_ratio))
         orig = {l: np.arange(prompt_len, dtype=np.int64) for l in full}
@@ -3015,7 +3019,10 @@ class RealSevenArmEngine:
             }
             result.telemetry["starlight"] = {
                 "measurement_label": STARLIGHT_MEASUREMENT_LABEL,
-                "method_variant": f"starlight_stage1::{'+'.join(starlight_enabled)}",
+                "method_variant": (
+                    f"starlight_stage1::{'+'.join(starlight_enabled)}" if starlight_enabled
+                    else "shared_h2o_control::no_internal_protection"
+                ),
                 "method_variant_is_upstream_h2o": False,
                 "signals_enabled": list(starlight_enabled),
                 "da_signal": (

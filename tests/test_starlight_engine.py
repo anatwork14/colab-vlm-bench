@@ -35,6 +35,8 @@ SEVEN_ARMS = frozenset(("base", "h2o_base", "da_base", "ecrd_base", "mtp", "h2o_
 STARLIGHT_ARMS = frozenset((
     "starlight_s1", "starlight_s1_no_da", "starlight_s1_no_grounding", "starlight_s1_mtp",
 ))  # Stage 2(b): + starlight_s1_mtp
+# ITER3 Round A H2 confounder control (no internal protection). A control, not a STARLIGHT arm.
+H2_CONTROL_ARMS = frozenset(("h2o_shared_base",))
 SHA = hashlib.sha256(b"no-image").hexdigest()
 
 
@@ -93,7 +95,8 @@ def _step(engine, tracker, length, budget, da_spans=(), grounding=None, enabled=
 # --- arm registry -------------------------------------------------------------------------
 
 def test_supported_arms_adds_four_starlight_arms_and_keeps_the_seven():
-    assert RealSevenArmEngine.SUPPORTED_ARMS == SEVEN_ARMS | STARLIGHT_ARMS
+    # Updated in ITER3 Round A: the set now also contains the H2 control arm (expectation extended, not relaxed).
+    assert RealSevenArmEngine.SUPPORTED_ARMS == SEVEN_ARMS | STARLIGHT_ARMS | H2_CONTROL_ARMS
 
 
 def test_existing_h2o_base_has_no_starlight_telemetry():

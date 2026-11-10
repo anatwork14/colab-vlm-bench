@@ -10,6 +10,7 @@ layers, generation policy and tiny config for every arm.
 import hashlib
 
 import numpy as np
+import torch
 
 from vlmbench.infrastructure.evidence_verification import EvidencePolicy
 from vlmbench.infrastructure.grounding_evidence import EvidenceItem, EvidencePool
@@ -39,6 +40,8 @@ def _pool(rid="h2s"):
 
 
 def _run(arm, *, pool=None, ratio=0.2, min_budget=16, rid="h2s"):
+    # Seeded: every engine draws its tiny random weights from the same seed, so two runs compare like for like.
+    torch.manual_seed(1234)
     engine = RealSevenArmEngine(method_arm=arm, device="cpu", config=_cfg(), stop_at_eos=False,
                                 h2o_min_budget=min_budget, h2o_budget_ratio=ratio, tokenizer=_WordTok(),
                                 evidence_policy=ACCEPT_DECLARED)
@@ -96,9 +99,10 @@ def _plans(engine, enabled, grounding):
     tracker = _scored_tracker(scores)
     k_lens = {3: length, 7: length}
     orig = {3: np.arange(length - 1), 7: np.arange(length - 1)}
-    return engine._starlight_build_step_plans(
+    _, _, plans = engine._starlight_build_step_plans(
         tracker, k_lens, orig, length - 1, budget, [], dict(grounding), tuple(enabled),
     )
+    return plans
 
 
 def test_shared_selection_matches_starlight_with_zero_protection_at_every_layer():
