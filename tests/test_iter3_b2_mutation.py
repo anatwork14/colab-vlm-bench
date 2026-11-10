@@ -100,8 +100,8 @@ def test_M4_plans_that_ignore_da_protection_are_detected_by_the_protection_spy(s
     real_new_state = star_engine._pol_new_state
     protected_pos = 23
 
-    def with_focus_span(kind, prompt_len):
-        st = real_new_state(kind, prompt_len)
+    def with_focus_span(kind, prompt_len, **kw):
+        st = real_new_state(kind, prompt_len, **kw)
         st.da_spans = tuple(st.da_spans) + (("focus:mid", protected_pos, protected_pos + 1),)
         return st
 
