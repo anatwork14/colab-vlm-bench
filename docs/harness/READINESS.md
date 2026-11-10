@@ -176,3 +176,18 @@ refusing everything.
   made the decision the record describes.
 - **Pilot GPU run.** No cell is READY and none has a smoke receipt. The GPU run is still unexecuted
   (see `docs/harness/GPU_RUNBOOK.md`).
+
+## 7. Arm sets and grid sizes (ITER3 round B)
+
+| Set | Arms | Cells | Where it is defined | Round A change |
+|---|---|---:|---|---|
+| Engine registry (`RealSevenArmEngine.SUPPORTED_ARMS`) | 12: seven originals, four STARLIGHT, `h2o_shared_base` | — | `src/vlmbench/infrastructure/real_engine.py` | `h2o_shared_base` added |
+| Confirmatory matrix | seven originals (`base`, `h2o_base`, `da_base`, `ecrd_base`, `mtp`, `h2o_mtp`, `da_mtp`) | **3,528** = 2 models × 7 methods × 2 datasets × 7 input lengths × 6 CCU × 3 reps | `configs/a100_qwen_7methods_full.json` | none (unchanged) |
+| Seven-method pilot | the same seven | **168** = 2 × 7 × 2 × 2 × 3 × 1 | `configs/a100_qwen_7methods_pilot.json` | none |
+| Priority pilot (inventory) | `base`, `mtp` only | **48** = 2 models × 2 modes × 2 datasets × 2 lengths × 3 CCU × 1 rep | `configs/a100_qwen_priority_pilot.json` | none (unchanged) |
+| Recorded inventory (`PILOT_INVENTORY.json`) | the seven originals (matrix rows) and `base`/`mtp` (pilot rows) | 3,576 = 48 + 3,528 | `scripts/harness_inventory.py` | regenerated only if the script changed (it did not) |
+
+`h2o_shared_base` and the four STARLIGHT arms are not in the matrix, either pilot, or the inventory. Any result for them needs its own
+plan and its own cell definition; they are not counted in the 48-cell or 3,528-cell figures. The 1,008 native cells (`base`, `mtp`) and the
+2,520 cells marked `UNSUPPORTED_ARM_NO_QUALIFIED_BACKEND` in the full matrix follow from the same split.
+`tests/test_i3b_arm_consistency.py` checks each row against the configs, the engine and the recorded inventory.
