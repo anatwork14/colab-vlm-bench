@@ -5,6 +5,11 @@ Status: **listings complete; small metadata files readable by folder ID (round B
 was downloaded (no safetensors shard was read), copied, synced, mounted, deleted or uploaded. No rclone configuration was
 printed; tokens and config values are not recorded here.
 
+**Round B correction:** the Qwen3.5 checkpoints are **also** in a second Drive tree, `LLM_Weights/models/Qwen` (§2b). That tree is
+**not** in the `drive:` root listing; it is reachable only by its folder ID. It holds the **Qwen3.5-0.8B** checkpoint and a **second copy of
+the 4B** (same bytes as `weights_system_one/public/qwen3.5-4b`). The earlier statements "no Qwen3.5-0.8B on Drive" and "the search covers all
+82,390 paths" apply to the `drive:` root tree only, and are withdrawn for the 0.8B.
+
 Read on **2026-11-10** with rclone **v1.63.1**. Local facts are read on this host at the same date.
 
 ## 1. Commands run (all read-only)
@@ -19,6 +24,9 @@ Read on **2026-11-10** with rclone **v1.63.1**. Local facts are read on this hos
 | `rclone lsjson drive: --drive-root-folder-id <ID> --dirs-only --max-depth 1` (per `weights_system_one` ID) | disambiguate the two folders by ID | folder IDs in §2a |
 | `rclone cat <name> --drive-root-folder-id <ID>` for 7 small files (§4, §5a) | read small metadata files by ID; output went to a session scratch folder, not to this doc | **exit 0 for all 7**; sizes match the listing |
 | `rclone cat MANIFEST.json --drive-root-folder-id <ID>` (`clef-flash-9b` folder, found by ID) | read the second MANIFEST | exit 0, 5,095 bytes |
+| `rclone lsjson drive: --drive-root-folder-id <ID> --max-depth 1 [--hash]` for `LLM_Weights/models/Qwen` and its 0.8B and 4B folders (§2b) | metadata listing (names, sizes, Drive MD5); no file body | exit 0 |
+| `rclone cat starlight_checkpoint_inventory.json --drive-root-folder-id <ID>` for the 0.8B and 4B folders (§4c) | read the staging record (2–3 KB) | exit 0 |
+| local re-hash of the 0.8B checkpoint (`starlight_local_manifest.json`, 13 files, incl. the 1.7 GB shard) under `heavy.lock` | check the local 0.8B against its own manifest and against Drive MD5 | SHA-256 13/13 match; MD5 13/13 match Drive |
 
 `--hash` on Google Drive returns the MD5 that Drive already stores. It does not download file bodies. Drive gives **MD5 only**, not SHA-256.
 
@@ -50,12 +58,22 @@ Under B: `public/qwen3.5-4b` = `17y6WMGDDcVUqIwZUyvQ5jA3ImUgNZqEi`; `public/qwen
 
 The two folders share a name, which breaks path-based lookups (§5). ID-based lookups work. The owner may still want to rename one of them.
 
+### 2b. `LLM_Weights/models/Qwen` (second tree; found by ID in round B)
+
+| Folder | ID | Contents (metadata) |
+|---|---|---|
+| `LLM_Weights/models/Qwen` (parent) | `1TzIvJ3ZqW5LR4-RpIKDd8VDx9J2NiTm9` | folders `Qwen3.5-0.8B`, `Qwen3.5-27B`, `Qwen3.5-27B-DFlash`, `Qwen3.5-2B`, `Qwen3.5-4B`, `Qwen3.5-4B-DFlash`, `Qwen3.5-4B-Eagle3`, `Qwen3.5-9B`, `Qwen3.5-9B-DFlash`, `Qwen3.6-27B` |
+| `Qwen3.5-0.8B` | `1tbrMRO_SvrA_LCVygPY-yp5EVHt8z-jM` | 14 files: 13 model files (the same set as the local 0.8B, §4c) plus `starlight_checkpoint_inventory.json` (2,322 B) |
+| `Qwen3.5-4B` | `1diS4-5tL8zfAkyNpMgOv1aiYxc9Rs25S` | 15 files: the 14 model files of §4a (the same bytes) plus `starlight_checkpoint_inventory.json` (2,513 B). No `.workspace-revision` |
+
+Only the 0.8B and 4B folders were listed. The other folders were not opened. Their names are the only evidence used here.
+
 ## 3. What was looked for, and what was found
 
 | Expected artifact (source) | Found on Drive | Evidence |
 |---|---|---|
-| Qwen3.5-0.8B checkpoint | **no** | no path, file name or size matches. Search: `qwen` (28 non-cache files, all 4B), `0.8`, `08b` |
-| Qwen3.5-4B checkpoint (`QWEN35_4B_STAGING_PLAN.md`) | **yes, candidate** `weights_system_one/public/qwen3.5-4b` (ID `17y6WMG…`; has `chat_template.jinja`; both shards listed; "instruct" is not established) | §4a |
+| Qwen3.5-0.8B checkpoint | **yes**: `LLM_Weights/models/Qwen/Qwen3.5-0.8B` (ID `1tbrMRO…`), **byte-identical to the local copy** (§4c). Not in the `drive:` root tree, so the earlier root search missed it | §2b, §4c |
+| Qwen3.5-4B checkpoint (`QWEN35_4B_STAGING_PLAN.md`) | **yes, two copies with the same bytes**: `weights_system_one/public/qwen3.5-4b` (ID `17y6WMG…`; has `.workspace-revision` and `chat_template.jinja`) and `LLM_Weights/models/Qwen/Qwen3.5-4B` (ID `1diS4…`; has the staging inventory). Both shards in each. "Instruct" is not established | §4a, §4d |
 | Qwen3.5-4B-base | `weights_system_one/public/qwen3.5-4b-base`, **incomplete**: shard 2 of 2 listed, shard 1 **absent** | §4b |
 | MemLens (`DATASET_READINESS.md` §2) | **no** (no name match for `memlens`, `release_images`, `haystack`, `needle`) | search of all 82,390 paths |
 | MMLongBench-Doc (`DATASET_READINESS.md` §3) | **no** (zero `.pdf` files; no `mmlong` name) | search of all 82,390 paths |
@@ -156,6 +174,30 @@ Round B read its `.workspace-revision` (`1001bb4d826a52d1f399e183466143f4da7b741
 counts as the 4B index (738: 426 / 297 / 15) and the same shard names, but a different MD5 (`1194255c…` vs `14dbb606…`).
 The pilot config names `Qwen/Qwen3.5-4B`. Whether that is the base or the instruct model is **not established here** (owner/HF metadata step).
 
+### 4c. Qwen3.5-0.8B in `LLM_Weights/models/Qwen/Qwen3.5-0.8B` (ID `1tbrMRO…`)
+
+| Check | Result |
+|---|---|
+| Drive MD5 vs the **local** 0.8B bytes (`models/Qwen/Qwen3.5-0.8B`, re-hashed on this host under `heavy.lock`) | **13 of 13 model files equal**, including the 1.7 GB shard (`model.safetensors-00001-of-00001.safetensors`, 1,746,942,600 B). The 14th file (`starlight_checkpoint_inventory.json`) exists only on Drive |
+| Recorded SHA-256 in `starlight_checkpoint_inventory.json` (Drive) vs `starlight_local_manifest.json` (local) | **13 of 13 equal** |
+| Local SHA-256 re-check (recomputed today) vs the local manifest | **13 of 13 match** (`heavy.lock`, read-only) |
+| Revision | `2fc06364715b967f1860aea9cf38778875588b17`, in both the Drive inventory and the local manifest. A **local and staging claim**, not verified against Hugging Face (S1 for the 0.8B too) |
+| `model.safetensors.index.json` | 50,900 B on Drive; MD5 `6de26210…` (the local index has the same MD5). Not reparsed here |
+
+So the 0.8B checkpoint **is** on Drive, and the copy matches the local bytes on MD5 and on the recorded SHA-256. The Drive copy itself was not
+hashed (its bytes are not local). The match rests on MD5 (metadata) and on the recorded SHA-256 (provenance), not on a fresh SHA-256 of the Drive bytes.
+
+### 4d. Qwen3.5-4B staging record (`starlight_checkpoint_inventory.json`, ID `1diS4…`)
+
+- `repo_id` `Qwen/Qwen3.5-4B`; `revision_sha` `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a` (the same value as the `.workspace-revision` in
+  `weights_system_one/public/qwen3.5-4b`, and the `.cache` file name). Role label in the file: `stage1_primary_stage2_verifier_native_mtp`.
+- 14 file entries, each with `path`, `bytes` and `sha256`. Every `bytes` value equals the Drive size of that file (14 of 14). The note says:
+  "SHA256 is computed over staged bytes. Rclone check verifies Drive copies."
+- **Status of these SHA-256 values:** recorded by an earlier staging run. The author, time and host are not stored in the file. No 4B bytes exist
+  on this host, so **none of the 4B SHA-256 values were verified here**. They are candidate values for the hash-on-arrival step (staging plan §9b).
+  They are not owner-signed and are not a pin.
+- The 4B revision `851bf6e8…` is recorded in the staging record and in the Drive `.workspace-revision`. Two Drive records agree. HF verification is still S1.
+
 ## 5. Read failures and how round B resolved them
 
 ### 5.1 Path-based reads (still fail)
@@ -207,10 +249,10 @@ The raw JSON of the index and the two MANIFESTs was parsed in scratch code. Only
 
 | Item | Reusable for the 4B staging? | Why |
 |---|---|---|
-| `qwen3.5-4b` shards and tokenizer files (§4a) | **Candidate; metadata verified, not usable yet** | Complete by name and size (9.32 GB of shards). Index, config and revision file now read. Not pinned, not SHA-256 verified. The copy needs owner approval, and **local disk cannot hold it** (below). |
-| `qwen3.5-4b` tokenizer.json / vocab.json / merges.txt / preprocessor_config.json | Cross-check only | MD5 equal to the local 0.8B copy. Verifies the family, not the 4B pin. |
+| 4B shards and tokenizer files (§4a; same bytes in `LLM_Weights/…/Qwen3.5-4B`, §4d) | **Candidate; metadata verified, not usable yet** | Complete by name and size (9.32 GB of shards). Index, config and revision now read. Recorded per-file SHA-256 exists (§4d) but was not verified here, and is not owner-signed. The copy needs owner approval, and **local disk cannot hold it** (§6a). |
+| 4B tokenizer.json / vocab.json / merges.txt / preprocessor_config.json | Cross-check only | MD5 equal to the local 0.8B copy. Verifies the family, not the 4B pin. |
 | `qwen3.5-4b-base` | **No** | Shard 1 missing. Different model variant (unconfirmed against the pin). |
-| Qwen3.5-0.8B on Drive | n/a | None. The local 0.8B copy stays the only one. |
+| Qwen3.5-0.8B (`LLM_Weights/models/Qwen/Qwen3.5-0.8B`) | **Already local; the Drive copy is the same bytes** | §4c. No transfer is needed for the 0.8B, which is already on this host and verified against its own manifest. |
 | MemLens / MMLongBench-Doc | **No** | Not on Drive. D2 must work from owner-approved upstream downloads. |
 | `MANIFEST.json` files | Provenance only | §5a. No usable hashes for the 4B. |
 
@@ -231,7 +273,8 @@ the GPU host, where the 4B is reused or transferred, and each file is hashed on 
 ## 7. Not closed
 
 - **Revision (S1).** The `.workspace-revision` value `851bf6e8…` is not verified against Hugging Face. It is an owner step (read-only HF metadata request).
-- **SHA-256 for any Drive file.** Drive stores MD5 only. A SHA-256 needs the bytes, so it needs owner approval for a transfer.
+- **SHA-256 of any Drive byte.** Drive stores MD5 only, and no Drive SHA-256 has been computed here. The recorded 4B and 0.8B SHA-256 values (§4c, §4d) are staging records, not checks of the Drive bytes. A check needs the bytes, so it needs owner approval for a transfer.
+- **`LLM_Weights` tree.** Reached by ID only. Its root and its other folders (27B, 2B, 9B, DFlash, Eagle3, 3.6-27B) were not listed. The 4B index, `config.json` and revision file were read (round B); both `MANIFEST.json` files were read (§5a).
   The plan is **verify-and-reuse on the GPU host**, with SHA-256 hashing on arrival, checked against the owner-signed manifest.
 - **Base vs instruct.** The config is identical for base and 4B, and the `chat_template.jinja` is the only difference in the file list. Not established.
 - **Safetensors headers and dtype.** Not read (would need a ranged read of the headers). The `total_size` check is consistent but not a header check.

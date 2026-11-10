@@ -18,6 +18,8 @@ folder ID (`docs/harness/DRIVE_INVENTORY.md`); no safetensors body was read.
 | Free space (`/`) | 15,870,783,488 bytes (14.78 GiB) |
 | Free space (`/mnt/hdd`) | 820,179,681,280 bytes (764 GiB) free, but **not writable** for this user (`root:root`, mode 755; `test -w` fails). Space is not the problem there; permission is. |
 | 0.8B reference layout | 13 top-level files plus `.cache/huggingface` (76 KB). See §3. |
+| Local 0.8B bytes vs its manifest (re-checked 2026-11-10, `heavy.lock`) | SHA-256 **13 of 13 match** `starlight_local_manifest.json`. The Drive copy (`LLM_Weights/models/Qwen/Qwen3.5-0.8B`) has the same MD5 on all 13 model files and the same recorded SHA-256 (DRIVE_INVENTORY §4c). |
+| Drive, 4B (round B) | **Two copies with the same bytes**: `weights_system_one/public/qwen3.5-4b` (ID `17y6WMG…`) and `LLM_Weights/models/Qwen/Qwen3.5-4B` (ID `1diS4-5t…`). The second has `starlight_checkpoint_inventory.json` with a recorded revision and per-file SHA-256 (DRIVE_INVENTORY §4d). |
 
 ## 2. Revision pin (UNKNOWN; owner-authorised metadata step)
 
@@ -25,6 +27,9 @@ folder ID (`docs/harness/DRIVE_INVENTORY.md`); no safetensors body was read.
 - Drive's `.workspace-revision` for the candidate folder reads `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a` (round B, by folder ID). It
   matches the name of a `.cache` file in the same folder, so the two Drive files agree. **It is not verified against Hugging Face.**
   The base folder's value is `1001bb4d826a52d1f399e183466143f4da7b741b`.
+  The second 4B copy's staging record (`LLM_Weights/models/Qwen/Qwen3.5-4B/starlight_checkpoint_inventory.json`) records the same
+  revision, `851bf6e8…`. The 0.8B revision `2fc06364715b967f1860aea9cf38778875588b17` is in the local manifest and in the Drive 0.8B
+  record. Both revisions are staging claims. The HF check (S1) is still needed for each.
 - Step: an owner-authorised **read-only** metadata request to the Hugging Face model API for `Qwen/Qwen3.5-4B`,
   recording the commit SHA, the `siblings` list (file names and sizes), and the last-modified date. No file body is fetched in
   that step. The result is written as a dated receipt, not as a pin. The Drive value is compared with that receipt; a mismatch is a finding.
@@ -99,6 +104,10 @@ text config also says 248,320). The chat template must render identically under 
 - `.cache/huggingface` is not part of the benchmark inputs. It is excluded from the manifest on purpose, and must stay out of the hashed set.
 - Hash procedure: SHA-256 each listed file in full, then sign the manifest bytes with the owner key. A hash of a file that was never
   compared with the pinned upstream is not verification.
+- **Recorded 4B SHA-256 values (round B, provenance only).** `LLM_Weights/models/Qwen/Qwen3.5-4B/starlight_checkpoint_inventory.json` lists
+  14 files with `bytes` and `sha256`. Every `bytes` value equals the Drive size. The file says the hashes were computed over staged bytes. The
+  author, time and host are not recorded, and no 4B bytes are on this host, so these values are **not verified here and not owner-signed**. They are
+  the candidate values to compare with on arrival (§9b step 5). They do not replace the signed `weights_manifest_sha256`.
 - **Drive gives MD5 only.** Drive MD5 values are metadata, not SHA-256, and they are not pins. The Drive folder's `MANIFEST.json`
   (folder B) has no hashes for the Qwen entries. The `clef-flash-9b` MANIFEST has SHA-256 values, but it is a different model.
 
@@ -180,7 +189,7 @@ Note: the committed file as written is rejected by the checker (exit 3, "expecte
 
 The local host cannot hold the 4B under the guard, so the plan is to verify and reuse on the GPU host and hash on arrival there.
 
-1. **Path or ID.** Use the folder IDs (B `1B8SUKrVIhbgP0-PEeAh6AI9rK2TtTJ4a`; `public/qwen3.5-4b` `17y6WMGDDcVUqIwZUyvQ5jA3ImUgNZqEi`) with `--drive-root-folder-id`, or the owner renames one duplicate folder. Path-based reads fail as long as the names are duplicated.
+1. **Path or ID.** Use a folder ID with `--drive-root-folder-id`. Two 4B copies hold the same bytes: `LLM_Weights/models/Qwen/Qwen3.5-4B` (ID `1diS4-5tL8zfAkyNpMgOv1aiYxc9Rs25S`, which also has the recorded per-file SHA-256 list), and `weights_system_one/public/qwen3.5-4b` (ID `17y6WMGDDcVUqIwZUyvQ5jA3ImUgNZqEi`, which has `.workspace-revision`). Path-based reads of the duplicated `weights_system_one` still fail. The owner chooses one source, and the choice is recorded.
 2. **Revision (S1).** Make the read-only HF metadata request for `Qwen/Qwen3.5-4B`, and compare it with the Drive value `851bf6e8…`. A mismatch is a finding. It is not overwritten.
 3. **Space (S3).** The GPU host needs about 30.8 GB free (9.34 GB + 20 GiB), or the owner decides the guard. This host cannot check the GPU host, so S3 stays open.
 4. **Reuse or transfer, on the GPU host, after 1–3.** For each of the 15 files, reuse a local file already at the expected size (`QWEN35_4B_DRIVE_EXPECTED_SIZES.json`). Otherwise transfer it into a **new** directory, not over any 0.8B file. The transfer needs explicit owner approval.
@@ -199,4 +208,6 @@ deletes the existing file.
 - No `generation_config.json` for the 4B, and the EOS question is open for both models. (S6.)
 - No vLLM load test for the 4B architecture, and no MTP trace on the 4B. (S8.)
 - The disk guard and the free space conflict on both writable filesystems (§6). `/mnt/hdd` has space but is not writable. (S3, owner decision.)
+- The 4B SHA-256 values in the Drive staging record are not verified (no 4B bytes here), and their author is not recorded. (S4–S5 on arrival.)
+- The 0.8B revision `2fc06364…` is a local and staging claim, not an HF check. (S1 for the 0.8B.)
 - The Drive folder `MANIFEST.json` describes the Qwen entries as "Pinned", but it has no sizes or hashes, and its `decision_model/` source paths do not exist on this host. Its "Pinned" wording is not verified and is not used.
