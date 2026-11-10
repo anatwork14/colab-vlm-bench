@@ -5,10 +5,13 @@ Policy (reported explicitly in telemetry):
   * a keyword whose protected positions exceed MAX_KEYWORD_PROMPT_FRACTION of the prompt is rejected;
   * if the accepted protection still exceeds the budget, the existing INFEASIBLE semantics apply
     (protected entries are retained, the overflow is reported, nothing is silently dropped).
+  * ITER3 R3 (N-R2-2): the protected UNION of accepted keywords is capped at MAX_UNION_PROMPT_FRACTION (0.5),
+    processed in declared order; rejections are listed in rejected_union.
 cpu_pytorch_reference_not_vllm.
 """
 import pytest
 
+from vlmbench.infrastructure import starlight as starlight_mod
 from vlmbench.infrastructure.grounding_evidence import EvidenceItem, EvidencePool
 from vlmbench.infrastructure.real_engine import RealSevenArmEngine
 from vlmbench.infrastructure.starlight import (
@@ -122,27 +125,129 @@ def test_engine_telemetry_reports_the_keyword_policy_and_the_rejected_stopword()
     assert res.telemetry["starlight"]["grounding_protected_by_evidence"] == {}
 
 
-# ITER3 R2 round-2 review (auditor wF:p9), OPEN: the 0.2 cap is per keyword. Six accepted keywords, each at 7/40
-# (0.175, under the cap), protect all 40 prompt positions together and nothing bounds that union or reports it.
-# Strict xfail: a bound on the union is an owner policy decision; when one lands this must be updated.
-@pytest.mark.xfail(strict=True, reason="ITER3 R2 round-2 C-4 OPEN: the breadth cap applies per keyword, not to the union")
-def test_the_union_of_accepted_keywords_is_bounded_by_the_policy():
-    words = ["which", "these", "their", "not", "they", "she"]
-    vocab = {"which": 21, "these": 22, "their": 23, "not": 24, "they": 25, "she": 26}
-    n = 40
-    prompt = [FILLER] * n
-    blocks = [(0, 7), (7, 14), (14, 21), (21, 28), (28, 35), (35, 40)]
-    for (a, b), w in zip(blocks, words):
-        for pos in range(a, b):
-            prompt[pos] = vocab[w]
-    pool = EvidencePool("c4u")
-    pool.add_evidence(EvidenceItem(evidence_id="ev_u", modality="text_span", content=" ".join(words),
-                                   source_sha256=SHA, verified=True), keywords=words)
+# ITER3 R3 (N-R2-2, lead ruling): the protected UNION of accepted keywords is bounded too. The default cap is
+# starlight_mod.MAX_UNION_PROMPT_FRACTION = 0.5 of prompt positions (owner-ratifiable named constant). Keywords are
+# processed in DECLARED order; a keyword whose addition would push the union over the cap is rejected and listed,
+# and later keywords are still considered. Probe: six keywords, each 7/40 (under the per-keyword cap), together 40/40.
+UNION_WORDS = ["which", "these", "their", "not", "they", "she"]
+UNION_VOCAB = {"which": 21, "these": 22, "their": 23, "not": 24, "they": 25, "she": 26}
+UNION_BLOCKS = [(0, 7), (7, 14), (14, 21), (21, 28), (28, 35), (35, 40)]
 
-    class _V:
+
+class _UnionTok:
+    def encode(self, text):
+        return [UNION_VOCAB[w] for w in text.lower().split() if w in UNION_VOCAB]
+
+
+def _probe_prompt():
+    prompt = [FILLER] * 40
+    for (a, b), w in zip(UNION_BLOCKS, UNION_WORDS):
+        for pos in range(a, b):
+            prompt[pos] = UNION_VOCAB[w]
+    return prompt
+
+
+def _declared_pool(words, eid="ev_u"):
+    pool = EvidencePool("c4u")
+    pool.add_evidence(EvidenceItem(evidence_id=eid, modality="text_span", content=" ".join(words),
+                                   source_sha256=SHA, verified=True), keywords=list(words))
+    return pool
+
+
+def _union_protect(words, prompt):
+    return grounding_protection_with_report(_declared_pool(words), prompt, _UnionTok().encode, "c4u", None)
+
+
+def test_the_union_of_accepted_keywords_is_bounded_by_the_policy():
+    # Promoted from the ITER3 R2 strict xfail; the test was not weakened. RE-DERIVED with stated reasons:
+    #  (1) the 0.2 bound was per keyword. Each accepted keyword is still checked against it.
+    #  (2) the union bound is now the policy's MAX_UNION_PROMPT_FRACTION (0.5): six keywords together protect
+    #      40/40 and cannot fit it, so the original 'all six accepted' expectation is replaced by the exact
+    #      outcome in declared order: which (7), these (7) -> 14; their (7) would give 21/40 = 0.525, rejected;
+    #      not (7) and they (7) rejected for the same reason; she (5) gives 19/40 = 0.475, accepted.
+    #      (The probe's last block is 5 positions, not 7, so 'she' fits; the R2 comment said 7/40 for each.)
+    prompt = _probe_prompt()
+    protected, report = _union_protect(UNION_WORDS, prompt)
+    for w in report["accepted_keywords"]:
+        own, _ = _union_protect([w], prompt)
+        assert len(own) / len(prompt) <= MAX_KEYWORD_PROMPT_FRACTION, w
+    assert report["accepted_keywords"] == ["which", "these", "she"]
+    assert len(protected) / len(prompt) <= starlight_mod.MAX_UNION_PROMPT_FRACTION
+    assert [r["keyword"] for r in report["rejected_union"]] == ["their", "not", "they"]
+
+
+def test_the_union_cap_is_the_named_half_of_the_prompt_default():
+    assert starlight_mod.MAX_UNION_PROMPT_FRACTION == 0.5
+
+
+def test_the_six_keyword_probe_reports_union_fraction_and_the_rejections():
+    prompt = _probe_prompt()
+    _protected, report = _union_protect(UNION_WORDS, prompt)
+    assert report["max_union_prompt_fraction"] == 0.5
+    assert report["union_fraction"] == 19 / 40
+    assert report["rejected_union"] == [
+        {"keyword": "their", "union_fraction_if_added": 21 / 40},
+        {"keyword": "not", "union_fraction_if_added": 21 / 40},
+        {"keyword": "they", "union_fraction_if_added": 21 / 40},
+    ]
+
+
+def test_union_is_evaluated_in_declared_order_not_alphabetically():
+    # Declared order decides which keyword fits. Reversed declaration accepts a different pair.
+    prompt = _probe_prompt()
+    _protected, report = _union_protect(list(reversed(UNION_WORDS)), prompt)
+    # Reversed: she (5) -> 5; they (7) -> 12; not (7) -> 19; these (7) would be 26/40 = 0.65, rejected; etc.
+    assert report["accepted_keywords"] == ["she", "they", "not"]
+
+
+def test_a_keyword_that_would_exceed_the_union_cap_does_not_block_later_smaller_keywords():
+    # Each keyword is under the per-keyword cap (8/40 = 0.2). alpha 8 -> 8; beta 8 -> 16 (0.4);
+    # gamma 8 would give 24/40 = 0.6, rejected for union; delta 2 gives 18/40 = 0.45, accepted.
+    words = ["alpha", "beta", "gamma", "delta"]
+    vocab = {"alpha": 41, "beta": 42, "gamma": 43, "delta": 44}
+    prompt = [FILLER] * 40
+    for (a, b), tok in (((0, 8), 41), ((8, 16), 42), ((16, 24), 43), ((24, 26), 44)):
+        for pos in range(a, b):
+            prompt[pos] = tok
+
+    class _T:
         def encode(self, text):
             return [vocab[w] for w in text.lower().split() if w in vocab]
 
-    protected, report = grounding_protection_with_report(pool, prompt, _V().encode, "c4u", None)
-    assert len(report["accepted_keywords"]) == len(words)  # every keyword is under the per-keyword cap
-    assert len(protected) / n <= MAX_KEYWORD_PROMPT_FRACTION, len(protected) / n
+    protected, report = grounding_protection_with_report(_declared_pool(words), prompt, _T().encode, "c4u", None)
+    assert report["accepted_keywords"] == ["alpha", "beta", "delta"]
+    assert [r["keyword"] for r in report["rejected_union"]] == ["gamma"]
+    assert len(protected) / 40 == 18 / 40
+
+
+def test_a_union_exactly_at_the_cap_is_accepted():
+    # Four keywords of 5/40 (0.125, under the per-keyword cap) cover 20/40 = 0.5 exactly: accepted, as at the
+    # per-keyword cap. (A single keyword over 20/40 would be rejected by the per-keyword cap, not the union cap.)
+    words = ["alpha", "beta", "gamma", "delta"]
+    vocab = {"alpha": 41, "beta": 42, "gamma": 43, "delta": 44}
+    prompt = [FILLER] * 40
+    for i, tok in enumerate((41, 42, 43, 44)):
+        for pos in range(5 * i, 5 * i + 5):
+            prompt[pos] = tok
+
+    class _T:
+        def encode(self, text):
+            return [vocab[w] for w in text.lower().split() if w in vocab]
+
+    protected, report = grounding_protection_with_report(_declared_pool(words), prompt, _T().encode, "c4u", None)
+    assert len(protected) / 40 == 0.5
+    assert report["accepted_keywords"] == words and report["rejected_union"] == []
+
+
+def test_engine_telemetry_reports_union_fraction_and_empty_union_rejections_when_under_cap():
+    engine = RealSevenArmEngine(method_arm="starlight_s1", device="cpu", config=_cfg(), stop_at_eos=False,
+                                h2o_min_budget=16, h2o_budget_ratio=0.2, tokenizer=_WordTok())
+    try:
+        res = engine.execute_request(request_id="c4e", prompt_token_ids=PROMPT, image_present=False,
+                                     max_new_tokens=4, evidence_pool=_pool(["car", "cat"], rid="c4e"))
+    finally:
+        engine.close()
+    policy = res.telemetry["starlight"]["grounding_keyword_policy"]
+    assert policy["union_fraction"] == 2 / len(PROMPT)
+    assert policy["rejected_union"] == []
+    assert policy["max_union_prompt_fraction"] == 0.5
