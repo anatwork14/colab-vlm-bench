@@ -12,6 +12,7 @@ cpu_pytorch_reference_not_vllm.
 import pytest
 
 from vlmbench.infrastructure import starlight as starlight_mod
+from vlmbench.infrastructure.evidence_verification import EvidencePolicy
 from vlmbench.infrastructure.grounding_evidence import EvidenceItem, EvidencePool
 from vlmbench.infrastructure.real_engine import RealSevenArmEngine
 from vlmbench.infrastructure.starlight import (
@@ -23,6 +24,12 @@ from vlmbench.infrastructure.starlight import (
 )
 
 from test_starlight_oracle import PROMPT, _cfg, _WordTok
+
+# S1 (evidence policy): these fixtures are text-only with caller verified=True. Since S1 they no longer
+# protect by default (there are no source bytes to check). They exercise the keyword BREADTH and UNION mechanics, so
+# they opt in explicitly with accept_declared=True. The default-off behaviour is pinned in
+# tests/test_i3a_s1_evidence_dimensions.py. Assertions are unchanged.
+ACCEPT_DECLARED = EvidencePolicy(accept_declared=True)
 
 SHA = "d" * 64
 THE, CAR, CAT, MAT, FILLER = 7, 8, 9, 12, 30
@@ -53,7 +60,7 @@ def _prompt(n, placed):
 
 def _protect(pool, prompt_ids):
     tok = _Tok()
-    return grounding_protection_with_report(pool, prompt_ids, tok.encode, "c4", None)
+    return grounding_protection_with_report(pool, prompt_ids, tok.encode, "c4", None, policy=ACCEPT_DECLARED)
 
 
 def test_the_is_in_the_stopword_list_and_the_policy_fraction_is_stated():
@@ -113,7 +120,8 @@ def test_protection_over_budget_stays_infeasible_and_is_not_silently_dropped():
 
 def test_engine_telemetry_reports_the_keyword_policy_and_the_rejected_stopword():
     engine = RealSevenArmEngine(method_arm="starlight_s1", device="cpu", config=_cfg(), stop_at_eos=False,
-                                h2o_min_budget=16, h2o_budget_ratio=0.2, tokenizer=_WordTok())
+                                h2o_min_budget=16, h2o_budget_ratio=0.2, tokenizer=_WordTok(),
+                                evidence_policy=ACCEPT_DECLARED)
     try:
         res = engine.execute_request(request_id="c4", prompt_token_ids=PROMPT, image_present=False,
                                      max_new_tokens=4, evidence_pool=_pool(["the"], rid="c4"))
@@ -155,7 +163,8 @@ def _declared_pool(words, eid="ev_u"):
 
 
 def _union_protect(words, prompt):
-    return grounding_protection_with_report(_declared_pool(words), prompt, _UnionTok().encode, "c4u", None)
+    return grounding_protection_with_report(_declared_pool(words), prompt, _UnionTok().encode, "c4u", None,
+                                            policy=ACCEPT_DECLARED)
 
 
 def test_the_union_of_accepted_keywords_is_bounded_by_the_policy():
@@ -214,7 +223,8 @@ def test_a_keyword_that_would_exceed_the_union_cap_does_not_block_later_smaller_
         def encode(self, text):
             return [vocab[w] for w in text.lower().split() if w in vocab]
 
-    protected, report = grounding_protection_with_report(_declared_pool(words), prompt, _T().encode, "c4u", None)
+    protected, report = grounding_protection_with_report(_declared_pool(words), prompt, _T().encode, "c4u", None,
+                                                         policy=ACCEPT_DECLARED)
     assert report["accepted_keywords"] == ["alpha", "beta", "delta"]
     assert [r["keyword"] for r in report["rejected_union"]] == ["gamma"]
     assert len(protected) / 40 == 18 / 40
@@ -234,14 +244,16 @@ def test_a_union_exactly_at_the_cap_is_accepted():
         def encode(self, text):
             return [vocab[w] for w in text.lower().split() if w in vocab]
 
-    protected, report = grounding_protection_with_report(_declared_pool(words), prompt, _T().encode, "c4u", None)
+    protected, report = grounding_protection_with_report(_declared_pool(words), prompt, _T().encode, "c4u", None,
+                                                         policy=ACCEPT_DECLARED)
     assert len(protected) / 40 == 0.5
     assert report["accepted_keywords"] == words and report["rejected_union"] == []
 
 
 def test_engine_telemetry_reports_union_fraction_and_empty_union_rejections_when_under_cap():
     engine = RealSevenArmEngine(method_arm="starlight_s1", device="cpu", config=_cfg(), stop_at_eos=False,
-                                h2o_min_budget=16, h2o_budget_ratio=0.2, tokenizer=_WordTok())
+                                h2o_min_budget=16, h2o_budget_ratio=0.2, tokenizer=_WordTok(),
+                                evidence_policy=ACCEPT_DECLARED)
     try:
         res = engine.execute_request(request_id="c4e", prompt_token_ids=PROMPT, image_present=False,
                                      max_new_tokens=4, evidence_pool=_pool(["car", "cat"], rid="c4e"))

@@ -61,7 +61,8 @@ def _assess(item, *, request_id="req-1", pool_request_id="req-1", image_sha=None
 
 def _protects(item, *, policy=EvidencePolicy(), image_sha=None, image_present=False, pool_request_id="req-1"):
     a = _assess(item, pool_request_id=pool_request_id, image_sha=image_sha, image_present=image_present)
-    return decide_protection(a, policy, caller_verified=bool(item.verified))
+    d = decide_protection(a, policy, caller_verified=bool(item.verified))
+    return d.protects, d.mode, d.reason
 
 
 def test_dimensions_are_named_and_tri_state_and_semantic_ones_exist():

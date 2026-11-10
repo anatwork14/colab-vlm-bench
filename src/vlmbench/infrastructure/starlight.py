@@ -22,6 +22,12 @@ Every result is labelled cpu_pytorch_reference_not_vllm. Nothing here is GPU or 
 
 from __future__ import annotations
 
+from .evidence_verification import (
+    EvidencePolicy, MODE_NO_PROTECTION_DECLARED, MODE_PROTECTED_BY_POLICY, MODE_PROTECTED_VERIFIED,
+    MODE_REJECTED_BYTES_MISMATCH, MODE_REJECTED_CALLER_FALSE, MODE_REJECTED_NOT_BOUND, MODE_UNCERTAIN,
+    assess_evidence, decide_protection,
+)
+
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
@@ -421,30 +427,69 @@ def match_token_spans(prompt_ids: Sequence[int], needle_ids: Sequence[int]) -> l
     return [i for i in range(len(prompt) - n + 1) if prompt[i:i + n] == needle]
 
 
-def evidence_validity(pool: Any, current_request_id: str, image_sha256: str | None) -> dict[str, tuple[str, str]]:
-    """Per evidence id: (status, reason) with status in {valid, expired, stale, unverified}.
+_MODE_TO_STATUS: dict[str, tuple[str, str]] = {
+    MODE_REJECTED_CALLER_FALSE: ("unverified", "caller_declared_verified_false"),
+    MODE_REJECTED_NOT_BOUND: ("expired", "pool_request_id_mismatch"),
+    MODE_REJECTED_BYTES_MISMATCH: ("stale", "source_sha256_mismatch"),
+    MODE_UNCERTAIN: ("uncertain", "source_bytes_not_hashed"),
+    MODE_PROTECTED_VERIFIED: ("valid", "source_sha256_match"),
+    MODE_NO_PROTECTION_DECLARED: ("declared_unverified", "no_source_bytes_checked"),
+    MODE_PROTECTED_BY_POLICY: ("declared_unverified", "accepted_by_policy_accept_declared"),
+}
 
-    - expired: the pool was built for a different request id (it outlived its request).
-    - stale: the image source hash differs from the source the evidence was declared against.
-    - text-only requests have no image hash to check; they are valid with an explicit
-      `source_unchecked_text_only` reason, so the gap stays visible in telemetry.
+
+def evidence_assessments(
+    pool: Any,
+    current_request_id: str,
+    image_sha256: str | None,
+    *,
+    image_present: bool | None = None,
+    policy: EvidencePolicy | None = None,
+) -> dict[str, dict[str, Any]]:
+    """ITER3 R3 S1: per evidence id, the tri-state dimensions, the method and provenance, and the protection decision.
+
+    `image_present` None means: present iff an image hash was supplied (the old call convention).
+    The status vocabulary: valid (source bytes VERIFIED and bound), declared_unverified (text-only, no source
+    bytes checked: protects only under accept_declared), uncertain, stale, expired, unverified (caller false).
     """
-    verdicts: dict[str, tuple[str, str]] = {}
+    if image_present is None:
+        image_present = image_sha256 is not None
+    policy = policy or EvidencePolicy()
+    out: dict[str, dict[str, Any]] = {}
     if pool is None:
-        return verdicts
+        return out
     for item in pool.items():
-        if not item.verified:
-            # The flag is the caller's declaration; the controller does not verify content (C-3).
-            verdicts[item.evidence_id] = ("unverified", "caller_declared_verified_false")
-        elif pool.request_id != current_request_id:
-            verdicts[item.evidence_id] = ("expired", "pool_request_id_mismatch")
-        elif image_sha256 is None:
-            verdicts[item.evidence_id] = ("valid", "source_unchecked_text_only")
-        elif item.source_sha256.lower() != image_sha256.lower():
-            verdicts[item.evidence_id] = ("stale", "source_sha256_mismatch")
-        else:
-            verdicts[item.evidence_id] = ("valid", "source_sha256_match")
-    return verdicts
+        a = assess_evidence(item, request_id=current_request_id, pool_request_id=pool.request_id,
+                            image_sha256=image_sha256, image_present=bool(image_present))
+        d = decide_protection(a, policy, caller_verified=bool(item.verified))
+        status, status_reason = _MODE_TO_STATUS[d.mode]
+        out[item.evidence_id] = {
+            "dimensions": dict(a.dimensions),
+            "method": a.method,
+            "provenance": dict(a.provenance),
+            "protection_mode": d.mode,
+            "protects": bool(d.protects),
+            "decision_reason": d.reason,
+            "status": status,
+            "status_reason": status_reason,
+        }
+    return out
+
+
+def evidence_validity(
+    pool: Any,
+    current_request_id: str,
+    image_sha256: str | None,
+    *,
+    image_present: bool | None = None,
+    policy: EvidencePolicy | None = None,
+) -> dict[str, tuple[str, str]]:
+    """Per evidence id: (status, reason). Derived from evidence_assessments (single decision path)."""
+    return {
+        eid: (a["status"], a["status_reason"])
+        for eid, a in evidence_assessments(pool, current_request_id, image_sha256,
+                                           image_present=image_present, policy=policy).items()
+    }
 
 
 # ITER3 R2 C-3: provenance labels. The `verified` flag is never checked by this controller, so it is always
@@ -504,8 +549,11 @@ def grounding_protection_from_pool(
     encode: Any,
     current_request_id: str,
     image_sha256: str | None,
+    policy: EvidencePolicy | None = None,
+    *,
+    image_present: bool | None = None,
 ) -> dict[int, tuple[str, ...]]:
-    """Grounding-protected prompt positions: token spans of valid evidence keywords.
+    """Grounding-protected prompt positions: token spans of evidence keywords whose items PROTECT.
 
     Uses the same keyword index ECRD matches on. Each keyword is tokenized in the bare,
     space-prefixed and capitalised forms, and every contiguous occurrence in the prompt is
@@ -515,7 +563,7 @@ def grounding_protection_from_pool(
     missed (documented limitation).
     """
     protected, _report = grounding_protection_with_report(
-        pool, prompt_ids, encode, current_request_id, image_sha256)
+        pool, prompt_ids, encode, current_request_id, image_sha256, policy, image_present=image_present)
     return protected
 
 
@@ -540,12 +588,17 @@ def grounding_protection_with_report(
     encode: Any,
     current_request_id: str,
     image_sha256: str | None,
+    policy: EvidencePolicy | None = None,
+    *,
+    image_present: bool | None = None,
 ) -> tuple[dict[int, tuple[str, ...]], dict[str, Any]]:
     """Grounding-protected positions AND the keyword policy report (accepted and rejected keywords).
 
-    Same matching as grounding_protection_from_pool. Each keyword is checked against the breadth policy
+    Same matching as grounding_protection_from_pool. Only evidence items whose PROTECTION DECISION is positive
+    (evidence_verification.decide_protection) can protect. Each keyword is checked against the breadth policy
     before any of its positions is protected, so a rejected keyword protects nothing.
     """
+    policy = policy or EvidencePolicy()
     report: dict[str, Any] = {
         "max_keyword_prompt_fraction": MAX_KEYWORD_PROMPT_FRACTION,
         "max_union_prompt_fraction": MAX_UNION_PROMPT_FRACTION,
@@ -555,11 +608,20 @@ def grounding_protection_with_report(
         "rejected_breadth": [],
         "rejected_union": [],
         "union_fraction": 0.0,
+        "evidence_policy": policy.as_dict(),
+        "assessments": {},
+        "omitted_items": [],
     }
     if pool is None:
         return {}, report
-    verdicts = evidence_validity(pool, current_request_id, image_sha256)
-    valid_ids = {eid for eid, (status, _) in verdicts.items() if status == "valid"}
+    assessments = evidence_assessments(pool, current_request_id, image_sha256,
+                                       image_present=image_present, policy=policy)
+    report["assessments"] = assessments
+    report["omitted_items"] = [
+        {"evidence_id": eid, "reason": a["protection_mode"]}
+        for eid, a in assessments.items() if not a["protects"]
+    ]
+    valid_ids = {eid for eid, a in assessments.items() if a["protects"]}
     n_prompt = len(prompt_ids)
     protected: dict[int, set[str]] = {}
     # Declared order (the pool's insertion order), not alphabetical: the union cap is order-dependent by design.

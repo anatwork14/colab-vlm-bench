@@ -54,9 +54,10 @@ from .grounding_evidence import ECRDConfig, EvidencePool, EvidenceItem, ECRDLogi
 from .starlight import (
     STATUS_INFEASIBLE, StarlightLayerPlan, combine_summaries, compact_orig_positions,
     VISUAL_EVIDENCE_NOTE, da_protection_from_spans, evidence_provenance, evidence_validity,
-    grounding_protection_with_report, visual_evidence_protection_status,
+    evidence_assessments, grounding_protection_with_report, visual_evidence_protection_status,
     plan_starlight_layer, summarize_plans,
 )
+from .evidence_verification import EvidencePolicy
 from .adapters import HardwareGateError, check_vllm_hardware_compatibility
 
 
@@ -1031,6 +1032,9 @@ EVIDENCE_REASON_CODES: dict[str, str] = {
     "expired": "EXPIRED_EVIDENCE",
     "stale": "STALE_DECLARATION",
     "unverified": "UNVERIFIED_EVIDENCE",
+    # ITER3 R3 S1: text-only evidence is declared, not checked; uncertain means the image could not be hashed.
+    "declared_unverified": "DECLARED_UNVERIFIED_EVIDENCE",
+    "uncertain": "UNCERTAIN_EVIDENCE_SOURCE",
 }
 GDN_EXEMPT_LABEL = "GDN_EXEMPT_NOT_TOKEN_ADDRESSABLE"
 # Lead decision Q2: vision_start/vision_end are protected as an explicit structural source.
@@ -1189,6 +1193,7 @@ class RealSevenArmEngine:
         checkpoint_dir: str | Path | None = None,
         starlight_record_decisions: bool = False,
         dtype_override: str | None = None,
+        evidence_policy: EvidencePolicy | None = None,
     ):
         if method_arm not in self.SUPPORTED_ARMS:
             raise ValueError(f"Unknown method arm: {method_arm}")
@@ -1249,6 +1254,8 @@ class RealSevenArmEngine:
         self.starlight_signals: tuple[str, ...] | None = STARLIGHT_ARM_SIGNALS.get(method_arm)
         # Opt-in per-entry decision records (auditor oracle I-10). Off by default: records are large.
         self.starlight_record_decisions = bool(starlight_record_decisions)
+        # ITER3 R3 S1: explicit evidence policy. Default accept_declared=False (declared text-only evidence does not protect).
+        self.evidence_policy = evidence_policy or EvidencePolicy()
         self.da_fsm = DAFSM() if method_arm in DA_MASKING_ARMS else None
         self.da_mask_gen = DAMaskGenerator() if method_arm in DA_MASKING_ARMS else None
         self.ecrd_processors: dict[str, ECRDLogitsProcessor] = {}
@@ -2387,6 +2394,7 @@ class RealSevenArmEngine:
         starlight_verdicts: dict[str, list[str]] = {}
         starlight_provenance: dict[str, dict[str, str]] = {}
         starlight_keyword_report: dict[str, Any] = {}
+        starlight_assessments: dict[str, dict[str, Any]] = {}
         starlight_summaries: list[dict[str, Any]] = []
         starlight_max_retained = 0
         starlight_text_fraction: float | None = None
@@ -2432,9 +2440,13 @@ class RealSevenArmEngine:
                 if evidence_pool is None:
                     starlight_grounding_status = "NO_EVIDENCE_DECLARED"
                 else:
+                    starlight_assessments = evidence_assessments(
+                        evidence_pool, request_id, image_sha, image_present=bool(image_present),
+                        policy=self.evidence_policy,
+                    )
                     starlight_verdicts = {
-                        eid: [status, reason, EVIDENCE_REASON_CODES[status]] for eid, (status, reason) in
-                        evidence_validity(evidence_pool, request_id, image_sha).items()
+                        eid: [a["status"], a["status_reason"], EVIDENCE_REASON_CODES[a["status"]]]
+                        for eid, a in starlight_assessments.items()
                     }
                     starlight_provenance = evidence_provenance(evidence_pool, image_sha)
                     if self.tokenizer is None:
@@ -2444,6 +2456,7 @@ class RealSevenArmEngine:
                     else:
                         starlight_grounding, starlight_keyword_report = grounding_protection_with_report(
                             evidence_pool, full_prompt, self.tokenizer.encode, request_id, image_sha,
+                            self.evidence_policy, image_present=bool(image_present),
                         )
                         starlight_grounding_status = "ACTIVE"
         tokens_generated: list[int] = []
@@ -2987,6 +3000,9 @@ class RealSevenArmEngine:
                 "grounding_evidence_verdicts": starlight_verdicts,
                 # ITER3 R2 C-3: `verified` is a caller declaration; source hash is checked only vs image bytes.
                 "grounding_evidence_provenance": starlight_provenance,
+                # ITER3 R3 S1: tri-state dimensions, method and protection decision per evidence item.
+                "grounding_evidence_assessments": starlight_assessments,
+                "evidence_policy": self.evidence_policy.as_dict(),
                 # ITER3 R2 C-5: image evidence protects no visual tokens. Stated, never silent.
                 # ITER3 R2 C-4: keyword breadth policy and what it rejected (never silent).
                 "grounding_keyword_policy": starlight_keyword_report,
