@@ -71,6 +71,15 @@ and the text-side budget shrinks by the same amount.
   protection therefore survives eviction and reindexing.
 - This is the scripted diagnostic. The model does not declare these scopes. The label
   `SCRIPTED_DIAGNOSTIC_NOT_MODEL_DECLARED` is in telemetry.
+- **Coverage on image prompts (wF:p9 F-1; ITER3 closure, scope unchanged).** The scripted FOCUS span
+  `focus:scripted_visual_segment` covers the WHOLE visual segment (`focus_end = sink_end + n_visual`,
+  `real_engine.py`, the prefill DA block). On an image prompt the DA protection is therefore every visual token, not
+  only the evidence region. Protection at prefill is at least `n_visual`, so whenever the visual token count reaches the
+  budget, every step is INFEASIBLE and nothing is evicted. The review's fixture run (640x480, 300 visual tokens) measured
+  321 of 322 entries protected with no evidence declared, against a budget of 192. Image `starlight_s1` is therefore a
+  FULL-CACHE run, not a sparse one, and it is not comparable to a matched-budget run. The run is labelled
+  `comparison_validity = STARLIGHT_FULL_CACHE_INFEASIBLE_NOT_COMPARABLE` (§19). Narrowing the FOCUS scope is an owner
+  research decision and is not made here.
 - Starlight arms do NOT build a DA attention mask. `DA_MASKING_ARMS` is exact membership, so
   `starlight_s1_no_da` does not enable masking through a substring match.
 
@@ -231,6 +240,11 @@ an H2O variant label is never attached to a STARLIGHT run.
   are INFEASIBLE by design and are reported (`infeasible_steps`), not hidden.
 - Protection costs budget, so STARLIGHT evicts more text tokens than H2O at the same ratio. This
   is a retention cost, not a quality result. Quality is not measured here.
+- Image prompts under `starlight_s1` are full-cache runs when the visual segment reaches the budget (§4.1, F-1). Their
+  retention numbers say nothing about sparsity. Read `telemetry["comparison_validity"]` before comparing any image
+  STARLIGHT run to a matched-budget run.
+- `comparison_validity` is set on the non-speculative execution path only. The two speculative text routes return
+  before that block and do not carry the field (open item, §19).
 - No claim is made about answer quality, latency, or memory savings.
 
 ## 11. Open questions for the owner
@@ -453,3 +467,48 @@ for boxes, and `accept_declared` for text-only evidence on the speculative path.
 - **Open items.** Owner ratification of the §4.4 gate and the `accept_declared` default. Image prompts on the speculative
   path (UNSUPPORTED by design, not implemented). Multi-image requests (the engine takes one image per request, and the
   mapping refuses multi-image). Native vLLM MTP (BLOCKED). The `adapters.py` placeholder from Round A (open).
+
+## 19. ITER3 closure repair (wF:p7, responding to the wF:p9 Round-B review)
+
+Source: `docs/harness/ITER3_ROUNDB_REVIEW.md`. Each item is test-first (a red commit, then a fix commit). Heavy checks run
+under `wt/heavy.lock`. `cpu_pytorch_reference_not_vllm`. No speed or quality claim.
+
+- **F-1 (HIGH; owner decision; scope NOT changed).** The DA FOCUS scope on image prompts covers the whole visual segment
+  (§4.1). The engine now surfaces `telemetry["comparison_validity"]` on the non-speculative path, computed by
+  `starlight.comparison_validity`. Status `STARLIGHT_FULL_CACHE_INFEASIBLE_NOT_COMPARABLE` when `evicted_total == 0` and
+  `protected_at_prefill >= budget_total`. `protected_at_prefill` counts the distinct prompt positions protected at prefill:
+  DA GLOBAL and FOCUS spans, grounding keys, and structural positions. Other statuses: `FIXED_BUDGET_RUN_MET` (comparable),
+  `NOT_A_SUCCESSFUL_FIXED_BUDGET_RUN`, and `NOT_APPLICABLE_NO_STARLIGHT_CONTROLLER`. Tests: `tests/test_i3c_p7_repair.py`
+  (light, parametrised) and `tests/test_i3c_p7_repair_heavy.py::test_f1_full_cache_infeasible_image_run_is_labelled_not_comparable`
+  (heavy). The review's strict xfail `test_starlight_s1_on_an_image_prompt_evicts_when_the_budget_is_feasible` stays strict:
+  it marks the owner decision that is still open.
+- **F-6 (independent retention checks).** `visual_protected_retained_final_by_layer` and
+  `grounding_protected_retained_final_by_layer` are checked against the planner's own returned slot map: the
+  `_starlight_build_step_plans` output for the visual channel, and the policy `next_orig` for the speculative grounding
+  channel. Neither check reads the telemetry expression. Each asserts an eviction precondition, so "retained" cannot be
+  vacuous. `test_i3b_s2_visual_engine.py::test_protected_visual_positions_are_retained_in_every_full_attention_layer_at_the_end`
+  now runs on `starlight_s1_no_da`, because `starlight_s1` never evicts on images (F-1).
+  - **Red evidence (mutant, scratch copy only).** Two mutants were built from the pristine tree. Visual: the visual merge is
+    removed from planner protection and the telemetry is replaced by the protected count. The independent check fails
+    (telemetry 80 against independent 64 on a layer). Speculative: the policy planner ignores grounding protection and the
+    telemetry is replaced by the protected count. The independent check fails (telemetry 1 against independent 0).
+    Pristine code passes both. The telemetry-only retention assertion still passes on the visual mutant, which is why the
+    independent check was added.
+- **F-7 (sub-tolerance box).** `visual_mapping._cell_interval`: an endpoint within `_EPS` of a cell boundary snaps to it,
+  unless the snap would collapse a positive-width interval. In that case the raw interval is kept, so the positive-overlap
+  superset holds. Before the fix, a 1e-10 px box straddling a boundary gave `r0 > r1` and mapped to no cell. Test:
+  `test_sub_tolerance_box_straddling_a_cell_boundary_keeps_its_positive_overlap` (strict xfail removed; body unchanged).
+- **F-8 (speculation ablation).** `_mtp_text_speculation_route` requires `_speculation_enabled`, as the policy route does.
+  Test: `test_speculation_ablation_is_honoured_on_the_serving_mtp_arm` (strict xfail removed; body unchanged).
+- **F-9 (partial cells).** Each visual evidence item reports `cells = {"full": n, "partial": m}` when it protects, and
+  `None` when refused. The counts reach telemetry through `visual_evidence_items`. Tests: `test_f9_*` in
+  `tests/test_i3c_p7_repair.py`. The docstring claim in `visual_mapping.py` is now true.
+- **F-10 (route label).** The serving mtp text path carries `speculative_route` (`MTP_VERIFIER_TEXT`). Test:
+  `test_f10_the_serving_mtp_text_path_carries_the_speculative_route_label` (heavy).
+- **F-11 (labels).** A control arm with no signal is `NOT_APPLICABLE_CONTROL_ARM_NO_GROUNDING_SIGNAL` (grounding and visual)
+  or `NOT_APPLICABLE_CONTROL_ARM_NO_DA_SIGNAL` (DA). An ablation with signals that drops one is `DISABLED_BY_ABLATION`.
+  `DISABLED_ABLATION` is removed. Tests: `test_f11_*` in `tests/test_i3c_p7_repair.py`.
+
+**Open after this repair.** (1) F-1 owner decision on the FOCUS scope. (2) `comparison_validity` is not carried by the two
+speculative text routes (they return before the non-speculative telemetry block). (3) F-12 (INFO, equivalent mutant) is not
+changed.
