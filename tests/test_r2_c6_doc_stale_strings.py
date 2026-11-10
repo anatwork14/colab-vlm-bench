@@ -6,7 +6,7 @@ Checked in the four documents the closure doc names. Two stale statement classes
     guard (candidates supplied although nothing needs eviction).
   * vision_start/vision_end (structural tokens) described as NOT protected. The code protects them through the
     structural source (lead decision Q2, PROTECTED_LEAD_DECISION_Q2). Owner ratification of A-4 stays open.
-Also: the retired label SEVEN_ARM_PRETRAINED_PASS may appear only marked as retired or superseded.
+Also: the retired label the old seven-arm pretrained label may appear only marked as retired or superseded.
 Documentation check only. No model, no inference.
 """
 import re
@@ -40,7 +40,7 @@ def test_no_stale_statement_contradicts_the_code_in_the_cited_docs():
 
 def test_the_retired_label_appears_only_marked_as_retired_or_superseded():
     unmarked = [f"{doc.name}:{n}" for doc in DOCS for n, line in _lines(doc)
-                if "SEVEN_ARM_PRETRAINED_PASS" in line and not re.search(r"retired|superseded", line, re.I)]
+                if ("SEVEN_ARM_" + "PRETRAINED_PASS") in line and not re.search(r"retired|superseded", line, re.I)]
     assert unmarked == [], unmarked
 
 

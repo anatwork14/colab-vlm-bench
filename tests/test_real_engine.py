@@ -441,6 +441,7 @@ def test_p7_partial_loader_does_not_count_truncated_oversized_tensor(tmp_path):
 def test_p7_da_mask_geometry_stable_across_decode_steps():
     """Regression: DA sink/focus boundaries were recomputed from the growing KV length,
     so the same prompt keys changed class between decode steps (sink 9 -> 16 for a 36-token prompt)."""
+    torch.manual_seed(1234)  # random-init model: unseeded, an early EOS made the step count order-dependent
     engine = RealSevenArmEngine(method_arm="da_base", config=_p7_small_cfg(), device="cpu")
     recorded = []
     real_gen = engine.da_mask_gen.generate_attention_mask

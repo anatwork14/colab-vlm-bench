@@ -278,19 +278,19 @@ def test_ecrd_evidence_provenance_and_validation():
     # 1. Unverified evidence item rejected
     with pytest.raises(ValueError, match="verified=False"):
         pool.add_evidence(
-            EvidenceItem("ev_unverified", "text", "bad", "a" * 64, verified=False)
+            EvidenceItem("ev_unverified", "text_span", "bad", "a" * 64, verified=False)
         )
 
     # 2. Invalid SHA256 rejected
     with pytest.raises(ValueError, match="invalid SHA256"):
         pool.add_evidence(
-            EvidenceItem("ev_bad_sha", "text", "bad", "not_a_valid_sha256", verified=True)
+            EvidenceItem("ev_bad_sha", "text_span", "bad", "not_a_valid_sha256", verified=True)
         )
 
     # 3. gold_answer_prohibited=False rejected
     with pytest.raises(ValueError, match="gold_answer_prohibited=False"):
         pool.add_evidence(
-            EvidenceItem("ev_leak", "text", "leak", "b" * 64, gold_answer_prohibited=False)
+            EvidenceItem("ev_leak", "text_span", "leak", "b" * 64, gold_answer_prohibited=False)
         )
 
 
@@ -594,7 +594,7 @@ def test_p7_h2o_unsaturated_protected_keeps_total_budget():
 
 def _p7_pool(keyword):
     pool = EvidencePool("p7_ecrd")
-    pool.add_evidence(EvidenceItem("ev_kw", "text", "fact", "4" * 64), keywords=[keyword])
+    pool.add_evidence(EvidenceItem("ev_kw", "text_span", "fact", "4" * 64), keywords=[keyword])
     return pool
 
 
