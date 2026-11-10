@@ -120,14 +120,17 @@ def test_f6_visual_retention_matches_the_planner_slot_map_independently(no_da_en
 def test_f6_speculative_grounding_retention_matches_the_policy_slot_map_independently():
     from vlmbench.infrastructure.starlight import grounding_protection_with_report
     e = RealSevenArmEngine(method_arm="starlight_s1_mtp", device="cpu", checkpoint_dir=CKPT, stop_at_eos=False,
-                           h2o_min_budget=40, h2o_budget_ratio=0.5,
+                           h2o_min_budget=16, h2o_budget_ratio=0.5,
                            evidence_policy=EvidencePolicy(accept_declared=True))
     try:
         ids = list(e.tokenizer.encode(TEXT))
         pool = EvidencePool("f6_spec")
-        pool.add_evidence(EvidenceItem(evidence_id="ev_paris", modality="text_span", content="Paris",
+        # 'Berlin' at budget 16: the reviewer's negative control (test_r4b_review_wF_p9.py) shows this keyword IS
+        # evicted without protection, so a retention check on it can fail. A keyword that is never evicted cannot.
+        pool.add_evidence(EvidenceItem(evidence_id="ev_berlin", modality="text_span",
+                                       content="Berlin is the capital of Germany",
                                        source_sha256=hashlib.sha256(TEXT.encode()).hexdigest(), verified=True),
-                          keywords=["Paris"])
+                          keywords=["Berlin"])
         # The expected protected set is recomputed from the keyword policy, not read from the telemetry.
         protected, _ = grounding_protection_with_report(pool, ids, e.tokenizer.encode, "f6_spec", None,
                                                         e.evidence_policy, image_present=False,
@@ -151,5 +154,8 @@ def test_f6_speculative_grounding_retention_matches_the_policy_slot_map_independ
     assert spec["grounding_protected_positions"] == len(protected) > 0
     assert captured, "the policy driver must have applied at least one step"
     final = captured[-1]
+    # Precondition: some prompt position really was evicted, otherwise "retained" says nothing about protection.
+    evicted_prompt_positions = {l: set(range(len(ids))) - set(final[l]) for l in final}
+    assert any(evicted_prompt_positions.values()), "no prompt position was evicted: the check would be vacuous"
     independent = {str(l): len(set(protected) & set(final[l])) for l in final}
     assert spec["grounding_protected_retained_final_by_layer"] == independent
