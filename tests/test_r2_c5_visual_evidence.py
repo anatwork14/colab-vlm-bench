@@ -50,3 +50,22 @@ def test_engine_telemetry_reports_visual_evidence_not_implemented_and_does_not_c
     block = res.telemetry["starlight"]
     assert block["visual_evidence_protection"] == "NOT_IMPLEMENTED"
     assert "visual" in block["visual_evidence_protection_note"].lower()
+
+
+# ITER3 R2 round-2 review (auditor wF:p9): the status keys on modality == "image_region". Before this fix any
+# other string (e.g. "image") was accepted by add_evidence and the status then read NO_IMAGE_EVIDENCE_DECLARED
+# while image evidence was declared. Unknown modalities are now refused at the pool.
+
+def test_an_unknown_modality_is_refused_so_image_evidence_cannot_hide_behind_a_label():
+    try:
+        _pool("image")
+    except ValueError as exc:
+        assert "modality" in str(exc)
+        return
+    raise AssertionError("an unknown modality must be refused, not accepted as text-only evidence")
+
+
+def test_the_known_modalities_are_still_accepted():
+    for modality in ("image_region", "text_span", "table_cell"):
+        pool = _pool(modality, bbox=(0.1, 0.1, 0.5, 0.5) if modality == "image_region" else None)
+        assert len(pool.items()) == 1

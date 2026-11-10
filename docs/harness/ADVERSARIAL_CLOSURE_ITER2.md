@@ -16,6 +16,108 @@
 
 ---
 
+## 0. Round 2 status (branch `iter3r2/p9`, base `iter2/lead` 8a6390d)
+
+Independent re-review of the round-2 fixes. Commits this round: `4f52fc1` (red and coverage tests), `b39e081` (C-5 fix), `751d808` (C-4 strict xfail), plus the commit that adds this section. Auditor: wF:p9. Heavy jobs were run under `flock wt/heavy.lock`, one at a time. Mutations ran on a scratch copy of `8a6390d` (`git archive`), one exact-string change at a time, outside the repo.
+
+### 0.1 Status per C-id
+
+| C-id | Round 1 | Round 2 status | Evidence (tests pass at HEAD unless noted) | Residual |
+|---|---|---|---|---|
+| C-1 R1 weightless pin | OPEN | **CLOSED** | `177b308`; `test_harness_r2_regressions.py::test_R1_*` (4 tests) | none |
+| C-1 R2 operator weight pins | OPEN | **CLOSED** | pins read only from the signed record; `test_R2_a_weight_manifest_pin_that_is_not_the_signed_one_is_not_a_pin`, `test_R2_the_operator_pin_flag_is_gone_from_the_cli` | signer anchor, see N-R2-1 |
+| C-1 R3 unsigned receipt index | OPEN | **CLOSED** | `test_harness_pins.py::test_a_receipt_index_whose_hash_is_not_the_signed_pin_counts_nothing` | none |
+| C-2 in-process vLLM stub | OPEN | **CLOSED** | `verify_vllm` runs `python -I` and needs signed version and RECORD pins; `test_harness_r2_regressions.py::test_C2_verify_vllm_runs_isolated_and_refuses_a_pythonpath_stub` | none |
+| C-3 caller-asserted `verified` / source hash | OPEN | **CLOSED as labelling** (the finding allowed "do not call it verified") | `evidence_provenance` reports `verified_flag: CALLER_DECLARED_NOT_VERIFIED`; `test_r2_c3_provenance.py` | protection still honours the caller's `verified` (unchanged). `CHECKED_IMAGE_BYTES_MATCH` only means the declared hash equals the request's image hash; evidence content is not checked (LOW) |
+| C-4 keyword breadth | OPEN | **OPEN (partial)** | per-keyword cap and stopword list in `3251469`; `test_r2_c4_keyword_breadth.py` passes; strict xfail `test_the_union_of_accepted_keywords_is_bounded_by_the_policy` | the cap is per keyword only; the protected union is unbounded and unreported (section 0.4) |
+| C-5 image evidence protects no visual tokens | OPEN | **CLOSED** for the label and the modality bypass; protection itself is still text-only | `6084e25` (NOT_IMPLEMENTED label); `b39e081` refuses unknown modalities; `test_r2_c5_visual_evidence.py` (7 tests) | visual evidence still protects no visual tokens (by design, labelled) |
+| C-6 stale doc statements | OPEN | **CLOSED** | `bc2b331`; `test_r2_c6_doc_stale_strings.py::test_no_stale_statement_contradicts_the_code_in_the_cited_docs` passes | historical review files still quote the retired label (not a claim) |
+| C-7 receipt not in git | LOW | **CLOSED as disclosure** | `c43d526` states the receipt is local; `GPU_RECEIPT_INDEX.json` has 0 entries | the receipt is not versioned |
+| C-8 bare-except deviation undocumented | LOW | **CLOSED** | `1c8a1a5` header states the change (read; not executed) | none |
+| C-9 `compare_receipts` order | LOW | **CLOSED** | `3c41e8d`; `test_gpu_smoke_helpers.py::test_C9_two_cuda_receipts_are_refused` and the CPU-first refusal test pass | none |
+| C-10 memory-block scope | LOW | **CLOSED** | `b7cf237`: block scope is `MIXED_PER_FIELD_SEE_memory_field_scopes`; `test_matched_retention.py::test_memory_block_states_no_single_scope_because_it_mixes_per_step_and_final_state` passes | none |
+| C-11 engine label derivation | LOW | **not re-checked** in round 2 | | covered only by the label-consistency test |
+
+### 0.2 F-1 (shared retained set) review
+
+**Judgement on p7's concern.** The round-1 M4 cross-layer scenario (a veto on layer 3 only) can no longer occur under the shared set. Candidates are layer-independent and `_starlight_build_step_plans` refuses unequal lengths or differing protected slots. What has to be covered now is that the veto applies to a *shared candidate* on every full-attention layer. The round-2 F-1 scenario did not cover that: it protects position 5, whose mean score is high, so position 5 is never a candidate. Dropping the DA veto leaves that scenario green (mutation F1b below). Coverage is now provided by three new tests in `tests/test_r2_shared_candidates.py` and by the checkpoint M4 test, which fails under F1b.
+
+**Mutation results** (exact strings, scratch copy, one at a time):
+
+| ID | Mutation | Round-2 result (before my tests) | After my tests |
+|---|---|---|---|
+| F1a | candidates computed per layer | 28 failed, 67 passed (7 starlight files); F-1 scenario fails | 2 failed (`test_F1_shared_candidates_keep_every_full_layer_…`, `test_F1_shared_candidates_use_the_mean_over_full_layers_…`) |
+| F1b | DA veto dropped on all layers | 7 failed (7 starlight files). **F-1 scenario passes** | `test_F1_veto_applies_to_a_shared_candidate_on_every_full_layer` fails (1 failed). Checkpoint `test_iter3_b2_mutation.py::test_M4…` fails under flock (1 failed, 88 s) |
+| F1c | structural veto dropped | 3 failed (`test_HC13_…`, `test_vision_…` tests) | unchanged |
+| F1d | off-by-one in the heavy-hitter rule | 6 failed | 2 failed (incl. `test_F1_shared_mask_with_one_layer_equals_…`) |
+| F1e | aggregate taken from layer 3 only | **SURVIVED** (95 passed) | `test_F1_shared_candidates_use_the_mean_over_full_layers_not_one_layer` fails (1 failed) |
+| F1f | unequal-length guard removed | 1 failed (`test_F1_unequal_full_layer_lengths_…`) | unchanged |
+| F1g | protected-union guard removed | **SURVIVED** (95 passed) | `test_F1_protected_slots_that_differ_across_layers_raise_…` fails (1 failed) |
+
+The checkpoint M4 mutant (F1b) fails at its baseline assertion, `baseline must pass first`: position 23 is evicted even without the mutation, because the mutation also applies to the baseline run. That is a valid detection, but the failure message is about the baseline, not the veto itself.
+
+**Protected never evicted, evicted ⊆ candidates, positions valid.** Covered by `test_starlight_oracle.py` (I1/I2 recompute eligibility from the records, HC13, HC8), `test_iter3_b1_policy_invariants.py::test_pinv_very_small_kv_budgets_never_evict_protected_entries`, and the new tests (`evicted ⊆ range(length)`, protected retained).
+
+### 0.3 Forgery attempts on READY (round 2)
+
+| ID | Forgery | Result | Severity |
+|---|---|---|---|
+| E1 | Attacker generates an ed25519 key, writes their own `--allowed-signers`, signs a record with their own pins (A100 name and uuid), passes that record as `--owner-record`. | `verify_owner_authorization` → **verified True**. `build_report` with a real, unmocked live probe on this host → **READY 0 pilot, 0 full**; reasons: vLLM not installed, GPU name differs from the signed pin, GPU uuid differs, weights not pinned. | MEDIUM (N-R2-1). Authorization can be forged by whoever chooses the signer file. READY still needs the live probe on the signed hardware. |
+| E2 | Image evidence declared with `modality="image"`. | Status read `NO_IMAGE_EVIDENCE_DECLARED` while image evidence was declared. | LOW, **fixed** by `b39e081`. |
+| E3 | `nvidia-smi` shim first on PATH. | `probe_gpu()` returns `compute_cap 8.0, memory 40960` from the shim. `probe_gpu` (parent) runs `nvidia-smi` from PATH, while the live probe uses `/usr/bin/nvidia-smi`. The capability and memory gates therefore trust PATH. READY still requires the child's name and uuid to match the signed pin. | LOW (G-PATH), OPEN |
+| E4 | Zero-byte and config-only manifest pins, operator pin flag, unsigned receipt index. | Refused by the existing `test_R1_*`, `test_R2_*`, `test_a_receipt_index_…` tests (all pass). | none |
+
+READY stays unreachable on this host from any forgery tried. Reaching READY needs control of the signer file and the signed hardware, which the threat model already assumes an external anchor for.
+
+### 0.4 C-4 keyword breadth: can it be bypassed, and is it silent?
+
+Probe on the scratch copy (`c4_probe.py`, corrected):
+- The 0.2 cap is applied per keyword. Six accepted keywords, each at 7/40 (0.175), together protect **40/40** prompt positions. The strict xfail records this.
+- Common non-stopwords (`which`, `these`, `their`, `not`, `they`, `she`) are not in the 24-word list. `which` at 6/30 is accepted (at the cap); at 7/30 it is rejected.
+- Stopword matching is exact on the lower-cased keyword. This is case-insensitive, so no case bypass was found.
+- Not silent per keyword: `grounding_keyword_policy` lists accepted and rejected keywords with fractions. The union fraction is not reported. A bounded union would show up only as INFEASIBLE when protected entries exceed the budget, and then nothing is evicted. The earlier figure 33/40 in round 1 was a probe error (a wrong vocabulary id), withdrawn.
+
+Verdict: the cap bounds each keyword but not what the keywords protect together. Owner policy decision (N-R2-2).
+
+### 0.5 New findings from round 2
+
+| ID | Severity | Owner | Status | Finding |
+|---|---|---|---|---|
+| N-R2-1 | MEDIUM | wF:p8 / lead | OPEN | The owner-authorization anchor is an operator-chosen `--allowed-signers` file. Nothing in the repo or the record pins the owner key fingerprint, so a local operator can forge authorization (E1). READY still fails on this host. Fix: pin the owner key fingerprint (or a hash of the signer file) in a location the operator cannot edit alongside the record. |
+| N-R2-2 | MEDIUM | wF:p7 | OPEN (strict xfail added) | Keyword breadth: the cap is per keyword and the protected union is unbounded and unreported (0.4). |
+| G-PATH | LOW | wF:p8 | OPEN | `probe_gpu` takes `nvidia-smi` from PATH, so the capability and memory gates can be shimmed (E3). Fix: fixed binary path, or read capability and memory in the child. |
+| F1-COV | LOW | wF:p9 | **CLOSED** (`4f52fc1`) | The F-1 scenario did not exercise the veto (F1b survived it). Three new tests now cover the veto, the mean aggregation and the union guard. |
+| C5-MOD | LOW | wF:p7 | **CLOSED** (`b39e081`) | Unknown modality labels were accepted and hid image evidence from the status. |
+| C3-FLAG | LOW | wF:p7 | accepted | `verified` is still caller-asserted for protection; it is now labelled as such. |
+
+### 0.6 Owner decisions still open
+
+- N-R2-1: the owner key anchor (what file or fingerprint the operator cannot choose).
+- N-R2-2: a bound on the protected union of keywords, and reporting it.
+- A-2, A-4, A-5 (unchanged from round 1).
+- C-3: whether the `CALLER_DECLARED` labels are enough, or `verified` should be removed from protection.
+- C-11: not re-checked.
+
+### 0.7 Commands and counts (round 2)
+
+All under `PYTHONPATH=src CUDA_VISIBLE_DEVICES= .venv/bin/python -m pytest -q -p no:cacheprovider` unless noted.
+
+| Set | Result |
+|---|---|
+| harness: `test_harness_forgery`, `_cli`, `_live_probe`, `_inventory`, `_pins`, `_r2_regressions`, `test_inventory_freshness` (before any change) | 103 passed (15.1 s) |
+| R2 + STARLIGHT + smoke: `test_r2_*`, `test_starlight_*`, `test_matched_retention`, `test_gpu_smoke_helpers`, `test_gpu_smoke_outer_deadline` (before any change) | 152 passed (16.7 s) |
+| `test_r2_shared_candidates.py` after adding three tests | 7 passed |
+| `test_r2_c5_visual_evidence.py` after the red test, before the fix | 1 failed (red as intended), 6 passed |
+| evidence-related set after the C-5 fix (10 files) | 114 passed |
+| `test_r2_c4_keyword_breadth.py` after the xfail | 8 passed, 1 xfailed (`--runxfail` fails on the union assertion) |
+| combined targeted set (24 files, after both fixes) | **277 passed, 1 xfailed** (41.0 s) |
+| checkpoint `test_iter3_b2_mutation.py::test_M4…` + `test_iter3_b2_mtp_rollback.py::test_F1_…` at HEAD, under flock | 2 passed (41.0 s) |
+| same M4 on the F1b mutant, scratch, under flock | 1 failed (88 s), baseline assertion (section 0.2) |
+
+Not run: the full suite (lead only); the Stage 2 serving and policy pair (timed out in round 1, not rerun); the checkpoint B1 and B2 suites beyond the two above; any slow CPU fp32 reference.
+
+---
+
 ## 1. Closure matrix
 
 | ID | Severity (original) | Original finding (source) | Fix commit(s) | Current code evidence | Targeted test or mutation | Status | Residual / reproducing command |
