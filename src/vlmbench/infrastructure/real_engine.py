@@ -54,10 +54,11 @@ from .grounding_evidence import ECRDConfig, EvidencePool, EvidenceItem, ECRDLogi
 from .starlight import (
     DEFAULT_GROUNDING_CAP_POLICY, FIXED_BUDGET_NOT_APPLICABLE, GroundingCapPolicy,
     RETENTION_AT_INFEASIBLE_STEPS, RETENTION_BUDGET_BOUNDED, STATUS_INFEASIBLE, StarlightLayerPlan, combine_summaries, compact_orig_positions,
-    VISUAL_EVIDENCE_NOTE, da_protection_from_spans, evidence_provenance, evidence_validity,
+    da_protection_from_spans, evidence_provenance, evidence_validity,
     evidence_assessments, fixed_budget_verdict, grounding_protection_with_report,
-    visual_evidence_protection_status, plan_starlight_layer, summarize_plans,
+    plan_starlight_layer, summarize_plans,
 )
+from .visual_mapping import VISUAL_EVIDENCE_NOTE, visual_evidence_report
 from .evidence_verification import EvidencePolicy
 from .adapters import HardwareGateError, check_vllm_hardware_compatibility
 
@@ -2419,6 +2420,12 @@ class RealSevenArmEngine:
         starlight_structural_labels: dict[int, tuple[str, ...]] = {}
         starlight_structural_evicted = 0
         starlight_cache_mismatch_steps = 0
+        # ITER3 Round B S2: visual evidence status for this request (replaced by the grounding branch below).
+        starlight_visual: dict[str, Any] = {
+            "status": "DISABLED_ABLATION", "unsupported_reason": None, "items": {},
+            "visual_positions_protected": 0, "visual_protected_positions": [], "geometry": None,
+            "note": VISUAL_EVIDENCE_NOTE,
+        }
         if starlight_active:
             # Total budget per full-attention layer, fixed from the prefill length (as H2O does).
             starlight_budget = max(self.h2o_config.min_budget, int(len(full_prompt) * self.h2o_config.budget_ratio))
@@ -2451,6 +2458,12 @@ class RealSevenArmEngine:
                     starlight_da_spans.append((label, tag.start_idx, tag.end_idx))
             if "grounding" in starlight_enabled:
                 image_sha = _image_sha256(image_bytes, image_path) if image_present else None
+                # ITER3 Round B S2: geometry is not derived from the processor yet (wired in the next commit), so an
+                # image request is UNSUPPORTED with an explicit reason, never a guessed mapping.
+                starlight_visual = visual_evidence_report(
+                    evidence_pool, request_id=request_id, image_sha256=image_sha, image_present=bool(image_present),
+                    geometry=None, geometry_reason="GEOMETRY_NOT_WIRED", span=None, span_reason=None,
+                )
                 if evidence_pool is None:
                     starlight_grounding_status = "NO_EVIDENCE_DECLARED"
                 else:
@@ -3040,7 +3053,14 @@ class RealSevenArmEngine:
                 # ITER3 R2 C-5: image evidence protects no visual tokens. Stated, never silent.
                 # ITER3 R2 C-4: keyword breadth policy and what it rejected (never silent).
                 "grounding_keyword_policy": starlight_keyword_report,
-                "visual_evidence_protection": visual_evidence_protection_status(evidence_pool),
+                # ITER3 Round B S2: SUPPORTED (mapping established) or UNSUPPORTED with a reason. Protection is per
+                # item (S1 + location + mapping). Preserving a visual span does NOT prove the model used it.
+                "visual_evidence_protection": starlight_visual["status"],
+                "visual_evidence_protection_reason": starlight_visual["unsupported_reason"],
+                "visual_evidence_items": starlight_visual["items"],
+                "visual_positions_protected": starlight_visual["visual_positions_protected"],
+                "visual_protected_positions": starlight_visual["visual_protected_positions"],
+                "visual_geometry": starlight_visual["geometry"],
                 "visual_evidence_protection_note": VISUAL_EVIDENCE_NOTE,
                 "grounding_protected_by_evidence": grounding_by_evidence,
                 "candidate_basis": (

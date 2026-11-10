@@ -24,6 +24,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
+
+from vlmbench.infrastructure.evidence_verification import EvidencePolicy, assess_evidence, decide_protection
 
 REASON_NO_SOURCE_SIZE = "NO_SOURCE_SIZE"
 REASON_MISSING_GRID = "MISSING_GRID"
@@ -62,6 +65,21 @@ class ProcessorGeometry:
     @property
     def n_tokens(self) -> int:
         return self.merged_h * self.merged_w
+
+    def as_dict(self) -> dict:
+        return {
+            "source_height": self.source_height,
+            "source_width": self.source_width,
+            "resized_height": self.resized_height,
+            "resized_width": self.resized_width,
+            "grid_h": self.grid_h,
+            "grid_w": self.grid_w,
+            "merged_h": self.merged_h,
+            "merged_w": self.merged_w,
+            "n_tokens": self.n_tokens,
+            "patch_size": self.patch_size,
+            "merge_size": self.merge_size,
+        }
 
 
 def smart_resize(height: int, width: int, factor: int, min_pixels: int, max_pixels: int) -> tuple[int, int]:
@@ -213,3 +231,113 @@ def region_positions(box, geom: ProcessorGeometry, span: tuple[int, int]):
         return None, reason, info
     positions = sorted(start + r * geom.merged_w + c for r, c in cells)
     return positions, None, info
+
+
+REASON_NO_IMAGE_IN_REQUEST = "NO_IMAGE_IN_REQUEST"
+REASON_IMAGE_SOURCE_UNKNOWN = "IMAGE_SOURCE_UNKNOWN"
+REASON_LOCATION_NOT_VERIFIED = "LOCATION_NOT_VERIFIED"
+
+STATUS_NO_EVIDENCE = "NO_EVIDENCE_DECLARED"
+STATUS_NO_IMAGE_EVIDENCE = "NO_IMAGE_EVIDENCE_DECLARED"
+STATUS_SUPPORTED = "SUPPORTED"
+STATUS_UNSUPPORTED = "UNSUPPORTED"
+
+VISUAL_EVIDENCE_NOTE = (
+    "SUPPORTED means the mapping from declared image_region evidence to visual token positions is established for "
+    "this request: processor geometry verified against grid_thw and one image token run. Protection is still per "
+    "item. A visual span is protected only when S1 protects the item (source bytes VERIFIED and bound to this "
+    "request) AND its location is VERIFIED. UNSUPPORTED protects no visual token and gives a reason. Protecting a "
+    "visual span does NOT prove the model used it. Visual protection is a separate channel and is not counted in "
+    "the keyword caps."
+)
+
+
+def geometry_from_grid_list(
+    source_height, source_width, grids, *, patch_size: int, merge_size: int, min_pixels: int, max_pixels: int
+) -> tuple[ProcessorGeometry | None, str | None]:
+    """Geometry from the processor's image_grid_thw list. Exactly one image grid is mappable."""
+    if not grids:
+        return None, REASON_MISSING_GRID
+    if len(grids) != 1:
+        return None, REASON_MULTI_IMAGE
+    return build_geometry(source_height, source_width, grids[0], patch_size=patch_size,
+                          merge_size=merge_size, min_pixels=min_pixels, max_pixels=max_pixels)
+
+
+def visual_evidence_report(
+    pool: Any,
+    *,
+    request_id: str,
+    image_sha256: str | None,
+    image_present: bool,
+    policy: EvidencePolicy | None = None,
+    geometry: ProcessorGeometry | None,
+    geometry_reason: str | None,
+    span: tuple[int, int] | None,
+    span_reason: str | None,
+) -> dict[str, Any]:
+    """Per request: the visual evidence status, the per-item S1-gated decision, and the protected positions.
+
+    The status is about the MAPPING: SUPPORTED when geometry and token run are established for this request,
+    UNSUPPORTED (with a reason) when they are not. Positions are protected only for items that pass S1 AND map.
+    A supported status with zero protected positions means every item was refused, and the items say why.
+    Positions are ORIGINAL prompt positions (the coordinates before any compaction).
+    """
+    policy = policy or EvidencePolicy()
+    rep: dict[str, Any] = {
+        "status": None,
+        "unsupported_reason": None,
+        "items": {},
+        "positions": {},
+        "visual_positions_protected": 0,
+        "visual_protected_positions": [],
+        "geometry": geometry.as_dict() if geometry is not None else None,
+        "note": VISUAL_EVIDENCE_NOTE,
+    }
+    if pool is None:
+        rep["status"] = STATUS_NO_EVIDENCE
+        return rep
+    image_items = [item for item in pool.items() if item.modality == "image_region"]
+    if not image_items:
+        rep["status"] = STATUS_NO_IMAGE_EVIDENCE
+        return rep
+    global_reason = None
+    if not image_present:
+        global_reason = REASON_NO_IMAGE_IN_REQUEST
+    elif image_sha256 is None:
+        global_reason = REASON_IMAGE_SOURCE_UNKNOWN
+    elif geometry is None:
+        global_reason = geometry_reason or REASON_MISSING_GRID
+    elif span is None:
+        global_reason = span_reason or REASON_NO_IMAGE_TOKENS
+    if global_reason is not None:
+        rep["status"] = STATUS_UNSUPPORTED
+        rep["unsupported_reason"] = global_reason
+        for item in image_items:
+            rep["items"][item.evidence_id] = {"protects": False, "reason": global_reason, "dimensions": None,
+                                              "positions": None}
+        return rep
+
+    rep["status"] = STATUS_SUPPORTED
+    protected: dict[int, list[str]] = {}
+    for item in image_items:
+        a = assess_evidence(item, request_id=request_id, pool_request_id=pool.request_id,
+                            image_sha256=image_sha256, image_present=True)
+        d = decide_protection(a, policy, caller_verified=bool(item.verified))
+        entry: dict[str, Any] = {"protects": False, "reason": d.mode, "dimensions": dict(a.dimensions),
+                                 "positions": None}
+        if d.protects:
+            positions, reason, _info = region_positions(item.bounding_box, geometry, span)
+            if reason is None and a.dimensions["location_valid"] != "VERIFIED":
+                reason = REASON_LOCATION_NOT_VERIFIED
+            if reason is None:
+                entry.update(protects=True, reason=d.mode, positions=positions)
+                for pos in positions:
+                    protected.setdefault(pos, []).append(item.evidence_id)
+            else:
+                entry["reason"] = reason
+        rep["items"][item.evidence_id] = entry
+    rep["positions"] = {pos: tuple(sorted(ids)) for pos, ids in sorted(protected.items())}
+    rep["visual_protected_positions"] = sorted(rep["positions"])
+    rep["visual_positions_protected"] = len(rep["positions"])
+    return rep
