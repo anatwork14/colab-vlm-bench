@@ -146,6 +146,15 @@ drafts), and any throughput, latency or memory saving.
   join the grounding protection (a separate channel: the keyword caps do not count them). Telemetry:
   `visual_positions_protected`, `visual_protected_positions`, `visual_span`, `visual_geometry`,
   `visual_protected_retained_final_by_layer` (measured at the end of the request), `visual_evidence_items`.
+- **Cell counts (ITER3 closure, F-9).** Each `visual_evidence_items[<id>]` carries `cells = {"full": n, "partial": m}`
+  for a protected item (cells fully inside the box, and cells only partly covered), and `null` when refused. A sub-EPS
+  box straddling a cell boundary maps to the cells it overlaps (F-7).
+- **Run comparability (ITER3 closure, F-1).** `telemetry["comparison_validity"]` is set on the non-speculative path. An image
+  `starlight_s1` run whose protection at prefill reaches the budget, with nothing evicted, is
+  `STARLIGHT_FULL_CACHE_INFEASIBLE_NOT_COMPARABLE` (`comparable_to_matched_budget: false`). The DA FOCUS scope that causes
+  this is unchanged (owner decision; `STARLIGHT_STAGE1_DESIGN.md` §4.1). The speculative text routes do not carry the field yet.
+- **Ablation labels (ITER3 closure, F-11).** A control arm with no signal reports `NOT_APPLICABLE_CONTROL_ARM_*`. An
+  ablation that drops a signal reports `DISABLED_BY_ABLATION`. `DISABLED_ABLATION` no longer appears.
 - **What this does not show.** Preserving a visual span does NOT prove the model used it. It shows the cache kept those
   positions. It says nothing about whether any answer depends on them, so it is not a quality or grounding result.
 - **Speculative path.** An image prompt on `h2o_mtp`, `starlight_s1_mtp` or `mtp` is `UNSUPPORTED_IMAGE_PROMPT`. Visual

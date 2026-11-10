@@ -50,6 +50,17 @@ def eng():
     e.close()
 
 
+@pytest.fixture(scope="module")
+def eng_no_da():
+    # ITER3 closure (F-1, F-6): on starlight_s1 an image prompt never evicts (DA FOCUS covers the whole visual
+    # segment), so a retention check there is vacuous. The no-DA arm has real eviction and the visual protection
+    # is its only large protected set.
+    e = RealSevenArmEngine(method_arm="starlight_s1_no_da", device="cpu", checkpoint_dir=CKPT, stop_at_eos=False,
+                           h2o_min_budget=8, h2o_budget_ratio=0.6, evidence_policy=EvidencePolicy())
+    yield e
+    e.close()
+
+
 def _pool(request_id, sha256, box=BOX):
     pool = EvidencePool(request_id)
     pool.add_evidence(EvidenceItem(evidence_id="ev_region", modality="image_region", content="top-left quadrant",
@@ -90,9 +101,11 @@ def test_verified_image_region_is_supported_and_protects_its_merged_cells(eng, i
     assert block["visual_evidence_items"]["ev_region"]["reason"] == "PROTECTED_SOURCE_BYTES_VERIFIED"
 
 
-def test_protected_visual_positions_are_retained_in_every_full_attention_layer_at_the_end(eng, image_bytes, sha):
-    res = _run(eng, "s2_retained", pool=_pool("s2_retained", sha), image_bytes=image_bytes)
+def test_protected_visual_positions_are_retained_in_every_full_attention_layer_at_the_end(eng_no_da, image_bytes, sha):
+    res = _run(eng_no_da, "s2_retained", pool=_pool("s2_retained", sha), image_bytes=image_bytes)
     block = res.telemetry["starlight"]
+    # ITER3 closure repair (F-6, wF:p9 F-2): without eviction "retained" says nothing about protection.
+    assert block["evicted_total"] > 0, "no eviction happened: the retention check would be vacuous"
     protected = len(block["visual_protected_positions"])
     retained = block["visual_protected_retained_final_by_layer"]
     assert retained, "the per-layer final retention must be reported"

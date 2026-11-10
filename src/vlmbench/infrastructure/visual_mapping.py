@@ -187,6 +187,19 @@ def _box_values(box):
     return (ymin, xmin, ymax, xmax), None
 
 
+def _cell_interval(a0: float, a1: float) -> tuple[float, float]:
+    """Interval [a0, a1) in merged-cell units, with float noise snapped to a cell boundary.
+
+    An endpoint within _EPS of an integer is snapped to it. If the snap would collapse a positive-width interval,
+    the raw interval is kept, so every cell with positive overlap is still returned (ITER3 closure F-7: sub-EPS
+    boxes straddling a boundary used to end with r0 > r1 and map to no cell).
+    """
+    s0, s1 = [float(round(a)) if abs(a - round(a)) <= _EPS else a for a in (a0, a1)]
+    if s1 <= s0:
+        return a0, a1
+    return s0, s1
+
+
 def box_cells(box, geom: ProcessorGeometry):
     """Merged cells a normalised (ymin, xmin, ymax, xmax) box overlaps with positive area.
 
@@ -200,10 +213,12 @@ def box_cells(box, geom: ProcessorGeometry):
     cell = float(geom.merge_size * geom.patch_size)  # 32 px in the resized image
     y0, y1 = ymin * geom.resized_height, ymax * geom.resized_height
     x0, x1 = xmin * geom.resized_width, xmax * geom.resized_width
-    r0 = max(0, math.floor(y0 / cell + _EPS))
-    r1 = min(geom.merged_h - 1, math.ceil(y1 / cell - _EPS) - 1)
-    c0 = max(0, math.floor(x0 / cell + _EPS))
-    c1 = min(geom.merged_w - 1, math.ceil(x1 / cell - _EPS) - 1)
+    ry0, ry1 = _cell_interval(y0 / cell, y1 / cell)
+    rx0, rx1 = _cell_interval(x0 / cell, x1 / cell)
+    r0 = max(0, math.floor(ry0))
+    r1 = min(geom.merged_h - 1, math.ceil(ry1) - 1)
+    c0 = max(0, math.floor(rx0))
+    c1 = min(geom.merged_w - 1, math.ceil(rx1) - 1)
     cells = []
     full = 0
     for r in range(r0, r1 + 1):
@@ -357,7 +372,7 @@ def visual_evidence_report(
         rep["unsupported_reason"] = global_reason
         for item in image_items:
             rep["items"][item.evidence_id] = {"protects": False, "reason": global_reason, "dimensions": None,
-                                              "positions": None}
+                                              "positions": None, "cells": None}
         return rep
 
     rep["status"] = STATUS_SUPPORTED
@@ -367,13 +382,15 @@ def visual_evidence_report(
                             image_sha256=image_sha256, image_present=True)
         d = decide_protection(a, policy, caller_verified=bool(item.verified))
         entry: dict[str, Any] = {"protects": False, "reason": d.mode, "dimensions": dict(a.dimensions),
-                                 "positions": None}
+                                 "positions": None, "cells": None}
         if d.protects:
-            positions, reason, _info = region_positions(item.bounding_box, geometry, span)
+            positions, reason, info = region_positions(item.bounding_box, geometry, span)
             if reason is None and a.dimensions["location_valid"] != "VERIFIED":
                 reason = REASON_LOCATION_NOT_VERIFIED
             if reason is None:
-                entry.update(protects=True, reason=d.mode, positions=positions)
+                # ITER3 closure F-9: the partially covered cells (overlap < whole cell) are reported, not discarded.
+                entry.update(protects=True, reason=d.mode, positions=positions,
+                             cells={"full": info["full_cells"], "partial": info["partial_cells"]})
                 for pos in positions:
                     protected.setdefault(pos, []).append(item.evidence_id)
             else:
