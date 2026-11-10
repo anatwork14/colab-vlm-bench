@@ -166,14 +166,14 @@ def test_ccu_concurrency_isolation():
     # Request A: Evidence for apple
     pool_a = EvidencePool("req_A")
     pool_a.add_evidence(
-        EvidenceItem("ev_A", "text", "red apple", "1" * 64),
+        EvidenceItem("ev_A", "text_span", "red apple", "1" * 64),
         keywords=["apple"],
     )
 
     # Request B: Evidence for target
     pool_b = EvidencePool("req_B")
     pool_b.add_evidence(
-        EvidenceItem("ev_B", "text", "target zone", "2" * 64),
+        EvidenceItem("ev_B", "text_span", "target zone", "2" * 64),
         keywords=["target"],
     )
 
@@ -534,7 +534,7 @@ def test_p7_ecrd_unsupported_penalty_is_inert_and_documented():
     outs = []
     for beta in (0.0, 5.0):
         pool = EvidencePool("p7_beta")
-        pool.add_evidence(EvidenceItem("ev_b", "text", "apple", "5" * 64), keywords=["apple"])
+        pool.add_evidence(EvidenceItem("ev_b", "text_span", "apple", "5" * 64), keywords=["apple"])
         proc = ECRDLogitsProcessor(pool, _Tok(), ECRDConfig(reweight_alpha=1.0, unsupported_penalty=beta))
         outs.append(proc([], logits.copy()))
     np.testing.assert_array_equal(outs[0], outs[1])
